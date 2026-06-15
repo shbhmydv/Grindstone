@@ -28,8 +28,12 @@ dependencies = [
     # built only above a file-count threshold and degrades to "no map" on any
     # failure, so a future `[lean]` extras split can move these out untouched.
     # (PageRank is hand-rolled, so no numpy/scipy/networkx stack is pulled in.)
-    "tree-sitter>=0.23",
-    "tree-sitter-language-pack>=0.7",
+    # tree-sitter floor is 0.25.2: repomap.py uses the 0.25 Query/QueryCursor API,
+    # and tree-sitter-language-pack's bundled grammars are built for that ABI, so a
+    # lower floor risks an ABI mismatch where grammars fail to load and the map
+    # degrades to None. The language-pack pins tree-sitter>=0.25.2 itself.
+    "tree-sitter>=0.25.2",
+    "tree-sitter-language-pack>=1.0",
     "tiktoken>=0.7",
     "diskcache>=5",
 ]

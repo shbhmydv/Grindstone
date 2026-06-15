@@ -13,6 +13,8 @@ import os
 import stat
 from pathlib import Path
 
+import pytest
+
 from grindstone.contracts.models import ArtifactTask, CmdCheck, ImplementTask
 from grindstone.planner import build_planner_input, stable_head
 from grindstone.repomap import (
@@ -21,6 +23,36 @@ from grindstone.repomap import (
     repo_file_count,
 )
 from grindstone.worker import WorkerRequest, build_worker_prompt
+
+
+def _grammars_loadable() -> bool:
+    """Whether tree-sitter can actually load a grammar and run a query HERE.
+
+    A fresh install with an ABI/version mismatch between ``tree-sitter`` and
+    ``tree-sitter-language-pack`` cannot parse, so the repo-map correctly degrades
+    to ``None``. The real-parse assertions below would then be red for an
+    environment reason, not a code defect, so they skip instead of failing. The
+    pyproject version floors are set to avoid this in practice; this is the net.
+    """
+
+    try:
+        from tree_sitter import Parser, Query, QueryCursor
+        from tree_sitter_language_pack import get_language
+
+        lang = get_language("python")
+        tree = Parser(lang).parse(b"def f():\n    return 1\n")
+        QueryCursor(Query(lang, "(function_definition) @f")).captures(tree.root_node)
+        return True
+    except Exception:  # noqa: BLE001 - any failure means grammars are unusable here
+        return False
+
+
+#: Skips the tests that need a real parse when grammars cannot load in this env.
+_needs_grammars = pytest.mark.skipif(
+    not _grammars_loadable(),
+    reason="tree-sitter grammars not loadable here (ABI/version mismatch); the "
+    "repo-map degrades to None, so its real-parse assertions cannot run",
+)
 
 
 def _spine_repo(root: Path, *, modules: int = 60) -> None:
@@ -70,6 +102,7 @@ def _tokens(text: str) -> int:
 # --- core behaviour ------------------------------------------------------------
 
 
+@_needs_grammars
 def test_spine_files_rank_first_and_within_budget(tmp_path: Path) -> None:
     _spine_repo(tmp_path)
     text = build_repo_map(tmp_path, map_tokens=2000)
@@ -99,6 +132,7 @@ def test_repo_file_count_skips_build_and_vcs_dirs(tmp_path: Path) -> None:
     assert repo_file_count(tmp_path) == 1
 
 
+@_needs_grammars
 def test_broken_file_does_not_raise(tmp_path: Path) -> None:
     _spine_repo(tmp_path)
     (tmp_path / "broken.py").write_text(
@@ -110,6 +144,7 @@ def test_broken_file_does_not_raise(tmp_path: Path) -> None:
     assert text is not None and "shared_helper" in text
 
 
+@_needs_grammars
 def test_read_only_repo_degrades_to_memory_cache(tmp_path: Path) -> None:
     _spine_repo(tmp_path)
     original = stat.S_IMODE(tmp_path.stat().st_mode)
@@ -122,6 +157,7 @@ def test_read_only_repo_degrades_to_memory_cache(tmp_path: Path) -> None:
     assert not (tmp_path / ".grindstone").exists()  # nothing written to the repo tree
 
 
+@_needs_grammars
 def test_focus_files_collapse_map_to_neighborhood(tmp_path: Path) -> None:
     _two_cluster_repo(tmp_path)
     whole = build_repo_map(tmp_path, map_tokens=4000)
@@ -138,6 +174,7 @@ def test_focus_files_collapse_map_to_neighborhood(tmp_path: Path) -> None:
     assert a_at != -1 and (b_at == -1 or a_at < b_at)
 
 
+@_needs_grammars
 def test_nonexistent_focus_paths_are_dropped(tmp_path: Path) -> None:
     _spine_repo(tmp_path)
     # A brand-new (not-yet-on-disk) file has no graph node; it is simply ignored
@@ -227,6 +264,7 @@ def test_worker_prompt_omits_subtree_when_absent() -> None:
     assert "<repo_map>" not in prompt
 
 
+@_needs_grammars
 def test_worker_subtree_seeds_implement_on_file_ownership(tmp_path: Path) -> None:
     from grindstone.task_loop import _worker_subtree
 
