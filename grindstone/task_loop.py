@@ -60,6 +60,7 @@ from grindstone.events import (
     TaskFailed,
     TaskRetried,
 )
+from grindstone.repomap import WORKER_SUBTREE_TOKENS, build_repo_map
 from grindstone.rundir import RunDir
 from grindstone import worktree as wt
 from grindstone.worker import (
@@ -423,6 +424,26 @@ def _install_attempt_checks(
     return task.model_copy(update={"done_when": [*task.done_when, *appended]})
 
 
+def _worker_subtree(repo: Path | None, task: Task) -> str | None:
+    """A repo-map subtree seeded on this task's files (a large-repo nav aid).
+
+    Implement tasks seed on ``file_ownership`` (globs/paths), collapsing the map
+    toward the neighborhood the task will edit. research/review/artifact tasks
+    seed on ``targets`` when present, else get no map (their scratch is not a repo
+    checkout and they navigate via resolved inputs). ``None`` whenever no repo is
+    configured, the repo is below threshold, or anything fails (never crashes)."""
+
+    if repo is None:
+        return None
+    if isinstance(task, ImplementTask):
+        focus = [Path(g) for g in task.file_ownership]
+        return build_repo_map(repo, map_tokens=WORKER_SUBTREE_TOKENS, focus_files=focus)
+    if task.targets:
+        focus = [Path(t) for t in task.targets]
+        return build_repo_map(repo, map_tokens=WORKER_SUBTREE_TOKENS, focus_files=focus)
+    return None
+
+
 def _dispatch_attempt(
     *,
     identity: TaskIdentity,
@@ -461,6 +482,7 @@ def _dispatch_attempt(
         attempt=cursor.attempt,
         failure_context=list(cursor.failure_context),
         mode=mode,
+        repo_map=_worker_subtree(repo, task),
     )
     try:
         worker.run(request)

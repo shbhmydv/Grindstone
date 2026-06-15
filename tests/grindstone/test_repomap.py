@@ -1,0 +1,282 @@
+"""Repo-map: PageRank spine ranking, size gate, never-crash degradation, the
+``focus_files`` subtree, and the planner/worker injection seams.
+
+The map is an enhancement that must never crash a run and must never touch the
+byte-stable planner head, both are asserted here. A multi-language fixture repo
+(Python + TypeScript) above the file-count threshold exercises the real
+tree-sitter path; tiny repos and broken files exercise the degrade paths.
+"""
+
+from __future__ import annotations
+
+import os
+import stat
+from pathlib import Path
+
+from grindstone.contracts.models import ArtifactTask, CmdCheck, ImplementTask
+from grindstone.planner import build_planner_input, stable_head
+from grindstone.repomap import (
+    MIN_FILES_FOR_MAP,
+    build_repo_map,
+    repo_file_count,
+)
+from grindstone.worker import WorkerRequest, build_worker_prompt
+
+
+def _spine_repo(root: Path, *, modules: int = 60) -> None:
+    """A repo whose ``util.shared_helper`` is referenced by every module, so it
+    is unambiguously the spine; plus a TypeScript file and a second helper."""
+
+    (root / "util.py").write_text(
+        "def shared_helper():\n    return 1\n\n\ndef rare_helper():\n    return 2\n",
+        encoding="utf-8",
+    )
+    for i in range(modules):
+        (root / f"mod_{i:02d}.py").write_text(
+            f"from util import shared_helper\n\n\ndef fn_{i}():\n"
+            f"    return shared_helper()\n",
+            encoding="utf-8",
+        )
+    (root / "app.ts").write_text(
+        "function tsEntry() { return tsHelper(); }\n"
+        "function tsHelper() { return tsEntry(); }\n",
+        encoding="utf-8",
+    )
+
+
+def _two_cluster_repo(root: Path) -> None:
+    """Two disjoint clusters: cluster A references ``coreA``, B references
+    ``coreB``. Used to prove ``focus_files`` collapses the map to a neighborhood."""
+
+    (root / "coreA.py").write_text("def helperA():\n    return 1\n", encoding="utf-8")
+    (root / "coreB.py").write_text("def helperB():\n    return 1\n", encoding="utf-8")
+    for i in range(28):
+        (root / f"a_{i:02d}.py").write_text(
+            f"from coreA import helperA\n\n\ndef a{i}():\n    return helperA()\n",
+            encoding="utf-8",
+        )
+        (root / f"b_{i:02d}.py").write_text(
+            f"from coreB import helperB\n\n\ndef b{i}():\n    return helperB()\n",
+            encoding="utf-8",
+        )
+
+
+def _tokens(text: str) -> int:
+    import tiktoken
+
+    return len(tiktoken.get_encoding("cl100k_base").encode(text))
+
+
+# --- core behaviour ------------------------------------------------------------
+
+
+def test_spine_files_rank_first_and_within_budget(tmp_path: Path) -> None:
+    _spine_repo(tmp_path)
+    text = build_repo_map(tmp_path, map_tokens=2000)
+    assert text is not None and text.strip()
+    # The most-referenced symbol/file is the spine and surfaces first.
+    assert "shared_helper" in text
+    assert text.splitlines()[0].startswith("util.py")
+    # TypeScript is parsed via the JS query alias (no separate TS grammar query).
+    assert "app.ts" in text
+    # The rendered map respects its token budget.
+    assert _tokens(text) <= 2000
+
+
+def test_size_gate_returns_none_below_threshold(tmp_path: Path) -> None:
+    for i in range(MIN_FILES_FOR_MAP - 5):
+        (tmp_path / f"f_{i}.py").write_text("def x():\n    return 1\n", encoding="utf-8")
+    assert repo_file_count(tmp_path) < MIN_FILES_FOR_MAP
+    assert build_repo_map(tmp_path) is None
+
+
+def test_repo_file_count_skips_build_and_vcs_dirs(tmp_path: Path) -> None:
+    (tmp_path / "real.py").write_text("x = 1\n", encoding="utf-8")
+    for skip in (".git", "node_modules", "__pycache__", ".grindstone", ".venv"):
+        d = tmp_path / skip
+        d.mkdir()
+        (d / "junk.py").write_text("y = 2\n", encoding="utf-8")
+    assert repo_file_count(tmp_path) == 1
+
+
+def test_broken_file_does_not_raise(tmp_path: Path) -> None:
+    _spine_repo(tmp_path)
+    (tmp_path / "broken.py").write_text(
+        "def (((( this is not valid python @@@ \n class\n", encoding="utf-8"
+    )
+    (tmp_path / "empty.py").write_text("", encoding="utf-8")
+    # Must not raise, and the valid spine still surfaces.
+    text = build_repo_map(tmp_path, map_tokens=2000)
+    assert text is not None and "shared_helper" in text
+
+
+def test_read_only_repo_degrades_to_memory_cache(tmp_path: Path) -> None:
+    _spine_repo(tmp_path)
+    original = stat.S_IMODE(tmp_path.stat().st_mode)
+    os.chmod(tmp_path, stat.S_IRUSR | stat.S_IXUSR)  # r-x: cannot create .grindstone
+    try:
+        text = build_repo_map(tmp_path, map_tokens=2000)
+    finally:
+        os.chmod(tmp_path, original)
+    assert text is not None and "shared_helper" in text
+    assert not (tmp_path / ".grindstone").exists()  # nothing written to the repo tree
+
+
+def test_focus_files_collapse_map_to_neighborhood(tmp_path: Path) -> None:
+    _two_cluster_repo(tmp_path)
+    whole = build_repo_map(tmp_path, map_tokens=4000)
+    assert whole is not None and "coreA" in whole and "coreB" in whole
+
+    focused = build_repo_map(
+        tmp_path, map_tokens=4000, focus_files=[Path("a_00.py")]
+    )
+    assert focused is not None
+    # Seeding on a cluster-A file ranks coreA above coreB (the neighborhood).
+    assert "coreA" in focused
+    a_at = focused.find("coreA")
+    b_at = focused.find("coreB")
+    assert a_at != -1 and (b_at == -1 or a_at < b_at)
+
+
+def test_nonexistent_focus_paths_are_dropped(tmp_path: Path) -> None:
+    _spine_repo(tmp_path)
+    # A brand-new (not-yet-on-disk) file has no graph node; it is simply ignored
+    # and the map falls back to whole-repo ranking rather than failing.
+    text = build_repo_map(
+        tmp_path, map_tokens=2000, focus_files=[Path("does/not/exist.py")]
+    )
+    assert text is not None and "shared_helper" in text
+
+
+# --- planner integration -------------------------------------------------------
+
+_JOB = "build the thing"
+
+
+def _phases() -> list:
+    from grindstone.contracts.models import Phase
+
+    return [
+        Phase(id="P1", title="A", exit_criterion=[CmdCheck(cmd="true")], epoch_budget=2),
+        Phase(id="P2", title="B", exit_criterion=[CmdCheck(cmd="true")], epoch_budget=1),
+    ]
+
+
+def _planner_kwargs() -> dict[str, object]:
+    return dict(
+        job=_JOB,
+        skeleton=_phases(),
+        phase_id="P1",
+        epoch_counter=1,
+        log_index=[],
+        last_epoch_rows=None,
+        reask_errors=[],
+    )
+
+
+def test_planner_repo_map_rides_tail_head_unchanged() -> None:
+    head = stable_head(_JOB, _phases())
+    without = build_planner_input(**_planner_kwargs())  # type: ignore[arg-type]
+    with_map = build_planner_input(  # type: ignore[arg-type]
+        **_planner_kwargs(), repo_map="util.py:\n  def shared_helper():"
+    )
+    # The map appears, in the tail, and the byte-stable head is unaffected.
+    assert "<repo_map>" in with_map
+    assert "shared_helper" in with_map
+    assert "<repo_map>" not in without
+    assert with_map.startswith(head) and without.startswith(head)
+    # Everything before the map section is identical to the no-map input.
+    assert with_map[: with_map.index("<repo_map>")] == without[: with_map.index("<repo_map>")]
+
+
+def test_planner_empty_map_omits_section() -> None:
+    out = build_planner_input(**_planner_kwargs(), repo_map=None)  # type: ignore[arg-type]
+    assert "<repo_map>" not in out
+
+
+# --- worker integration --------------------------------------------------------
+
+
+def _implement_request(repo_map: str | None) -> WorkerRequest:
+    task = ImplementTask(
+        id="T1",
+        goal="edit the widget",
+        done_when=[CmdCheck(cmd="true")],
+        file_ownership=["src/widget.py"],
+    )
+    return WorkerRequest(
+        task=task,
+        task_id="P1/E1/T1",
+        inputs={},
+        scratch=Path("/tmp/scratch"),
+        attempt=1,
+        failure_context=[],
+        mode="implement",
+        repo_map=repo_map,
+    )
+
+
+def test_worker_prompt_injects_subtree_when_present() -> None:
+    prompt = build_worker_prompt(_implement_request("src/widget.py:\n  def render():"))
+    assert "<repo_map>" in prompt
+    assert "def render():" in prompt
+
+
+def test_worker_prompt_omits_subtree_when_absent() -> None:
+    prompt = build_worker_prompt(_implement_request(None))
+    assert "<repo_map>" not in prompt
+
+
+def test_worker_subtree_seeds_implement_on_file_ownership(tmp_path: Path) -> None:
+    from grindstone.task_loop import _worker_subtree
+
+    _spine_repo(tmp_path)
+    task = ImplementTask(
+        id="T1",
+        goal="g",
+        done_when=[CmdCheck(cmd="true")],
+        file_ownership=["mod_0*.py", "util.py"],
+    )
+    sub = _worker_subtree(tmp_path, task)
+    assert sub is not None and "shared_helper" in sub
+
+
+def test_worker_subtree_none_for_artifact_without_targets(tmp_path: Path) -> None:
+    from grindstone.task_loop import _worker_subtree
+
+    _spine_repo(tmp_path)
+    task = ArtifactTask(
+        id="T1", goal="g", done_when=[CmdCheck(cmd="true")], artifact_out="notes.md"
+    )
+    assert _worker_subtree(tmp_path, task) is None
+
+
+def test_worker_subtree_none_below_threshold(tmp_path: Path) -> None:
+    from grindstone.task_loop import _worker_subtree
+
+    (tmp_path / "only.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    task = ImplementTask(
+        id="T1", goal="g", done_when=[CmdCheck(cmd="true")], file_ownership=["only.py"]
+    )
+    assert _worker_subtree(tmp_path, task) is None
+    assert _worker_subtree(None, task) is None
+
+
+def test_artifact_request_default_has_no_map() -> None:
+    task = ArtifactTask(
+        id="T1",
+        goal="research the thing",
+        done_when=[CmdCheck(cmd="true")],
+        artifact_out="notes.md",
+    )
+    request = WorkerRequest(
+        task=task,
+        task_id="P1/E1/T1",
+        inputs={},
+        scratch=Path("/tmp/scratch"),
+        attempt=1,
+        failure_context=[],
+        mode="research",
+    )
+    assert request.repo_map is None
+    assert "<repo_map>" not in build_worker_prompt(request)

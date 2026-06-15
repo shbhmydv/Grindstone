@@ -98,6 +98,7 @@ from grindstone.planner import (
     flatten_last_epoch,
     validate_decision,
 )
+from grindstone.repomap import build_repo_map
 from grindstone.rundir import RunDir, atomic_write_json
 from grindstone.task_loop import TIER0_ATTEMPTS
 from grindstone.worker import WorkerTransport
@@ -603,6 +604,10 @@ def _plan_boundary(
 
     reasks = 0
     reask_errors: list[str] = []
+    # Whole-repo map of the CURRENT integration tip (volatile-tail context). Built
+    # once per boundary (the tip does not move across this boundary's re-asks);
+    # None below threshold / on any failure, the run is unaffected either way.
+    repo_map = build_repo_map(repo) if repo is not None else None
     while True:
         prompt = build_planner_input(
             job=store.state.job_text,
@@ -614,6 +619,7 @@ def _plan_boundary(
             reask_errors=reask_errors,
             phase=phase_ctx.info if phase_ctx is not None else None,
             repo_memory=store.state.repo_memory,
+            repo_map=repo_map,
         )
         try:
             raw = _transport_call(journal, store, planner, sleep_fn, prompt, max_planner_calls)

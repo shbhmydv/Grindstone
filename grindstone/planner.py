@@ -421,10 +421,16 @@ def volatile_tail(
     last_epoch_rows: list[dict[str, object]] | None,
     reask_errors: list[str],
     phase: PhaseTailInfo | None = None,
+    repo_map: str | None = None,
 ) -> str:
     """The per-call suffix: running state, phase status, last-epoch report,
     re-ask feedback, request. Never byte-stable, it carries everything that
-    moves (S4 adds the phase-status + integration-tip surfacing, ruling 3)."""
+    moves (S4 adds the phase-status + integration-tip surfacing, ruling 3).
+
+    The optional ``<repo_map>`` (a PageRank-ranked structural map of the target
+    repo's CURRENT tip) rides HERE, in the volatile tail, never the byte-stable
+    head: it is rebuilt per call as the repo changes during implement epochs.
+    Empty/None omits the section entirely (no empty tags)."""
 
     log_lines = "\n".join(f"  - {k}" for k in log_index) or "  (empty)"
     state = (
@@ -436,6 +442,13 @@ def volatile_tail(
         "</state>\n"
     )
     phase_status = _phase_status_block(phase_id, phase) if phase is not None else ""
+    repo_map_block = (
+        "<repo_map>\nStructural map of the target repo at the current integration "
+        "tip (most-referenced files/symbols first). A navigation aid, not "
+        f"exhaustive.\n{repo_map}\n</repo_map>\n"
+        if repo_map
+        else ""
+    )
     if last_epoch_rows is None:
         last = "<last_epoch>\n  (none, this is the first decision)\n</last_epoch>\n"
     else:
@@ -453,7 +466,7 @@ def volatile_tail(
         "epoch_decision schema. No prose.\n"
         "</request>\n"
     )
-    return state + phase_status + last + errors + request
+    return state + phase_status + repo_map_block + last + errors + request
 
 
 def build_planner_input(
@@ -467,8 +480,12 @@ def build_planner_input(
     reask_errors: list[str],
     phase: PhaseTailInfo | None = None,
     repo_memory: str | None = None,
+    repo_map: str | None = None,
 ) -> str:
-    """Full constructed input: ``stable_head`` + ``volatile_tail`` (ruling 3)."""
+    """Full constructed input: ``stable_head`` + ``volatile_tail`` (ruling 3).
+
+    ``repo_map`` (when present) is injected into the volatile tail only; the
+    stable head stays byte-identical across a run regardless of it."""
 
     return stable_head(job, skeleton, repo_memory) + volatile_tail(
         phase_id=phase_id,
@@ -477,6 +494,7 @@ def build_planner_input(
         last_epoch_rows=last_epoch_rows,
         reask_errors=reask_errors,
         phase=phase,
+        repo_map=repo_map,
     )
 
 

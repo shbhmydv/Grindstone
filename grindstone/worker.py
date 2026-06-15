@@ -84,6 +84,10 @@ class WorkerRequest:
     attempt: int
     failure_context: list[str]
     mode: HandoffMode
+    #: A PageRank-ranked SUBTREE of the target repo, personalized on this task's
+    #: files (a navigation aid for large repos). ``None`` below threshold / on any
+    #: failure / for tasks with no seed files; rendered only when present.
+    repo_map: str | None = None
 
 
 class WorkerTransport(Protocol):
@@ -281,6 +285,14 @@ def build_worker_prompt(request: WorkerRequest) -> str:
             "\n<prior_failures>\nEarlier attempts failed for these reasons; "
             f"fix them:\n{joined}\n</prior_failures>\n"
         )
+    repo_map_block = ""
+    if request.repo_map:
+        repo_map_block = (
+            "\n<repo_map>\nStructural map of the target repo near this task's "
+            "files (most-referenced symbols first). A navigation aid, not "
+            f"exhaustive; verify against the actual files.\n{request.repo_map}\n"
+            "</repo_map>\n"
+        )
     return f"""<task id="{request.task_id}">
 {task.goal}
 </task>
@@ -288,7 +300,7 @@ def build_worker_prompt(request: WorkerRequest) -> str:
 <inputs>
 {_render_inputs(request)}
 </inputs>
-
+{repo_map_block}
 <done_when>
 These deterministic checks will be re-run by the orchestrator. They MUST pass:
 {_render_checks(request)}
