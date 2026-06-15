@@ -145,6 +145,39 @@ stream into a run → phase → epoch → task tree; the same fold powers the li
 sufficient to render the whole run; `journal.md` is a derived view that carries
 no trust and is never read back into the loop.
 
+## Repo-map: navigating large repos
+
+A job spec and a usually-empty repo-memory digest are not enough to plan against
+a thousand-file codebase. `grindstone/repomap.py` builds a structural map of the
+**target** repo on demand: it extracts definition and reference tags per file
+with tree-sitter, ranks files and symbols with a PageRank over the def/ref graph,
+and renders the spine (the most-referenced files and their key symbols) to a
+token budget.
+
+- **The planner** gets a whole-repo map, built once per planner boundary against
+  the current integration tip. It rides the **volatile tail** of the planner
+  input, never the byte-stable head, so prefix caching is unaffected and the map
+  always reflects the latest committed code.
+- **Each worker** gets a personalized **subtree**: the same PageRank with a
+  restart distribution seeded on the task's own files (an implement task's
+  `file_ownership`, a review or research task's `targets`), which collapses the
+  map to the neighborhood the worker will touch.
+
+The map is an enhancement, not a gate, and is built to disappear quietly. A repo
+below a small file-count threshold is skipped entirely, so demos and small repos
+see no map and pay nothing. Any failure (a missing grammar, an unparseable file,
+a read-only repo) returns no map rather than raising, so a run proceeds
+identically whether or not the map built. The tag cache lives under
+`.grindstone/`, keyed on each file's mtime and size so warm rebuilds are
+sub-second, with an in-memory fallback when the repo is read-only.
+
+PageRank is a small pure-Python power iteration, so the feature pulls in no
+numpy/scipy/networkx stack; it depends on tree-sitter (with grammars for Python,
+JavaScript/TypeScript, Go, Rust, Java, C, C++, C#, Ruby, Dart, and Swift),
+tiktoken for token counting, and diskcache for the tag cache. The tree-sitter tag
+queries under `grindstone/_repomap_queries/` are pure data vendored from aider
+(Apache-2.0; see the attribution there).
+
 ## Taste and vision features
 
 Grindstone can build and judge work that is evaluated by how it *looks*:

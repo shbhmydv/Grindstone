@@ -28,6 +28,11 @@ Grindstone checks the work directly, and the rest of the design follows from tha
   (`propose_skeleton`, `implement`, `review`, `complete_run`, and a few others),
   validated against a schema before the loop acts on it. The loop is an ordinary
   state machine you can read top to bottom.
+- **Repo-aware navigation.** On a large target repo, the planner and each worker
+  get a structural map built fresh with tree-sitter: definitions and references
+  ranked by PageRank, rendered to a token budget. The planner sees the whole
+  repo's spine; a worker sees the neighborhood of the files its task touches.
+  Small repos are skipped, and a map that fails to build never fails the run.
 - **Swappable models.** There are three roles: `planner`, `local`, and `senior`.
   Each is a `models/*.sh` script behind a file contract, so you can put GPT-5.5
   where Claude was, or Qwen where Llama was, and the orchestrator stays the same.
