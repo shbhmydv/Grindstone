@@ -135,7 +135,9 @@ Good shapes (compose freely; these are nudges, not a fixed menu):
 
 - **Heavy implementation** → `research` (map the area + constraints, on senior,
   cited) → `implement` (build it, on local, consuming the research artifact as an
-  input) → `review` (judge the result against the job's intent, on senior).
+  input) → `review` (on senior, re-derive a sample of the result's claims and
+  reconcile them against the inputs, not merely confirm the expected sections
+  exist).
 - **Report / triage / migration plan** → `research` (investigate + classify, on
   senior, cited) → `artifact` (write the final report from the findings, on
   local). Do not collapse the judgment into a single local `artifact` epoch when
@@ -195,7 +197,13 @@ Mode-specific:
 - **research / review / artifact** additionally require `artifact_out` (the log
   key the task will create). Review tasks also take `targets` (the paths under
   review). These tasks get **no worktree**: a non-write task is never handed the
-  live repo as its CWD.
+  live repo as its CWD. A `review` must INDEPENDENTLY RE-DERIVE a sample of the
+  claims or verdicts it judges and RECONCILE them against the upstream
+  artifact(s) it consumes via `inputs`; confirming only that required sections or
+  fields are present is mis-scoped (it spends a planner call yet catches no wrong
+  answer). When a review consumes an upstream artifact, surfacing any
+  contradiction between the reviewed work and that artifact is a primary job of
+  the review.
 
 ### Taste routing: the `visual` epoch flag
 

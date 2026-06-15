@@ -188,6 +188,12 @@ Rules:
   analysis into one local artifact epoch, that downgrades it off senior); UI =
   research -> implement with `visual:true` -> a phase exit criterion that builds,
   screenshots, then `vision_review`s it. A small job can be a single epoch.
+- A review epoch must INDEPENDENTLY RE-DERIVE a sample of the claims or verdicts
+  it judges and RECONCILE them against the upstream artifact(s) it consumes via
+  `inputs`, not merely confirm that the expected sections or fields are present
+  (a presence-only review spends a planner call yet catches no wrong answer).
+  When a review consumes an upstream artifact, surfacing any contradiction
+  between the reviewed work and that artifact is a primary job of the review.
 - Taste routing: set `"visual": true` on an implement or review epoch whose
   deliverable is FRONT-END / UI / visual / polish output (layout, styling, a
   rendered page, a diagram, anything judged by how it LOOKS). That epoch is
