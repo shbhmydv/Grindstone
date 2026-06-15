@@ -3,7 +3,7 @@
 The only sanctioned randomness in the suite (ARCHITECTURE.md). For each seed every task
 gets a random behavior script on every ladder tier; we assert the epoch reaches
 a terminal EpochOutcome and EVERY dispatched task reaches a terminal event
-(done | failed) — never hanging, never leaving a task un-terminated.
+(done | failed), never hanging, never leaving a task un-terminated.
 """
 
 from __future__ import annotations

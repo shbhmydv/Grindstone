@@ -106,7 +106,7 @@ def test_phase_passes_only_when_criterion_met(git_repo: Path, run_dir: RunDir) -
 
 def test_last_phase_pass_does_not_auto_complete(git_repo: Path, run_dir: RunDir) -> None:
     # Both phases' criteria are already satisfied at run start, so BOTH pass in
-    # the first preamble — yet the run only completes once the planner emits
+    # the first preamble, yet the run only completes once the planner emits
     # complete_run (the planner stays in the loop; evidence is the certificate).
     planner = MockPlanner(
         script=[two_phase_skeleton(), complete_decision(check_cmd("true"))]
@@ -136,7 +136,7 @@ def test_budget_exhaustion_escalates_then_revise_recovers(
                     phase_dict("P1", exit_criterion=goal, budget=1),
                     phase_dict("P2", exit_criterion=goal, budget=1),
                 ),
-                # Creates other.txt — P1's goal.txt criterion never passes; the
+                # Creates other.txt, P1's goal.txt criterion never passes; the
                 # one-epoch budget is then spent -> phase escalation.
                 implement_decision(impl_task("T1", "other.txt")),
                 # Re-scope P1 onto what actually exists; budget + flag reset.

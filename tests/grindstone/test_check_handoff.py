@@ -79,7 +79,7 @@ def test_generated_script_agrees_with_schema(
     """The script's accept/reject must match the schema gate across the corpus.
 
     Parametrized in ``implement`` mode (no citation requirement) with cited
-    files pre-created so the only differences left are structural — exactly what
+    files pre-created so the only differences left are structural, exactly what
     the script mirrors. Valid fixtures are baked with their own task_id; invalid
     ones with a fixed dispatched id, so ``bad_task_id`` is rejected precisely
     because its id is not the one dispatched.
@@ -115,7 +115,7 @@ def _ok_handoff(task_id: str = "P1/E1/T1", **over: object) -> dict[str, object]:
 def test_research_script_accepts_repo_root_citation(tmp_path: Path) -> None:
     """Gate-5 P0 mirror: research/review/artifact workers cite TARGET-REPO
     files, so the worker-side validator must resolve citations against the
-    baked repo root too — or workers self-validate differently than the core
+    baked repo root too, or workers self-validate differently than the core
     gate and burn attempts on a disagreement they cannot see."""
 
     repo = tmp_path / "repo"
@@ -203,7 +203,7 @@ def test_byte_cap_is_enforced(tmp_path: Path) -> None:
 
 
 def test_generated_script_is_stdlib_only() -> None:
-    """No grindstone / jsonschema import — target repos have neither."""
+    """No grindstone / jsonschema import, target repos have neither."""
 
     script = generate_check_script(task_id="P1/E1/T1", mode="implement")
     assert "import grindstone" not in script

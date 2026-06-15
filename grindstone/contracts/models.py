@@ -31,7 +31,7 @@ LogKey = Annotated[
 
 
 class _Frozen(BaseModel):
-    """Immutable, closed model — the boundary invariant for every contract type."""
+    """Immutable, closed model, the boundary invariant for every contract type."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -55,10 +55,10 @@ class ArtifactExistsCheck(_Frozen):
 class VisionReviewSpec(_Frozen):
     """The taste-gate's payload: a screenshot path + the criteria to judge it by.
 
-    ``screenshot`` is a path RELATIVE TO THE EVAL WORKTREE — a prior cmd check in
+    ``screenshot`` is a path RELATIVE TO THE EVAL WORKTREE, a prior cmd check in
     the same criterion list renders the UI there (e.g. ``ui/screen.png``). The
     pattern forbids a leading ``/`` and any ``..`` segment so a planner-supplied
-    path cannot escape the worktree (codex reads the image with ``-i`` — an
+    path cannot escape the worktree (codex reads the image with ``-i``, an
     absolute/traversal path would be an arbitrary on-disk file read). ``criteria``
     is prose describing what polished/correct looks like; the core feeds both to
     codex, which returns a structured verdict (``vision_verdict``).
@@ -84,7 +84,7 @@ class VisionReviewCheck(_Frozen):
     """Taste check (B3): codex looks at a rendered-UI screenshot + criteria and
     emits a pass/fail verdict, layered on top of the deterministic functional
     floor. The verdict is a re-read disk contract (``vision_verdict.json``), never
-    stdout — identical in spirit to the worker handoff."""
+    stdout, identical in spirit to the worker handoff."""
 
     vision_review: VisionReviewSpec
 
@@ -148,8 +148,8 @@ class _EpochArgsBase(_Frozen):
     #: Taste routing (B3 seam): set True when the epoch produces or changes
     #: UI/visual output, so the core builds its workers on the stronger
     #: taste-building senior tier instead of the mode default. (The senior is a
-    #: text model — the genuine image-based judgment is the B3 vision-review gate
-    #: in the phase exit criterion, not this worker.) Optional — a decision
+    #: text model, the genuine image-based judgment is the B3 vision-review gate
+    #: in the phase exit criterion, not this worker.) Optional, a decision
     #: without the field parses unchanged (default False); ``StrictBool`` mirrors
     #: the schema's ``boolean`` type, so a non-bool is rejected at both layers.
     visual: StrictBool = False

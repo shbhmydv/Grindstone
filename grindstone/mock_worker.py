@@ -1,11 +1,11 @@
-"""Deterministic mock worker — scripted failures for the S1 loop tests.
+"""Deterministic mock worker, scripted failures for the S1 loop tests.
 
 The script is a list of behaviors consumed one entry per ``run()`` call, so a
 test pins the exact failure sequence with zero randomness (ARCHITECTURE.md / S1):
 ``["rate_limit", "bad_json", "ok"]`` raises, then writes garbage, then behaves.
 The five behaviors are the failure taxonomy the loop must survive. A separate
 seeded ``fuzz_script`` generates unscripted sequences for the one fuzz test
-that proves the loop always terminates — the only place randomness is allowed.
+that proves the loop always terminates, the only place randomness is allowed.
 """
 
 from __future__ import annotations
@@ -76,7 +76,7 @@ class MockWorker:
             return
         if behavior == "timeout":
             # Hung-then-killed: a partial file lands, then the supervisor kills
-            # the worker. No real sleep — the kill is modelled as a raise.
+            # the worker. No real sleep, the kill is modelled as a raise.
             handoff.write_text('{"schema_version": "1"', encoding="utf-8")
             raise WorkerTimeout("mock hang killed")
         if behavior == "ok":

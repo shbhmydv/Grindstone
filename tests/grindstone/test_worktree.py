@@ -1,4 +1,4 @@
-"""Worktree lifecycle, ownership scope check, commit, and merge — against
+"""Worktree lifecycle, ownership scope check, commit, and merge, against
 throwaway tmp git repos (ARCHITECTURE.md / S2 rulings 4-7). These never touch the
 Grindstone checkout: every op targets the fixture's tmp repo.
 """
@@ -162,7 +162,7 @@ def test_add_worktree_detached_tolerates_branch_checked_out_elsewhere(
     """E2E gate2 P0: phase-eval crashed because its worktree targeted a BRANCH
     that something else (there: a rogue artifact worker; equally: the owner
     inspecting mid-run) had checked out in the operator's checkout. The
-    evaluator only reads a tree — detached HEAD cannot collide by construction.
+    evaluator only reads a tree, detached HEAD cannot collide by construction.
     """
 
     base = wt.head_commit(repo)

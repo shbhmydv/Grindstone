@@ -84,7 +84,7 @@ def test_preamble_teaches_sizing_independence_and_decomposition() -> None:
 
 def test_preamble_constrains_artifact_mode_done_when() -> None:
     """E2E gate2 finding: the planner attached repo test commands to an artifact
-    task's done_when — unsatisfiable by construction (artifact CWD is run-dir
+    task's done_when, unsatisfiable by construction (artifact CWD is run-dir
     scratch, not a repo checkout), so the task burned every attempt on a check
     that could never pass. The preamble must scope done_when by mode."""
 
@@ -94,7 +94,7 @@ def test_preamble_constrains_artifact_mode_done_when() -> None:
 
 def test_preamble_teaches_mode_selection_by_destination() -> None:
     """E2E gates 3+4 (2/2): document deliverables always came out `implement`.
-    Both jobs demanded the file IN the repo tree, so implement was right — but
+    Both jobs demanded the file IN the repo tree, so implement was right, but
     the preamble never taught the selection rule at all, so jobs wanting
     log-keyed deliverables (analyses, reports) would get worktrees too. The
     rule follows the deliverable's DESTINATION: committed repo files (even
@@ -109,8 +109,8 @@ def test_preamble_teaches_mode_selection_by_destination() -> None:
 def test_preamble_teaches_artifact_publication_and_bare_filename_checks() -> None:
     """Gate-6 RCA companion: the planner must know (a) accepted artifact tasks
     get their artifact_out PUBLISHED to the keyed log, and (b) an
-    artifact_exists check may use a bare filename — required at skeleton time,
-    when the P*/E*/T*/ placement is unknowable — matching exactly one logged
+    artifact_exists check may use a bare filename, required at skeleton time,
+    when the P*/E*/T*/ placement is unknowable, matching exactly one logged
     artifact."""
 
     assert "published to the keyed log" in SYSTEM_PREAMBLE

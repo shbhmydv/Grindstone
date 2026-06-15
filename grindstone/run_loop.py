@@ -2,7 +2,7 @@
 
 This is S3's spine. A stateless one-shot planner is called with constructed
 input, returns ONE decision as constrained JSON, the core validates and executes
-it, and the result feeds the next call — until ``complete_run`` (terminal
+it, and the result feeds the next call, until ``complete_run`` (terminal
 success) or escalation (terminal, needs a human)::
 
     loop:
@@ -18,7 +18,7 @@ success) or escalation (terminal, needs a human)::
                             fail -> reject + re-ask with the failing evidence
 
 Phases stay THIN at S3 (brief): the skeleton is stored, validated, fed to the
-stable head, and the run lives in its FIRST phase — epoch ids increment within
+stable head, and the run lives in its FIRST phase, epoch ids increment within
 it (E1, E2, …). Exit-criteria evaluation, budgets, and phase escalation are S4.
 
 Epoch chaining (ruling 4): epoch N+1's base is epoch N's integration tip when
@@ -28,7 +28,7 @@ branch (merging to the user's branch stays manual).
 Run-level durability (rulings 6/7): ``RunState`` is rewritten atomically to a
 file DISTINCT from the epoch's ``state.json``. A kill while a planner call is
 in flight leaves ``status=awaiting_planner`` and nothing else on disk (planner
-calls are side-effect-free), so resume simply RE-ISSUES the call — no burn,
+calls are side-effect-free), so resume simply RE-ISSUES the call, no burn,
 unlike workers. A kill mid-epoch leaves ``status=running_epoch`` + the pending
 decision; resume delegates to ``resume_epoch`` then continues the loop.
 """
@@ -107,7 +107,7 @@ SleepFn = Callable[[float], None]
 Ladder = Sequence[tuple[str, WorkerTransport]]
 
 #: Cap on the integration-tip file listing surfaced in the tail (ruling 3b):
-#: a reference, not a payload — the full count is always reported alongside.
+#: a reference, not a payload, the full count is always reported alongside.
 TIP_LISTING_CAP = 200
 
 _EPOCH_MODE: dict[str, HandoffMode] = {
@@ -151,7 +151,7 @@ class RunState(BaseModel):
     repo_memory: str | None = None
     # --- S4 phase machinery (defaulted so S3-crafted states still load) --------
     #: Per-phase epoch index → the epoch id ``E{n+1}``; resets to 0 on phase
-    #: advance (NOT on revise — keeping it monotonic avoids E-dir collisions).
+    #: advance (NOT on revise, keeping it monotonic avoids E-dir collisions).
     phase_epoch_index: int = 0
     #: Epochs charged to the current phase's budget; resets on advance AND revise.
     phase_budget_used: int = 0
@@ -254,7 +254,7 @@ def _vision_result(
 ) -> tuple[str, bool]:
     """Run one taste check through the configured reviewer; ``(label, passed)``.
 
-    Deterministic FAIL — never a crash — when no reviewer is wired, the screenshot
+    Deterministic FAIL, never a crash, when no reviewer is wired, the screenshot
     a prior check should have produced is absent, or the script/verdict path fails
     (``VisionReviewError``). On a clean PASS the label is the bare check; on a
     FAIL the verdict reasons are surfaced into the label (the failing-evidence
@@ -443,7 +443,7 @@ def _advance_phases(
     (ruling 1). All checks pass -> ``phase_passed`` (guarded on recorded state so
     resume never double-emits, ruling 6) and, unless this is the LAST phase,
     advance to the next (``phase_started``, counters reset, ruling 1). The last
-    phase passing does NOT auto-complete — the planner still owns ``complete_run``.
+    phase passing does NOT auto-complete, the planner still owns ``complete_run``.
     Returns the CURRENT phase's per-check results once advancement settles.
     """
 
@@ -452,7 +452,7 @@ def _advance_phases(
     # Advance by POSITION, resolved from the cursor ONCE: re-looking-up the current
     # id each pass would resolve a DUPLICATE phase id backward and hang forever (the
     # validator rejects dup ids, but the loop stays safe regardless). The skeleton
-    # is stable here — _advance_phases never revises it.
+    # is stable here, _advance_phases never revises it.
     idx = _phase_index(skeleton, store.state.current_phase_id)
     while True:
         phase = skeleton[idx]
@@ -554,7 +554,7 @@ def _transport_call(
         store.update(planner_call_count=store.state.planner_call_count + 1)
         try:
             return planner.plan(prompt)
-        except BaseException as exc:  # transport boundary — classify then react
+        except BaseException as exc:  # transport boundary, classify then react
             classification = classify_failure(exc)
             journal.emit(
                 lambda s: PlannerCallFailed(seq=s, ts=_now(), classification=classification)
@@ -597,7 +597,7 @@ def _plan_boundary(
     rulings 1-3); the gate enforces phase-escalation position legality (ruling 2)
     and rejects ``revise_phases`` that reuses an already-passed phase id. Re-asks
     on an invalid decision (journaled ``planner_call_failed("transient")``) and on
-    a ``complete_run`` whose evidence fails — both share the ≤2 re-ask budget;
+    a ``complete_run`` whose evidence fails, both share the ≤2 re-ask budget;
     exhausting it escalates the run.
     """
 
@@ -809,7 +809,7 @@ def _final_polish(
     final_polish: FinalPolish | None,
     vision_reviewer: VisionReviewer | None,
 ) -> None:
-    """Optionally let codex polish the finished repo inline — model proposes, the
+    """Optionally let codex polish the finished repo inline, model proposes, the
     state machine disposes. Runs only when configured AND a repo + final branch
     exist. ANY error (codex, worktree, evidence) is a CLEAN no-op: the pass can
     never turn a completed run into a failure, so the whole body is guarded.
@@ -822,7 +822,7 @@ def _final_polish(
         return
     # Idempotent on resume (ruling 6): a kill AFTER adopting the polish but BEFORE
     # status=completed would otherwise re-ask the planner -> complete_run ->
-    # re-run polish and STACK a second commit. The journal leads — if a polish
+    # re-run polish and STACK a second commit. The journal leads, if a polish
     # outcome is already recorded for this run, the pass has run; do not repeat it.
     if _polish_already_ran(run_dir):
         return
@@ -843,7 +843,7 @@ def _polish_already_ran(run_dir: RunDir) -> bool:
 
     The durable journal is the source of truth: an ``applied`` or ``skipped``
     event means the (idempotent) pass already executed, so a re-entered run must
-    not run it again. Reads the flushed events file — every ``emit`` fsyncs.
+    not run it again. Reads the flushed events file, every ``emit`` fsyncs.
     """
 
     return any(
@@ -864,11 +864,11 @@ def _run_final_polish(
 ) -> None:
     """The polish body (caller guards every failure into a no-op).
 
-    Detached worktree at the final branch (committing there moves NO branch — a
+    Detached worktree at the final branch (committing there moves NO branch, a
     discarded polish leaves nothing behind); codex edits it; a zero-diff pass is a
     no-op; otherwise the edits are committed and the SAME ``complete_run`` evidence
     is re-run against the polish commit. Pass -> the run's integration branch is
-    force-moved to the polish commit (a REAL ref — the commit is never left
+    force-moved to the polish commit (a REAL ref, the commit is never left
     dangling on a torn-down worktree) and that BRANCH NAME becomes the final
     branch; fail -> drop it, the original completion stands.
     """
@@ -909,8 +909,8 @@ def _run_final_polish(
             )
             return
         # Materialize a real ref BEFORE the worktree (the only thing referencing
-        # the polish commit) is torn down, and record the BRANCH NAME — not the
-        # bare sha — so the run's final branch resolves to the polished work.
+        # the polish commit) is torn down, and record the BRANCH NAME, not the
+        # bare sha, so the run's final branch resolves to the polished work.
         changed = wt.changed_paths(repo, base_commit, polish_commit)
         wt.force_branch(repo, branch, polish_commit)
         store.update(last_integration_branch=branch)
@@ -945,7 +945,7 @@ def _fail_valve(
 ) -> RunOutcome:
     # The safety valve (production planner-call cap / harness epoch bound) tripped.
     # Terminal but not an escalation. Emit a vocabulary event so the journal is
-    # self-describing — a watcher can render + exit instead of hanging on a run
+    # self-describing, a watcher can render + exit instead of hanging on a run
     # whose durable status is "failed" but whose journal never closed.
     store.update(status="failed", terminal_reason=reason)
     journal.emit(lambda s: RunFailed(seq=s, ts=_now(), reason=reason))
@@ -1092,7 +1092,7 @@ def run_grind(
     a cap (config > built-in default) so an unattended revision spin cannot
     drain the planner subscription (gate-5 P0: 34 calls overnight); ``None``
     (= off) remains a test seam only. ``max_epochs`` is a TEST-harness valve
-    (off by default — NOT loop policy). When tripped the run stops with a
+    (off by default, NOT loop policy). When tripped the run stops with a
     ``failed`` outcome and ``run_state.json`` records why.
     """
 
@@ -1169,7 +1169,7 @@ def resume_grind(
 ) -> RunOutcome:
     """Re-enter a killed run from ``run_state.json`` + the journal (ruling 6).
 
-    ``awaiting_planner`` (incl. a kill mid-planner-call): re-issue — nothing
+    ``awaiting_planner`` (incl. a kill mid-planner-call): re-issue, nothing
     landed on disk, the call is idempotent by construction, so it is re-asked,
     not burned. ``running_epoch``: finish the in-flight epoch via ``resume_epoch``
     (re-parsing the pending decision), then continue the loop. Already-terminal
@@ -1195,7 +1195,7 @@ def resume_grind(
     started_phases = {e.phase_id for e in journal_events if isinstance(e, PhaseStarted)}
     # Seed the passed set from the JOURNAL (not just run_state.json) so a kill
     # between emitting phase_passed and persisting the cursor still suppresses a
-    # duplicate phase_passed on resume — the journal leads, ruling 6.
+    # duplicate phase_passed on resume, the journal leads, ruling 6.
     passed_phases = {e.phase_id for e in journal_events if isinstance(e, PhasePassed)}
     with JournalWriter(run_dir.events_path) as journal:
         journal.emit(lambda s: RunResumed(seq=s, ts=_now(), run_id=state.run_id))

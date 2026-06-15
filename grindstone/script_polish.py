@@ -4,14 +4,14 @@ The B5 polish pass lets codex EDIT a finished, gated repo inline (workspace-writ
 for finishing touches. Like every other model boundary, grindstone reaches it
 through a request **script** (``models/codex_polish.sh``) and never learns the
 transport (codex) behind it: the script runs ``codex exec -s workspace-write`` in
-the worktree and edits files IN PLACE — there is NO disk-contract verdict, because
+the worktree and edits files IN PLACE, there is NO disk-contract verdict, because
 the GATE is the run's evidence re-run (``run_loop._final_polish``), not codex's
 word. ``ScriptPolisher`` Popen's the script as a group leader, supervises the
 wall-clock, and on timeout delegates the kill to ``stop.sh`` (mirrors
 ``ScriptVisionReviewer``).
 
 ``polish`` returns whether codex ran SUCCESSFULLY (exit 0); a non-zero exit or a
-timeout returns ``False`` — never an exception. The caller treats a ``False`` (and
+timeout returns ``False``, never an exception. The caller treats a ``False`` (and
 any error it raises around the call) as a clean no-op: a failed polish can never
 turn a completed run into a failure.
 """
@@ -53,7 +53,7 @@ class ScriptPolisher:
 
     ``script`` is the absolute path to ``codex_polish.sh``; ``stop.sh`` is its
     sibling. ``timeout_s`` is the transport-owned wall-clock supervisor. No model
-    identity here — that lives in the script.
+    identity here, that lives in the script.
     """
 
     def __init__(self, *, script: Path, timeout_s: float) -> None:

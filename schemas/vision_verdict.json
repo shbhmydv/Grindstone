@@ -14,7 +14,7 @@
       "type": "array",
       "items": { "type": "string", "maxLength": 512 },
       "maxItems": 16,
-      "description": "Why it passed or (especially) failed — surfaced in the failing-check label."
+      "description": "Why it passed or (especially) failed, surfaced in the failing-check label."
     }
   }
 }

@@ -238,7 +238,7 @@ def test_concurrent_fanout_per_task_causality(git_repo: Path, run_dir: RunDir) -
 
 
 def test_default_concurrency_caps_at_four(git_repo: Path, run_dir: RunDir) -> None:
-    # 6 tasks, default concurrency = min(4, n) — just assert it runs to completion.
+    # 6 tasks, default concurrency = min(4, n), just assert it runs to completion.
     tasks = _disjoint_tasks(6)
     outcome = _run(run_dir, git_repo, tasks, _file_workers(6))
     assert outcome.status == "completed"

@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# local_request.sh — the `local` worker role. Runs pi one-shot on a local GPU.
+# local_request.sh, the `local` worker role. Runs pi one-shot on a local GPU.
 #
 # This script owns the whole grindstone<->local-model boundary: model identity,
-# transport (pi) and the killable process group. The `local` role is ONE model —
+# transport (pi) and the killable process group. The `local` role is ONE model,
 # Qwen3.6-27B UD-Q6_K_XL spanning both GPUs on a single :8080 endpoint whose
 # --parallel 2 slots ARE the concurrency bound (no GPU arbitration). Grindstone
 # passes only a worktree, a prompt file, a log dir, a handle-out path and a
-# timeout — it never learns the transport or the model behind the `local` role.
+# timeout, it never learns the transport or the model behind the `local` role.
 #
 # The agent writes handoff.json into the worktree; that file is the ONLY result
-# channel — stdout is never parsed. We propagate pi's exit code and forward its
+# channel, stdout is never parsed. We propagate pi's exit code and forward its
 # stderr to ours so the caller can grep `rate|limit|429`.
 set -euo pipefail
 
@@ -44,7 +44,7 @@ handle_out="$(cd "$(dirname "$handle_out")" && pwd)/$(basename "$handle_out")"
 
 # Model identity is THIS script's concern. The local role is ONE model:
 # Qwen3.6-27B UD-Q6_K_XL on a single :8080 endpoint spanning both GPUs (no
-# per-attempt GPU claim — the endpoint's --parallel 2 slots are the concurrency
+# per-attempt GPU claim, the endpoint's --parallel 2 slots are the concurrency
 # bound). pi routes `local-reviewer` to :8080 via its own config.
 # Override for your own rig via $GRINDSTONE_LOCAL_PROVIDER / $GRINDSTONE_LOCAL_MODEL
 # (the pi --provider/--model your agent routes to your local endpoint).

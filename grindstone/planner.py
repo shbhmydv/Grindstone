@@ -9,18 +9,18 @@ semantic validation before dispatch. The transport only returns raw text.
 Journal mapping for an INVALID decision (ruling 8): the vocabulary has no
 "invalid decision" event. A decision that fails the gate is journaled by the
 *caller* as ``planner_call_succeeded`` NOT emitted + ``planner_call_failed`` with
-classification ``"transient"`` — it is a retryable bad output, re-asked up to
+classification ``"transient"``, it is a retryable bad output, re-asked up to
 twice before the run escalates. (Transport-level failures are journaled with
 their ``classify_failure`` result; this module owns that classification.)
 
 Input construction is a PURE function over durable state (ruling 3):
 
-  - **Stable head** — byte-identical across every call of a run: a fixed system
+  - **Stable head**, byte-identical across every call of a run: a fixed system
     preamble, an (empty at S3) ``<skills>`` digest, an (empty at S3, S5 seam)
     ``<repo_memory>`` digest, and the stored ``<skeleton>`` as compact JSON. The
     head changes ONLY when ``propose_skeleton`` / ``revise_phases`` change the
-    skeleton — then, and only then, the prefix cache legitimately resets.
-  - **Volatile tail** — ``<state>`` (phase id, epoch counter, keyed-log index),
+    skeleton, then, and only then, the prefix cache legitimately resets.
+  - **Volatile tail**, ``<state>`` (phase id, epoch counter, keyed-log index),
     ``<last_epoch>`` (the prior outcome flattened: per-task status/attempts/tier,
     each DONE task's handoff resulting_state + downstream_needs, each FAILED
     task's last failure reason), optional ``<errors>`` (re-ask feedback), and
@@ -39,7 +39,7 @@ from grindstone.contracts.semantics import epoch_decision_violations
 from grindstone.epoch_loop import EpochOutcome
 from grindstone.rundir import RunDir
 
-# The transport exception family is the workers' (ruling 1) — re-exported here so
+# The transport exception family is the workers' (ruling 1), re-exported here so
 # planner code imports one surface. ``PlannerHardError`` is the planner-only
 # addition for auth/config: it is deliberately NOT a ``TransportError`` so
 # ``classify_failure`` reads it as ``hard`` (the default branch).
@@ -90,7 +90,7 @@ TOOL_NAMES: frozenset[str] = frozenset(
 class PlannerHardError(Exception):
     """A planner failure that needs a human: auth, config, unknown model error.
 
-    Outside the transport exception family on purpose — ``classify_failure``
+    Outside the transport exception family on purpose, ``classify_failure``
     returns ``hard`` for it (and for any other unrecognized exception).
     """
 
@@ -125,7 +125,7 @@ MAX_REASKS = 2
 def classify_failure(exc: BaseException) -> FailureClass:
     """Three-way classification of a planner-call failure (ARCHITECTURE.md).
 
-    ``RateLimited`` → rate_limit (wait for the window — never auto-spill to a
+    ``RateLimited`` → rate_limit (wait for the window, never auto-spill to a
     different planner). ``TransportError`` / ``WorkerTimeout`` → transient (retry
     the same call). Anything else (auth/config/unknown) → hard (escalate).
     """
@@ -163,29 +163,29 @@ Rules:
   the keyed-log index below; never invent a key. Resulting artifacts are named
   by their log key, never inlined. An accepted artifact task's `artifact_out`
   file is published to the keyed log, and an `artifact_exists` check may name
-  it either by its exact log key or by its bare filename — use the bare
+  it either by its exact log key or by its bare filename, use the bare
   filename in phase exit criteria (the P*/E*/T*/ placement is decided epochs
   later); it passes only while exactly one logged artifact carries that name.
 - implement tasks carry `file_ownership` globs that must be pairwise DISJOINT
   across the epoch (the merge-correctness mechanism). research/review/artifact
   tasks carry `artifact_out`; review tasks also carry `targets`.
 - Choose the mode by the deliverable's DESTINATION, never by its flavor.
-  Output the job requires as a COMMITTED file in the repo tree — code, config,
-  docs, even prose — is implement work: only implement tasks run in a worktree
+  Output the job requires as a COMMITTED file in the repo tree, code, config,
+  docs, even prose, is implement work: only implement tasks run in a worktree
   and get committed. Output consumed via the keyed log (an analysis, report,
   or investigation the job does NOT require as a committed file) is research
   or artifact work shipped through `artifact_out`; review judges existing work
   and ships a verdict the same way. Never give a task a worktree its
   deliverable does not need.
 - Sequence by tier of thinking. research/review (and visual epochs) run on the
-  stronger SENIOR tier; implement/artifact run on the local rig — so a skeleton
+  stronger SENIOR tier; implement/artifact run on the local rig, so a skeleton
   is also a routing choice: put judgment on senior, production on local. For
   heavy or judgment-laden work, SPLIT into phases rather than cramming it into a
   single local epoch, and feed each step forward through the keyed log (a
   non-implement epoch's `artifact_out` becomes a later epoch's `inputs`). Good
   shapes (nudges, not a fixed menu): heavy build = research -> implement ->
   review; report / triage / migration = research -> artifact (do NOT collapse the
-  analysis into one local artifact epoch — that downgrades it off senior); UI =
+  analysis into one local artifact epoch, that downgrades it off senior); UI =
   research -> implement with `visual:true` -> a phase exit criterion that builds,
   screenshots, then `vision_review`s it. A small job can be a single epoch.
 - Taste routing: set `"visual": true` on an implement or review epoch whose
@@ -193,7 +193,7 @@ Rules:
   rendered page, a diagram, anything judged by how it LOOKS). That epoch is
   built by the stronger taste-building senior tier instead of the local default
   (the senior is a text model; the actual image judgment is the vision_review
-  gate below). Omit it (defaults false) for non-visual work — backend, logic,
+  gate below). Omit it (defaults false) for non-visual work, backend, logic,
   plain text/config.
 - Vision-review (taste gate): a third check `{"vision_review":{"screenshot":
   "<path relative to the eval worktree>","criteria":"<what polished looks
@@ -203,12 +203,12 @@ Rules:
   into the tip worktree (e.g. `{"cmd":"npm run build && node shot.js
   ui/screen.png"}`), then a `vision_review` of that `ui/screen.png` against the
   design bar. The state machine renders the verdict deterministically (a failed
-  taste verdict fails the phase, just like a failed command) — it is not a task
+  taste verdict fails the phase, just like a failed command), it is not a task
   `done_when` (a worker scratch has no renderer/screenshot).
 - done_when is scoped by mode. research/review/artifact tasks run in a scratch
   dir that is NOT a repo checkout: their done_when must verify the
   artifact itself (e.g. `test -s notes.md` in the task CWD, or an
-  artifact_exists key) — never repo build/test commands; those can only pass in
+  artifact_exists key), never repo build/test commands; those can only pass in
   implement tasks or phase exit criteria (run in a checkout of the tip).
 - escalate_run only when you genuinely cannot proceed. complete_run only when
   the whole job is done; its `evidence` checks are re-run deterministically and
@@ -219,30 +219,39 @@ Rules:
 
 Task sizing, independence, and decomposition:
 - Tasks within an epoch run in PARALLEL and MUST NOT consume each other's
-  outputs. Anything where one task needs another's result is SEQUENTIAL work —
+  outputs. Anything where one task needs another's result is SEQUENTIAL work,
   put it in a later epoch (or phase), never in a sibling task of the same epoch.
+- Two axes, OPPOSITE biases. Splitting PARALLEL tasks inside one epoch: be
+  CONSERVATIVE (prefer one task when the work is interconnected; see below).
+  Splitting SEQUENTIAL work across epochs: be LIBERAL. Give a step its own epoch
+  whenever it needs an earlier step's `artifact_out`, OR a real checkpoint/gate
+  sits between steps, even at the SAME tier, not only when the tier changes.
+  Each epoch boundary is a free planner checkpoint plus a deterministic gate. Do
+  not fuse a genuine A-then-B dependency into one opaque task; do not manufacture
+  artificial steps either (every epoch costs a planner call, bounded by
+  `epoch_budget`).
 - Each task must fit ONE worker with a ~90k-token working context. Treat 90k as
   the sizing CONTRACT: the worker has headroom above it, but that headroom is
   overrun insurance, never plannable budget. If a task cannot plausibly fit, it
   is two tasks or two epochs.
 - `epoch_budget` is how many epochs a phase may consume before the state machine
   fires a phase escalation (forcing you to revise_phases or escalate_run). It is
-  a ceiling sized to the phase's real arc — a small phase is 1-2, a broad build
-  phase a few more — not a target; unused budget is free.
+  a ceiling sized to the phase's real arc, a small phase is 1-2, a broad build
+  phase a few more, not a target; unused budget is free.
 - Decompose CONSERVATIVELY, at the top level only. You are a powerful planner:
   prefer ONE task whenever the work is even remotely interconnected and shared
   context helps. Split into multiple tasks ONLY when the parts are genuinely
   independent, or genuinely too big for one worker's context. Naive fan-out of
-  intertangled work hands the hardest part — cross-file consistency — to the
+  intertangled work hands the hardest part, cross-file consistency, to the
   least-coordinated agents.
 - Carry the relevant job-spec requirements into each task's `goal` VERBATIM, or
   point at the exact input artifacts (by log key) that contain them. Never
-  paraphrase or summarize a requirement away — lossy paraphrase silently drops
+  paraphrase or summarize a requirement away, lossy paraphrase silently drops
   requirements. `goal` is capped at 1024 chars: quote exactly what fits and move
   the rest into referenced input artifacts; never compress a requirement into a
   summary.
 
-Output format — emit EXACTLY ONE JSON object with this envelope, nothing else:
+Output format, emit EXACTLY ONE JSON object with this envelope, nothing else:
   {"schema_version":"1","tool":"<one tool name>","args":{ ... }}
 The keys schema_version, tool, args are ALL mandatory. Do NOT use the shorthand
 {"<tool>":{...}} and do NOT omit schema_version.
@@ -256,7 +265,7 @@ The keys schema_version, tool, args are ALL mandatory. Do NOT use the shorthand
 - complete_run:     {"summary":..,"evidence":[check..]}
 A check is {"cmd":..,"expect_exit"?:int} or {"artifact_exists":"<log key>"} or
 {"vision_review":{"screenshot":"<eval-worktree-relative path>","criteria":..}}
-(taste gate — phase exit criteria only, after a cmd check renders the shot).
+(taste gate, phase exit criteria only, after a cmd check renders the shot).
 
 Example first decision (note: TWO phases minimum):
   {"schema_version":"1","tool":"propose_skeleton","args":{"phases":[
@@ -284,7 +293,7 @@ def stable_head(job: str, skeleton: list[Phase] | None, repo_memory: str | None 
     start so byte-identity holds run-long; ``skills`` stays empty). Identical
     bytes while those are unchanged; changes exactly when ``propose_skeleton`` /
     ``revise_phases`` move the skeleton. The ``<job>`` slot is the spec the
-    planner plans against — frozen at run start, hence part of the head (an
+    planner plans against, frozen at run start, hence part of the head (an
     addition to ruling 3's enumerated slots: a planner cannot plan without the
     ask). The ``<repo_memory>`` slot is empty-byte-identical when no digest
     exists (the common case), so the seam adds zero cost to a memory-less repo.
@@ -316,7 +325,7 @@ def flatten_last_epoch(run_dir: RunDir, outcome: EpochOutcome) -> list[dict[str,
     """Flatten an EpochOutcome into compact per-task rows for ``<last_epoch>``.
 
     DONE tasks contribute their handoff ``resulting_state`` + ``downstream_needs``
-    (read from the keyed log — references, never bodies); FAILED tasks contribute
+    (read from the keyed log, references, never bodies); FAILED tasks contribute
     their last failure reason. Pure over durable state (the relocated handoffs).
     """
 
@@ -350,7 +359,7 @@ class PhaseTailInfo:
     References, never payloads: per-check pass/fail of the current phase's exit
     criterion (freshly evaluated by the core before this call), the integration
     tip's file LISTING (names + total, capped), the ids already passed, and
-    whether the current phase is under an escalation demand (budget exhausted —
+    whether the current phase is under an escalation demand (budget exhausted,
     only revise_phases / escalate_run are legal until it clears).
     """
 
@@ -377,7 +386,7 @@ def _phase_status_block(phase_id: str | None, phase: PhaseTailInfo) -> str:
     more = "" if len(phase.tip_files) >= phase.tip_total else f" (showing {len(phase.tip_files)})"
     status = (
         "<phase_status>\n"
-        f"current_phase: {phase_id or 'none'} — {phase.title}\n"
+        f"current_phase: {phase_id or 'none'}, {phase.title}\n"
         f"epoch_budget: {phase.budget_used}/{phase.budget} epochs used\n"
         "exit_criterion (deterministic, evaluated by the state machine):\n"
         f"{checks}\n"
@@ -408,7 +417,7 @@ def volatile_tail(
     phase: PhaseTailInfo | None = None,
 ) -> str:
     """The per-call suffix: running state, phase status, last-epoch report,
-    re-ask feedback, request. Never byte-stable — it carries everything that
+    re-ask feedback, request. Never byte-stable, it carries everything that
     moves (S4 adds the phase-status + integration-tip surfacing, ruling 3)."""
 
     log_lines = "\n".join(f"  - {k}" for k in log_index) or "  (empty)"
@@ -422,7 +431,7 @@ def volatile_tail(
     )
     phase_status = _phase_status_block(phase_id, phase) if phase is not None else ""
     if last_epoch_rows is None:
-        last = "<last_epoch>\n  (none — this is the first decision)\n</last_epoch>\n"
+        last = "<last_epoch>\n  (none, this is the first decision)\n</last_epoch>\n"
     else:
         last = f"<last_epoch>\n{_compact(last_epoch_rows)}\n</last_epoch>\n"
     errors = ""
@@ -497,15 +506,15 @@ def is_decision_like(obj: object) -> bool:
     return isinstance(obj, dict) and ("tool" in obj or _shorthand_tool(obj) is not None)
 
 
-# --- tolerant JSON extraction (core parsing — ruling 1) ------------------------
+# --- tolerant JSON extraction (core parsing, ruling 1) ------------------------
 
 
 def _balanced_object_spans(text: str) -> list[tuple[int, int]]:
     """Yield (start, end) of every TOP-LEVEL ``{...}`` region, string-aware.
 
     Brace counting that ignores braces inside JSON string literals (honouring
-    backslash escapes), so a model that emits reasoning then a fenced object —
-    or prose with braces in quotes — still yields the real object spans. Nested
+    backslash escapes), so a model that emits reasoning then a fenced object,
+    or prose with braces in quotes, still yields the real object spans. Nested
     objects are part of their enclosing top-level span, not separate entries.
     """
 
@@ -572,12 +581,12 @@ def normalize_tool_call(payload: object) -> object:
     """Canonicalize tolerated tool-call encodings to ``{schema_version,tool,args}``.
 
     Codex (and most function-calling models) natively emit either the canonical
-    envelope — sometimes without ``schema_version`` — or the shorthand
+    envelope, sometimes without ``schema_version``, or the shorthand
     ``{<tool>: <args>}``. Both are unambiguous dispatch-on-tool-name encodings;
     canonicalizing them here (structurally, not via fragile prompt wording) lets
     the authoritative schema stay the single source of truth. ``schema_version``
     defaults to ``"1"`` (the only version in v1) when absent; nothing else is
-    inferred — a genuinely malformed object passes through and is rejected.
+    inferred, a genuinely malformed object passes through and is rejected.
     """
 
     if not isinstance(payload, dict):
@@ -605,7 +614,7 @@ def _position_legality(
     ``propose_skeleton`` is legal ONLY on the first call (no skeleton yet); every
     other tool is legal ONLY once a skeleton exists. When the current phase is
     under an escalation demand (budget exhausted, S4 ruling 2), the ONLY legal
-    tools are ``revise_phases`` / ``escalate_run`` — any work epoch is rejected
+    tools are ``revise_phases`` / ``escalate_run``, any work epoch is rejected
     back to the planner via the same re-ask ladder.
     """
 

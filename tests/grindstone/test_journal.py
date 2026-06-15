@@ -1,6 +1,6 @@
 """The per-run journal: a markdown render of events.ndjson (the human-facing
 post-mortem), written at terminal, and reaped for every run BUT the latest when
-a new run starts. Derived from events — so reaping a journal loses nothing the
+a new run starts. Derived from events, so reaping a journal loses nothing the
 retained events.ndjson can't re-render.
 """
 

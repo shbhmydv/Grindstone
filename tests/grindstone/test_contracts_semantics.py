@@ -69,7 +69,7 @@ def test_duplicate_task_ids_rejected() -> None:
 
 def test_duplicate_phase_ids_rejected() -> None:
     # Two phases sharing an id would wedge phase advancement in an unbounded hang
-    # (_phase_index resolves an id to its FIRST occurrence) — reject at the gate.
+    # (_phase_index resolves an id to its FIRST occurrence), reject at the gate.
     dup = parse_decision(skeleton_decision(phase_dict("P1", title="a"), phase_dict("P1", title="b")))
     bad = epoch_decision_violations(dup, existing_log_keys=EMPTY, completed_phase_ids=EMPTY)
     assert any("duplicate phase id" in v for v in bad)

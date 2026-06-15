@@ -2,7 +2,7 @@
 6; not collected). Drives ``run_grind`` with a planner that blocks at a file
 sentinel on its FIRST call (so the kill lands while a planner call is in flight,
 status=awaiting_planner, nothing on disk). The parent SIGKILLs once the sentinel
-appears, then resumes — proving the in-flight call is RE-ISSUED, not burned.
+appears, then resumes, proving the in-flight call is RE-ISSUED, not burned.
 """
 
 from __future__ import annotations

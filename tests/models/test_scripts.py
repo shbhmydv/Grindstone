@@ -105,7 +105,7 @@ def test_local_request_propagates_nonzero_exit(tmp_path: Path) -> None:
     )
 
     # pi's exit code is propagated EXACTLY (not masked by the script's own error
-    # path — the IQ4-era $gpu_index unbound-var bug would have exited 1 here).
+    # path, the IQ4-era $gpu_index unbound-var bug would have exited 1 here).
     assert res.returncode == 7, res.stderr
     # The reason is forwarded to the caller's stderr (grindstone greps it).
     assert "429" in res.stderr or "rate" in res.stderr.lower()
@@ -192,7 +192,7 @@ def test_senior_request_relays_handoff_no_gpu(tmp_path: Path) -> None:
             "--handle-out", str(handle),
             "--timeout", "30",
         ],
-        # NOTE: no GRINDSTONE_GPU_LOCKDIR — senior claims no GPU at all.
+        # NOTE: no GRINDSTONE_GPU_LOCKDIR, senior claims no GPU at all.
         env=_env_with_stub_path(stub_dir),
         capture_output=True,
         text=True,
@@ -206,7 +206,7 @@ def test_senior_request_relays_handoff_no_gpu(tmp_path: Path) -> None:
 def test_senior_request_runs_opencode_with_exa_and_no_pin(tmp_path: Path) -> None:
     # Senior runs the opencode agent with the Exa websearch tool ON, pinned to the
     # cloud model, auto-approving tools. It writes NO .pi pin (opencode owns its own
-    # agents), and the per-attempt OPENCODE_DB lives in the LOG dir — never the
+    # agents), and the per-attempt OPENCODE_DB lives in the LOG dir, never the
     # worktree (so it can't leak into a commit, and concurrent attempts isolate).
     stub_dir = tmp_path / "bin"
     stub_dir.mkdir()
@@ -426,7 +426,7 @@ def test_vision_review_propagates_nonzero_exit(tmp_path: Path) -> None:
 
 
 def test_vision_review_rejects_non_image_screenshot(tmp_path: Path) -> None:
-    # PNG/JPEG only — a non-image screenshot path is a hard error before codex.
+    # PNG/JPEG only, a non-image screenshot path is a hard error before codex.
     stub_dir = tmp_path / "bin"
     stub_dir.mkdir()
     _make_stub(stub_dir, "codex", 'exit 0\n')
@@ -565,7 +565,7 @@ def test_polish_invokes_codex_workspace_write_with_prompt_and_criteria(
 
 def test_polish_passes_screenshot_after_prompt(tmp_path: Path) -> None:
     # An optional screenshot is forwarded via -i, AFTER the prompt positional
-    # (codex exec arg-ordering gotcha — mirrors vision_review.sh).
+    # (codex exec arg-ordering gotcha, mirrors vision_review.sh).
     stub_dir = tmp_path / "bin"
     stub_dir.mkdir()
     record = tmp_path / "argv.txt"

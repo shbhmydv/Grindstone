@@ -4,14 +4,14 @@ ARCHITECTURE.md / S2 rulings 4-7. Implement tasks each run in a throwaway worktr
 branched from the **epoch base** (the repo tip at epoch dispatch). The worker's
 writes land there, the core scope-checks the diff against the task's
 ``file_ownership`` globs, commits on success (models never run git), and at the
-done-predicate the core fast-forward-merges every DONE task's branch — in task
-order — into the epoch integration branch. Pairwise-disjoint ownership plus the
+done-predicate the core fast-forward-merges every DONE task's branch, in task
+order, into the epoch integration branch. Pairwise-disjoint ownership plus the
 scope check make the merges commute, so ANY merge conflict is a structural bug
 and aborts the epoch (``integration_conflict``), never a retried runtime path.
 
-Pure subprocess git (no GitPython). The scars ported from the v7 pipeline —
+Pure subprocess git (no GitPython). The scars ported from the v7 pipeline,
 worktrees as scratch CWD, force removal + prune of debris, merge in an isolated
-worktree so the operator's checkout is never touched — are reimplemented here,
+worktree so the operator's checkout is never touched, are reimplemented here,
 not imported.
 
 Every git op runs with ``cwd`` set to a caller-supplied repo or worktree path;
@@ -90,7 +90,7 @@ def resolve_commit(repo: Path, ref: str) -> str:
 
 
 def head_commit(repo: Path) -> str:
-    """The repo tip commit sha — the first epoch's base captured at dispatch."""
+    """The repo tip commit sha, the first epoch's base captured at dispatch."""
 
     return resolve_commit(repo, "HEAD")
 
@@ -99,7 +99,7 @@ def list_tree(repo: Path, ref: str) -> list[str]:
     """Every tracked file path at ``ref`` (``git ls-tree -r --name-only``).
 
     The cumulative-state surfacing primitive (S4 ruling 3b): a reference listing
-    of the integration tip the planner plans against — names only, never bodies.
+    of the integration tip the planner plans against, names only, never bodies.
     Returns ``[]`` when ``ref`` cannot be resolved (e.g. a not-yet-built branch).
     """
 
@@ -131,7 +131,7 @@ def is_ancestor(repo: Path, maybe_ancestor: str, descendant: str) -> bool:
 
 
 def delete_branch(repo: Path, branch: str) -> None:
-    """Force-delete a branch if it exists (idempotent — zero dead refs)."""
+    """Force-delete a branch if it exists (idempotent, zero dead refs)."""
 
     if branch_exists(repo, branch):
         _git(repo, "branch", "-D", branch, check=False)
@@ -186,7 +186,7 @@ def add_worktree_detached(repo: Path, path: Path, *, ref: str) -> None:
 
     Used by the check evaluator (phase exit criteria / complete_run evidence):
     it only reads a tree, and `git worktree add <branch>` refuses any branch
-    already checked out elsewhere — including the operator's own checkout (E2E
+    already checked out elsewhere, including the operator's own checkout (E2E
     gate2 P0). Detached HEAD cannot collide by construction.
     """
 
@@ -235,7 +235,7 @@ def commit_all(worktree: Path, message: str) -> bool:
     """Stage everything and commit; return whether a commit was created.
 
     The core commits (models never run git). A zero-diff attempt stages nothing
-    and creates no commit (``False``) — HEAD stays at base, which integrates as
+    and creates no commit (``False``), HEAD stays at base, which integrates as
     a no-op. Identity is supplied per-command so no repo-level config is needed.
     """
 

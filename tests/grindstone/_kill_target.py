@@ -3,7 +3,7 @@
 Drives ``run_epoch`` with a 2-task implement epoch on a throwaway git repo. T1
 runs to DONE fast; T2 blocks at a deterministic sync point (writes a ``ready``
 sentinel, then busy-waits on a ``release`` sentinel that never appears). The
-parent waits until T1 is DONE *and* T2 is in flight, then SIGKILLs — exercising
+parent waits until T1 is DONE *and* T2 is in flight, then SIGKILLs, exercising
 ruling 9 (>=1 task DONE, >=1 in flight at kill).
 """
 
@@ -36,7 +36,7 @@ class _BlockingWorker:
     def run(self, request: WorkerRequest) -> None:
         self.ready.write_text("ready", encoding="utf-8")
         # Stay in flight until SIGKILLed (release never appears). Poll on a
-        # short sleep, NOT a sched_yield hot-spin — a leaked subprocess must
+        # short sleep, NOT a sched_yield hot-spin, a leaked subprocess must
         # never peg a CPU (the reaper bounds its lifetime, but defence in
         # depth keeps it cheap meanwhile).
         while not self.release.exists():

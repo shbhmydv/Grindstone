@@ -3,7 +3,7 @@
 AFTER a run's ``complete_run`` evidence passes, an OPTIONAL pass lets codex EDIT
 the finished repo inline (workspace-write) for finishing touches. Safety is the
 whole point: codex's edits are KEPT only if the SAME evidence STILL passes against
-the polished commit — otherwise discarded, and the original completion stands.
+the polished commit, otherwise discarded, and the original completion stands.
 Off by default; a polish pass can never bypass the gate or fail a completed run.
 
 These tests drive the whole pass through ``run_grind`` with a STUB polish script
@@ -53,7 +53,7 @@ def _run_state(run_dir: RunDir) -> RunState:
 # --- stub polish scripts (edit the worktree in place, no disk-contract verdict) --
 
 #: A stub that finds ``--repo`` (the writable worktree codex would edit), runs an
-#: arbitrary ``{body}`` against it, and exits ``$RC``. It never calls codex —
+#: arbitrary ``{body}`` against it, and exits ``$RC``. It never calls codex,
 #: ``{body}`` stands in for the model's inline edits.
 _STUB = """\
 #!/usr/bin/env bash
@@ -74,7 +74,7 @@ _BENIGN = 'printf polished > "$repo/POLISH.md"\nexit 0\n'
 _BREAKS = 'rm -f "$repo/f1.txt"\nexit 0\n'
 #: Leave the worktree untouched (codex decided nothing needed polishing).
 _NOCHANGE = "exit 0\n"
-#: The codex call itself failed (nonzero exit) — a clean no-op.
+#: The codex call itself failed (nonzero exit), a clean no-op.
 _NONZERO = 'echo "codex polish failed" >&2\nexit 3\n'
 
 

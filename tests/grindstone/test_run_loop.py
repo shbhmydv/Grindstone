@@ -39,7 +39,7 @@ def _ladder() -> list[tuple[str, OwnershipWorker]]:
 
 
 def test_evaluate_checks_artifact_bare_filename(tmp_path: Path) -> None:
-    """Gate-6 RCA: a skeleton-time exit criterion can only name the FILE — the
+    """Gate-6 RCA: a skeleton-time exit criterion can only name the FILE, the
     P*/E*/T*/ placement is chosen epochs later by the producing task. A bare
     filename passes iff exactly ONE logged artifact carries that name; exact
     keys keep working; ambiguity and absence stay False."""
@@ -64,7 +64,7 @@ def test_evaluate_checks_artifact_bare_filename(tmp_path: Path) -> None:
 
 def test_evaluate_checks_fresh_repo_unborn_head_fails_not_crashes(tmp_path: Path) -> None:
     """A repo with ZERO commits (unborn HEAD) has no tip to check out. A cmd
-    exit-criterion must FAIL deterministically — not let GitError escape and crash
+    exit-criterion must FAIL deterministically, not let GitError escape and crash
     the whole run (the most likely first-contact failure on a fresh project)."""
 
     repo = tmp_path / "fresh"

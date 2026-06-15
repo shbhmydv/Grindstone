@@ -1,12 +1,12 @@
-"""Deterministic mock planner — scripted decisions + scripted failures (S3).
+"""Deterministic mock planner, scripted decisions + scripted failures (S3).
 
 Same consumed-per-call discipline as ``MockWorker`` (ruling 10): the script is a
 list consumed one entry per ``plan()`` call, so a test pins the exact decision /
 failure sequence with zero randomness. An entry is either:
 
-  - a ``dict`` — a decision payload, returned as JSON text (optionally fence- or
+  - a ``dict``, a decision payload, returned as JSON text (optionally fence- or
     prose-wrapped so the core's extractor is exercised end-to-end); or
-  - a failure token from ``FAILURES`` — raising the matching transport exception
+  - a failure token from ``FAILURES``, raising the matching transport exception
     or returning malformed text.
 
 Failure taxonomy (the planner analogue of the worker's): ``rate_limit`` →
@@ -24,7 +24,7 @@ from grindstone.planner import PlannerHardError, RateLimited, TransportError, Wo
 
 
 #: An ``invalid`` token returns valid JSON that fails the decision gate (an
-#: implement decision with no tasks — schema-rejected), exercising the re-ask
+#: implement decision with no tasks, schema-rejected), exercising the re-ask
 #: ladder without any transport error.
 _INVALID_DECISION = {"schema_version": "1", "tool": "implement", "args": {}}
 
@@ -36,7 +36,7 @@ class MockPlanner:
     """A planner whose every ``plan()`` follows the next scripted entry.
 
     ``wrap`` chooses how decision dicts are rendered: ``"bare"`` (plain JSON),
-    ``"fence"`` (```json fenced), or ``"prose"`` (reasoning before + after) — so
+    ``"fence"`` (```json fenced), or ``"prose"`` (reasoning before + after), so
     a single test can prove the extractor survives codex's wrapping habits.
     """
 

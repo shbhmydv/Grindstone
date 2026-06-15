@@ -3,7 +3,7 @@ ruling 6; not collected). Drives ``run_grind`` with a planner that completes
 phase P1 (its epoch satisfies P1's exit criterion), lets the core fire
 ``phase_passed(P1)`` + advance to P2, then BLOCKS at a file sentinel on the
 NEXT planner call (now in P2). The parent SIGKILLs once the transition is on
-disk, then resumes — proving criteria are re-evaluated idempotently (no
+disk, then resumes, proving criteria are re-evaluated idempotently (no
 duplicate ``phase_passed`` for the already-passed P1).
 """
 

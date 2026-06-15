@@ -178,7 +178,7 @@ exit 0
         scratch.mkdir()
         try:
             worker.run(_request(scratch, task_id=f"P1/E1/T{i}", attempt=1))
-        except BaseException as exc:  # noqa: BLE001 — surface to the asserting thread
+        except BaseException as exc:  # noqa: BLE001, surface to the asserting thread
             errors.append(exc)
 
     threads = [threading.Thread(target=_go, args=(i,)) for i in range(n)]

@@ -2,7 +2,7 @@
 
 The role-split boundary: grindstone knows only a *role* name
 (`local` / `senior`) reached through a script. It never learns the transport
-(`pi` / cloud) or the model behind the role — the script owns transport, model
+(`pi` / cloud) or the model behind the role, the script owns transport, model
 identity, GPU arbitration, the pin file (``.pi/settings.json``) and the killable
 process group. ``ScriptWorker`` builds the prompt (orchestration: *what* to ask,
 ``build_worker_prompt`` in core), Popen's the script as a group leader, supervises
@@ -37,9 +37,9 @@ class ScriptWorker:
 
     ``script`` is the absolute path to ``local_request.sh`` / ``senior_request.sh``;
     ``stop.sh`` is resolved as its sibling. ``slots`` bounds concurrency,
-    ``timeout_s`` is the transport-owned wall-clock supervisor (NOT loop policy —
+    ``timeout_s`` is the transport-owned wall-clock supervisor (NOT loop policy,
     §10), ``log_root`` is where per-attempt log dirs + handle files are allocated
-    (never the run dir — §7). No provider/model: those moved into the script.
+    (never the run dir, §7). No provider/model: those moved into the script.
     """
 
     def __init__(

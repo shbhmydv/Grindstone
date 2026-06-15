@@ -11,7 +11,7 @@ pass. It is Python with Pydantic at every boundary and `mypy --strict` clean.
 The differentiator is the loop itself. It is **not** a stateful "leader" model
 that owns the run and drifts over a long horizon. It is a fixed, deterministic
 state machine with provable invariants (termination, no orphaned tasks, budget
-caps). The only model that steers the run — the planner — is a **stateless
+caps). The only model that steers the run, the planner, is a **stateless
 one-shot call**: Grindstone reconstructs its full input from durable state every
 time, so model drift has nowhere to accumulate. The model *proposes* one decision
 as constrained JSON; the state machine *validates and disposes* of it,
@@ -22,7 +22,7 @@ phase is done.
 
 Grindstone is a pure orchestrator that knows only **three role names** and reaches
 each through a request **script** behind a file contract. It never learns the
-transport, model identity, or GPU assignment hiding behind a script — those live
+transport, model identity, or GPU assignment hiding behind a script; those live
 entirely in `models/`.
 
 | role | what it does | reference adapter (`models/`) |
@@ -34,7 +34,7 @@ entirely in `models/`.
 Two more optional scripts back the taste features: `vision_review.sh` (the
 screenshot-judge gate) and `codex_polish.sh` (the final-polish pass);
 `stop.sh` + `_timeout_prefix.sh` are shared kill/timeout helpers. All scripts are
-**reference adapters** — point them at your own backends, or replace them. The
+**reference adapters**: point them at your own backends, or replace them. The
 per-repo `.grindstone/config.yaml` names each role's script plus its `slots`
 (per-role concurrency) and `timeout_s`; `planner` + `local` are required,
 `senior` is optional (its absence means a local-only escalation ladder).
@@ -71,7 +71,7 @@ skeleton. Each phase carries a deterministic `exit_criterion` and an
 `epoch_budget`. On every loop pass, once a skeleton exists, the core freshly
 evaluates the current phase's exit criterion **against the integration tip** in a
 throwaway worktree; all checks passing advances the phase (the last phase passing
-does *not* auto-complete — the planner still owns `complete_run`). A phase whose
+does *not* auto-complete; the planner still owns `complete_run`). A phase whose
 budget is exhausted with its criterion still failing fires a one-shot **phase
 escalation**, after which only `revise_phases` / `escalate_run` are legal until
 it clears.
@@ -87,7 +87,7 @@ state machine in `grindstone/task_loop.py`:
   commits the worktree and checks that every committed path falls inside the
   task's `file_ownership` globs. Because ownership is pairwise-disjoint and
   scope-checked, integration is fast-forward merges in task order that *cannot
-  conflict* — any conflict is treated as a structural bug and aborts the epoch.
+  conflict*; any conflict is treated as a structural bug and aborts the epoch.
 - **research / review / artifact** tasks run in a plain run-dir scratch directory
   with no worktree and no git: a non-write task is never handed the live repo as
   its CWD. They publish their `artifact_out` to the keyed log.
@@ -102,11 +102,11 @@ exists; everything else starts local).
 
 Every worker writes `handoff.json` **in its own CWD** and self-validates it.
 Grindstone relocates that file to the task's log key and re-validates it from
-scratch — schema → typed parse → semantic rules → a **grounding spot-check** that
+scratch: schema → typed parse → semantic rules → a **grounding spot-check** that
 every cited `{file, line}` actually exists → a re-run of the task's `done_when`.
 Only a `DONE` handoff whose checks all pass is accepted; any failure deletes the
 relocated record (zero dead artifacts) and re-queues the attempt. **Stdout is
-never parsed** — the disk file is the only result channel.
+never parsed**; the disk file is the only result channel.
 
 ### Deterministic gates
 
@@ -114,7 +114,7 @@ never parsed** — the disk file is the only result channel.
 criteria and `complete_run` evidence: command checks run in a tip worktree,
 `artifact_exists` checks resolve against the keyed log, and `vision_review`
 checks render a verdict (below). `complete_run` is never trusted on the planner's
-word — its `evidence` is re-run deterministically and the completion is rejected
+word; its `evidence` is re-run deterministically and the completion is rejected
 (and re-asked) if anything fails.
 
 ## The run-dir layout
@@ -125,7 +125,7 @@ so nothing resolves outside it:
 
 ```
 .grindstone/runs/<run-id>/
-  events.ndjson        append-only journal — the durable source of truth
+  events.ndjson        append-only journal, the durable source of truth
   run_state.json       run-level cursor (RunState): skeleton, phase, counters
   state.json           in-flight epoch cursor (EpochState): per-task status
   journal.md           human-facing markdown post-mortem (derived; latest run only)
@@ -142,7 +142,7 @@ backbone: a frozen vocabulary of Pydantic events (`run_started`, `phase_passed`,
 flushed and fsynced, with strictly monotonic `seq`. `replay()` folds the event
 stream into a run → phase → epoch → task tree; the same fold powers the live
 `watch` TUI and the post-mortem `journal.md`. The event stream alone is
-sufficient to render the whole run — `journal.md` is a derived view that carries
+sufficient to render the whole run; `journal.md` is a derived view that carries
 no trust and is never read back into the loop.
 
 ## Taste and vision features
@@ -156,14 +156,14 @@ Grindstone can build and judge work that is evaluated by how it *looks*:
   check shows that screenshot to a vision model (via `models/vision_review.sh`)
   with criteria for "what polished looks like". The script writes a
   `vision_verdict.json` that the core re-reads and validates (a disk contract,
-  never stdout — `grindstone/script_vision.py`); a failed taste verdict fails the
+  never stdout, `grindstone/script_vision.py`); a failed taste verdict fails the
   phase exactly like a failed command. The gate is "always fail, never crash":
   any error degrades to a deterministic FAIL.
 - **The optional final-polish pass** (`grindstone/script_polish.py`, off unless
   the config opts in): after a run's `complete_run` evidence passes, `codex` runs
   in `workspace-write` mode against a throwaway worktree of the final branch and
   edits it in place. The edits are **kept only if the same evidence still
-  passes** — otherwise discarded, leaving the original completion standing. They
+  passes**, otherwise discarded, leaving the original completion standing. They
   are committed to a branch but **never auto-pushed**, and the pass can never turn
   a completed run into a failure.
 
@@ -175,12 +175,12 @@ to *distinct* files, so the multi-epoch loop and the in-flight epoch never clobb
 each other.
 
 - A kill **while a planner call is in flight** leaves nothing on disk (planner
-  calls are side-effect-free), so resume simply re-issues the call — no work
+  calls are side-effect-free), so resume simply re-issues the call, no work
   burned.
 - A kill **mid-epoch** burns only the single in-flight worker attempt (a killed
   worker cannot be trusted): its worktree and branch are torn down and the attempt
   is abandoned, while DONE tasks keep their branches and handoffs and are never
-  re-run. Integration then finishes idempotently — already-merged branches are
+  re-run. Integration then finishes idempotently: already-merged branches are
   ancestors of the integration branch and are skipped.
 
 The keyed log, the atomic state files, and the append-only journal together mean

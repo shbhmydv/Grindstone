@@ -3,12 +3,12 @@ contract nudges toward (PLANNER_CONTRACT §3 "Sequencing by tier of thinking"):
 
   - research -> artifact: judgment on senior, the write-up on local, with the
     research findings flowing forward as a keyed-log input.
-  - research -> implement -> review: the heavy-build shape — map (senior), build
+  - research -> implement -> review: the heavy-build shape, map (senior), build
     (local, committed), judge (senior).
   - a visual implement epoch is built on the senior taste tier.
 
 These drive real runs through ``run_grind`` with a scripted ``MockPlanner`` and a
-two-tier ladder, asserting BOTH the tier routing and the cross-epoch handoff —
+two-tier ladder, asserting BOTH the tier routing and the cross-epoch handoff,
 the seams the dogfood surfaced (artifact publication + senior routing). Each
 phase carries an exit criterion that only passes once its epoch's deliverable
 exists, so epochs land in the intended phase (a trivially-true criterion would
@@ -122,7 +122,7 @@ def _artifact_task(
 def test_research_to_artifact_split_pipeline(git_repo: Path, run_dir: RunDir) -> None:
     """research (senior) publishes findings to the keyed log; a downstream artifact
     epoch (local) consumes that key as an ``input`` and writes the report. Proves
-    the cross-epoch keyed-log handoff AND tier routing in one run — and the input
+    the cross-epoch keyed-log handoff AND tier routing in one run, and the input
     only resolves because the research artifact was actually published (the dogfood
     bug would have left the key absent and failed the report decision's validation)."""
 

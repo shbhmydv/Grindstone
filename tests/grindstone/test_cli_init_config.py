@@ -155,7 +155,7 @@ def test_resolve_max_planner_calls_defaults_on(tmp_path: Path) -> None:
     """Gate-5 P0: an unattended run looped phase revisions for 34 codex calls
     because max_planner_calls was a test-only valve, off in production. The
     CLI now ALWAYS passes a cap: config value if set, else the built-in
-    default — never unbounded."""
+    default, never unbounded."""
 
     main(["init", "--repo", str(tmp_path)])
     cfg = load_config(tmp_path)

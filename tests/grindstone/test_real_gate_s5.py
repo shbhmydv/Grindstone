@@ -1,14 +1,14 @@
-"""S5 E2E GATE (marker ``real``, excluded by default) — REQUIRED to PASS.
+"""S5 E2E GATE (marker ``real``, excluded by default), REQUIRED to PASS.
 
 The CONFIG-PATH gate: a full job driven through the CLI exactly as an operator
-would — ``grindstone init`` scaffolds ``.grindstone/config.yaml``, then
+would, ``grindstone init`` scaffolds ``.grindstone/config.yaml``, then
 ``grindstone run`` loads a local-only role config, builds the REAL
 ``codex exec`` planner + REAL ``ScriptWorker`` from it, and runs the S4 toy job to
 completion. This proves the init → config → CLI → loop plumbing (ruling 5), not
 new orchestration; the job shape is S4's.
 
 The 12-planner-call valve is TEST-only and is threaded by monkeypatching the
-``run_grind`` symbol the CLI calls (the CLI exposes no valve flag — it is not a
+``run_grind`` symbol the CLI calls (the CLI exposes no valve flag, it is not a
 real loop bound), so the live wiring path stays intact while quota stays capped.
 
 Run: ``rtk proxy python3 -m pytest tests/grindstone/test_real_gate_s5.py -m real -s``
@@ -40,18 +40,18 @@ pytestmark = pytest.mark.real
 
 DEFAULT_ENDPOINT = "http://localhost:8080"
 #: The rig's role scripts (this repo's sibling models/ folder). The script owns
-#: provider/model/GPU now — the gate only needs the path, not the model identity.
+#: provider/model/GPU now, the gate only needs the path, not the model identity.
 _MODELS_DIR = Path(__file__).resolve().parents[2] / "models"
 PLANNER_VALVE = 12  # TEST-only safety valve
 
 _JOB = (
     "Goal: build and document a tiny Python greeting module, across TWO phases.\n"
     "\n"
-    "Phase 1 — build: create `greet.py` defining a function `greet(name)` that\n"
+    "Phase 1, build: create `greet.py` defining a function `greet(name)` that\n"
     "returns the string `Hello, <name>!`, and a `test_greet.py` with a passing\n"
     "test for it. The tests must pass when run with `python3 -m pytest -q`.\n"
     "\n"
-    "Phase 2 — document: create `README.md` documenting greet.py and how to run\n"
+    "Phase 2, document: create `README.md` documenting greet.py and how to run\n"
     "its test.\n"
     "\n"
     "Each phase's exit_criterion must be deterministic checks (a command with an\n"

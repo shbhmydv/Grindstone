@@ -1,14 +1,14 @@
-"""S4 E2E GATE (marker ``real``, excluded by default) — REQUIRED to PASS.
+"""S4 E2E GATE (marker ``real``, excluded by default), REQUIRED to PASS.
 
 A full job end-to-end: real ``codex exec`` planner + real ``ScriptWorker`` workers
 (:8082, concurrency 2) on a throwaway repo, with a job that needs >=2 phases of
-real work — P1 builds ``greet.py`` + a passing ``test_greet.py`` (run with
+real work, P1 builds ``greet.py`` + a passing ``test_greet.py`` (run with
 ``python3 -m pytest``); P2 documents it in ``README.md``. The run MUST reach
 ``complete_run`` with verified evidence. The 12-planner-call valve is TEST-only.
 
 The gate is also the S3 Gate-B flakiness diagnosis: it captures every planner
 decision (tool + epoch title), every task outcome with per-attempt failure
-reasons, total wall time, planner_calls, and the final branch listing — printed
+reasons, total wall time, planner_calls, and the final branch listing, printed
 with ``-s`` so the evidence trail survives even on success.
 
 Run: ``rtk proxy python3 -m pytest tests/grindstone/test_real_gate_s4.py -m real -s``
@@ -56,11 +56,11 @@ PLANNER_VALVE = 12  # TEST-only safety valve
 _JOB = (
     "Goal: build and document a tiny Python greeting module, across TWO phases.\n"
     "\n"
-    "Phase 1 — build: create `greet.py` defining a function `greet(name)` that\n"
+    "Phase 1, build: create `greet.py` defining a function `greet(name)` that\n"
     "returns the string `Hello, <name>!`, and a `test_greet.py` with a passing\n"
     "test for it. The tests must pass when run with `python3 -m pytest -q`.\n"
     "\n"
-    "Phase 2 — document: create `README.md` documenting greet.py and how to run\n"
+    "Phase 2, document: create `README.md` documenting greet.py and how to run\n"
     "its test.\n"
     "\n"
     "Each phase's exit_criterion must be deterministic checks (a command with an\n"

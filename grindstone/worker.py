@@ -1,4 +1,4 @@
-"""Worker transport interface — the uniform task-in / disk-out boundary.
+"""Worker transport interface, the uniform task-in / disk-out boundary.
 
 ARCHITECTURE.md: the orchestrator's only levers are pre-dispatch (task sizing,
 input resolution) and post-return (validate, escalate). It never inspects a
@@ -40,7 +40,7 @@ REVIEW_CHECK_COMMAND = f"test -s {REVIEW_FILENAME}"
 #: Per-cwd pi settings the transport drops in the attempt CWD to pin spawned
 #: subagents to the same model as the parent worker. pi-subagents reads
 #: ``<project-root>/.pi/settings.json`` and a dir is "project root" iff it holds
-#: a ``.pi/`` — so writing here makes the attempt CWD that root (verified in
+#: a ``.pi/``, so writing here makes the attempt CWD that root (verified in
 #: pi-subagents@0.23.1 src/agents/agents.ts: findNearestProjectRoot +
 #: getProjectAgentSettingsPath). Shared so the loop knows what to strip before
 #: commit (orchestration metadata never enters the diff) without importing any
@@ -67,14 +67,14 @@ class WorkerRequest:
 
     ``task`` is the typed contract model (never stringly JSON). ``inputs`` maps
     each declared input log key to its resolved on-disk path (the core resolves
-    keys at dispatch — §8 working window). ``scratch`` is the CWD the worker
+    keys at dispatch, §8 working window). ``scratch`` is the CWD the worker
     runs in and writes ``handoff.json`` into. ``task_id`` is the fully-qualified
     ``P<phase>/E<epoch>/T<task>`` key the handoff must echo. ``attempt`` is the
     1-based global attempt number; ``failure_context`` carries the rejection
     reasons from every prior attempt so the worker can correct course. ``mode``
     is the epoch's decision tool: research/review/artifact all dispatch the same
     ``ArtifactTask`` shape, so the task type alone cannot select the worker
-    plan — the prompt builder dispatches on ``mode``.
+    plan, the prompt builder dispatches on ``mode``.
     """
 
     task: Task
@@ -99,7 +99,7 @@ class WorkerTransport(Protocol):
 
 # --- prompt construction (orchestration: *what* to ask) ------------------------
 #
-# ``build_worker_prompt`` is a pure function — *what* the orchestrator asks a
+# ``build_worker_prompt`` is a pure function, *what* the orchestrator asks a
 # worker to do, independent of *which* transport runs it (ARCHITECTURE.md). It lives
 # in core so every transport (pi, script) builds the identical prompt; only the
 # disk-out boundary differs.
@@ -147,8 +147,8 @@ def _implement_plan(task: ImplementTask) -> str:
 <implement_plan>
 Work this plan in order. You implement everything yourself; subagents are for
 the review step only. A saturated context silently drops shared-contract
-details — the discipline below is what keeps a large solo build coherent.
-  1. CONTRACT FIRST. Identify the shared pieces every other file depends on —
+details, the discipline below is what keeps a large solo build coherent.
+  1. CONTRACT FIRST. Identify the shared pieces every other file depends on,
      constants, interface signatures, exception types, schemas. Implement them
      first, completely, and verify they import/load cleanly before moving on.
   2. WORK IN DEPENDENCY ORDER, ANCHORED TO THE CONTRACT. Before each unit ask:
@@ -158,23 +158,23 @@ details — the discipline below is what keeps a large solo build coherent.
      Run the relevant done_when checks as each unit lands.
   3. VERBATIM SPEC. Before each unit, re-read its authoritative spec in the
      task goal and inputs end to end. Never work from a paraphrase or from
-     memory — paraphrase silently drops requirements. If your context was
+     memory, paraphrase silently drops requirements. If your context was
      compacted, recover by re-reading the spec and the files on disk.
-  4. BAKE BEFORE HANDOFF — mandatory, all of (a)-(c) BEFORE handoff.json:
+  4. BAKE BEFORE HANDOFF, mandatory, all of (a)-(c) BEFORE handoff.json:
      (a) run EVERY done_when check yourself and fix every failure you see
-         (exception: `python3 check_handoff.py` validates handoff.json itself —
+         (exception: `python3 check_handoff.py` validates handoff.json itself,
          it cannot pass yet; you satisfy it in step 5);
-     (b) re-read the full task goal once more and audit the seams — implement
+     (b) re-read the full task goal once more and audit the seams, implement
          anything no earlier step clearly covered;
      (c) get ONE fresh-context review: spawn the registered `reviewer`
          subagent with the goal, the done_when checks and a summary of what
          you changed; its findings must be written to `{REVIEW_FILENAME}` in
-         this directory (non-empty — `{REVIEW_CHECK_COMMAND}` is one of your
+         this directory (non-empty, `{REVIEW_CHECK_COMMAND}` is one of your
          checks). ACT on what it finds.
-  5. Write handoff.json LAST, as its own final step, only after the bake — then
+  5. Write handoff.json LAST, as its own final step, only after the bake, then
      run `python3 check_handoff.py` and fix violations until it exits 0.
 If after honest effort the checks cannot pass, write a truthful FAILED or
-PARTIAL handoff with `not_done` and `downstream_needs` filled in — the planner
+PARTIAL handoff with `not_done` and `downstream_needs` filled in, the planner
 re-plans from that. Never claim DONE on failing checks: every check is re-run
 by the orchestrator and a false DONE is always caught.
 </implement_plan>
@@ -183,7 +183,7 @@ by the orchestrator and a false DONE is always caught.
 You may create or edit files ONLY within these globs:
 {globs}
 Changing ANY other file fails the attempt. (`handoff.json`, `check_handoff.py`
-and `{REVIEW_FILENAME}` are orchestration files, not repo work — write them in
+and `{REVIEW_FILENAME}` are orchestration files, not repo work, write them in
 the CWD as instructed; the orchestrator excludes them from this rule.)
 </file_ownership>
 """
@@ -196,7 +196,7 @@ the CWD as instructed; the orchestrator excludes them from this rule.)
 #: is the mechanism; this line keeps the model from wandering by path at all.
 _CWD_CONTAINMENT = """Your CWD is your entire workspace: read your resolved inputs, write your
 artifact and handoff here. Never cd above it, never read or modify the
-surrounding repository, and do not run git — there is no repository here."""
+surrounding repository, and do not run git, there is no repository here."""
 
 
 def _research_plan() -> str:
@@ -205,7 +205,7 @@ def _research_plan() -> str:
 This is a research task: investigate and report; do not modify code.
 {_CWD_CONTAINMENT}
   1. Read the resolved inputs; they contain everything the goal requires.
-  2. Write your findings into the artifact named above — that artifact is the
+  2. Write your findings into the artifact named above, that artifact is the
      deliverable the planner reads.
   3. Ground every claim: the handoff's `citations` MUST contain at least one
      real file (with line numbers where useful). A research handoff with no
@@ -241,7 +241,7 @@ artifact is the deliverable; keep the handoff to references, not payloads.
 
 
 def build_worker_prompt(request: WorkerRequest) -> str:
-    """Construct the worker prompt (pure function — no pi, no I/O).
+    """Construct the worker prompt (pure function, no pi, no I/O).
 
     Common skeleton: goal, resolved inputs, the done_when checks, prior-failure
     context, and a handoff block pinning the disk contract (write handoff.json
@@ -261,7 +261,7 @@ def build_worker_prompt(request: WorkerRequest) -> str:
     if isinstance(task, ImplementTask):
         plan_block = _implement_plan(task)
         occupancy_line = (
-            "  - occupancy: {\"compacted\": <bool>, \"subagent_splits\": <int>} — "
+            "  - occupancy: {\"compacted\": <bool>, \"subagent_splits\": <int>}, "
             "report honestly;\n    your reviewer spawn counts as a split."
         )
     else:
@@ -296,25 +296,25 @@ These deterministic checks will be re-run by the orchestrator. They MUST pass:
 {plan_block}{context_block}
 <handoff>
 When finished, write a file named exactly `handoff.json` in your current working
-directory. It is the ONLY thing the orchestrator reads — stdout is ignored.
+directory. It is the ONLY thing the orchestrator reads, stdout is ignored.
 Requirements:
   - JSON object, schema_version "1".
   - task_id MUST be exactly "{request.task_id}".
   - status: "DONE" if every done_when check passes, else "FAILED" or "PARTIAL".
   - resulting_state: one short sentence for the planner (references, not file bodies).
   - what_changed: list of {{"kind": "file"|"interface"|"artifact", "ref": <path or name>}}
-    objects, one per thing you changed — NOT free prose strings.
+    objects, one per thing you changed, NOT free prose strings.
   - not_done / downstream_needs: lists of short strings (downstream_needs holds
     log keys); fill both on FAILED or PARTIAL.
   - checks: echo each done_when as {{"check": <text>, "exit_code": <int>}}.
   - citations: list of {{"file": <path>, "line": <int optional>}} grounding your
-    claims in real files. Paths resolve against your CWD — or against the
-    target repo root for research/review/artifact tasks — and must stay inside
+    claims in real files. Paths resolve against your CWD, or against the
+    target repo root for research/review/artifact tasks, and must stay inside
     those roots; a citation outside them (or hallucinated) fails the handoff.
 {occupancy_line}
-  - The whole file must serialize under {HANDOFF_MAX_BYTES} bytes — references, not payloads.
+  - The whole file must serialize under {HANDOFF_MAX_BYTES} bytes, references, not payloads.
 After writing handoff.json, run `python3 check_handoff.py` (it is in your CWD
 and in done_when) and fix every violation it prints until it exits 0. It can
-only pass once handoff.json exists — earlier check runs cannot cover it.
+only pass once handoff.json exists, earlier check runs cannot cover it.
 </handoff>
 """

@@ -364,7 +364,7 @@ def test_reader_raises_on_corrupt_interior_line(tmp_path: Path) -> None:
 
 def test_journal_writer_heals_crash_torn_final_line(tmp_path: Path) -> None:
     """A crash mid-write leaves a torn final line (no terminating newline). The
-    writer must TRUNCATE it before appending — otherwise the next event fuses onto
+    writer must TRUNCATE it before appending, otherwise the next event fuses onto
     the partial bytes into a corrupt non-final line that every later read rejects
     (a recoverable partial write would become permanent loss of resume/replay)."""
 

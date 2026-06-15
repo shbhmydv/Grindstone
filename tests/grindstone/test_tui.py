@@ -1,5 +1,5 @@
 """TUI render path (S4 ruling 4): the pure events -> RunTree -> rich render is
-snapshot-tested via plain-text export. No live terminal, no wall clock — the
+snapshot-tested via plain-text export. No live terminal, no wall clock, the
 poll loop's timing is deliberately excluded; only the renderer is asserted.
 """
 

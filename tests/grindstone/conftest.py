@@ -5,7 +5,7 @@ worker (so a fan-out test pins deterministic behavior per task under
 concurrency) all live here. The only sanctioned randomness is the fuzz test's
 seeded RNG; everything here is fixed.
 
-All git ops target the caller-supplied tmp repo — never the Grindstone
+All git ops target the caller-supplied tmp repo, never the Grindstone
 checkout.
 """
 
@@ -126,7 +126,7 @@ def reap_kill_target(proc: "subprocess.Popen[bytes]") -> None:
 
     The kill-mid-* signature tests SIGKILL the subprocess as their deliberate
     action, but if the kill point is never reached (e.g. a busy host misses the
-    60s deadline) the assert fires first and control skips the kill — leaving
+    60s deadline) the assert fires first and control skips the kill, leaving
     the subprocess hot-spinning on a ``release`` sentinel that never appears.
     A bare ``proc.wait()`` in ``finally`` then blocks FOREVER on that immortal
     process (observed 2026-06-13: a 5-hour CPU-pegging hang). Always kill if
@@ -165,7 +165,7 @@ def init_git_repo(path: Path) -> Path:
     # Gitignore the run dir AND Python bytecode: an implement task whose
     # done_when runs `python3 -m pytest` leaves __pycache__/*.pyc, which an
     # un-ignored `git add -A` would stage and the ownership scope check would
-    # (correctly) flag as out-of-scope — the S3 Gate-B flakiness. Real Python
+    # (correctly) flag as out-of-scope, the S3 Gate-B flakiness. Real Python
     # repos gitignore it; the toy repo mirrors that hygiene.
     (path / ".gitignore").write_text(".grindstone/\n__pycache__/\n", encoding="utf-8")
     (path / "README.md").write_text("base\n", encoding="utf-8")
@@ -256,7 +256,7 @@ def handoff_payload(
 
 
 class HandoffWorker:
-    """Writes an arbitrary handoff + scratch files — drives exact disk state."""
+    """Writes an arbitrary handoff + scratch files, drives exact disk state."""
 
     def __init__(
         self, payload: dict[str, object], files: dict[str, str] | None = None

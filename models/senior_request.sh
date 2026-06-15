@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# senior_request.sh — the `senior` worker role: the CLOUD tier, driven through the
+# senior_request.sh, the `senior` worker role: the CLOUD tier, driven through the
 # OPENCODE AGENT (not pi) so the model gets opencode's web tools (Exa websearch +
 # webfetch). Senior handles research/review escalations, which need real web
 # search; that is the whole reason this role exists. Same grindstone contract as
@@ -10,7 +10,7 @@
 # `rate|limit|429`. The per-attempt OPENCODE_DB lives in the LOG dir (never the
 # worktree) for two reasons: opencode's SQLite state then can't leak into a commit,
 # and each attempt gets its own db so concurrent senior runs never hit SQLITE_BUSY
-# (opencode's single-global-db lock — the documented per-instance workaround).
+# (opencode's single-global-db lock, the documented per-instance workaround).
 set -euo pipefail
 
 # Portable timeout prefix (resolves `timeout`, else `gtimeout`, else none).

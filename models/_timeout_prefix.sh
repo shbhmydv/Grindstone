@@ -1,8 +1,8 @@
-# _timeout_prefix.sh — portable timeout-prefix resolution, sourced by the five
+# _timeout_prefix.sh, portable timeout-prefix resolution, sourced by the five
 # request scripts. NOT executable / no shebang: it only defines a function.
 #
 # All request scripts honor --timeout as a wall-clock backstop via a `timeout`
-# command prefix. Linux has GNU `timeout`; macOS has NONE in its base system —
+# command prefix. Linux has GNU `timeout`; macOS has NONE in its base system,
 # coreutils installs it as `gtimeout` (brew). GNU gtimeout accepts the SAME
 # `--foreground --signal=TERM` flags, so only the BINARY NAME needs resolving.
 # If neither exists we degrade gracefully: an empty prefix (no timeout backstop)

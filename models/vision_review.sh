@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# vision_review.sh — the B3 TASTE GATE. Runs codex one-shot against a SCREENSHOT
+# vision_review.sh, the B3 TASTE GATE. Runs codex one-shot against a SCREENSHOT
 # of the rendered UI (read-only) and asks it to judge visual polish/correctness
 # against the supplied criteria. codex's verdict is written to --out (a disk
 # contract: {"pass":bool,"reasons":[..]} per --output-schema); grindstone re-reads
-# and re-validates --out itself — stdout is never parsed. Mirrors
+# and re-validates --out itself, stdout is never parsed. Mirrors
 # planner_request.sh (codex exec --ephemeral -s read-only -C <repo> -o <out>),
 # adding -i <screenshot> and --output-schema <verdict schema>.
 #
@@ -38,7 +38,7 @@ done
 
 repo="$(cd "$repo" && pwd)"
 # The screenshot is REPO-RELATIVE (codex -C root). Reject an absolute path or a
-# `..` path segment before joining it onto $repo — the Python contract already
+# `..` path segment before joining it onto $repo, the Python contract already
 # rejects these (Chunk 2), this is the same guard at the script boundary so a
 # crafted path can never escape the repo. Then resolve it to an absolute path
 # for -i and validate it exists and is an image.

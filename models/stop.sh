@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# stop.sh — reap a role script's process group. Reads the pgid written to the
+# stop.sh, reap a role script's process group. Reads the pgid written to the
 # handle file by *_request.sh, SIGTERMs the whole group, waits briefly, then
 # escalates to SIGKILL. This is the v7 kill-group scar moved into models/.
 #
 # Idempotent / no-op if the group is already gone (the handle is stale, missing,
-# empty, or the process already exited) — always exits 0 in those cases.
+# empty, or the process already exited), always exits 0 in those cases.
 set -euo pipefail
 
 handle=""

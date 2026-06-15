@@ -1,5 +1,5 @@
 """Per-task state-machine invariants, exercised through 1-task epochs (the
-per-task machine no longer has a standalone entry point — ruling 3). Covers
+per-task machine no longer has a standalone entry point, ruling 3). Covers
 scripted failures, retry/escalate, the disk contract, grounding, done_when
 re-run, status mapping, the ownership scope check, and the in-flight snapshot.
 """
@@ -297,7 +297,7 @@ def test_artifact_out_with_subdir_published_from_full_path(
     """Regression (dogfood-1): an ``artifact_out`` carrying a real subdirectory
     (``MIGRATION/inv.md``) is what a live planner emits when the job names a path.
     The worker prompt + ``done_when`` both reference that FULL path, so an obedient
-    worker writes ``<scratch>/MIGRATION/inv.md`` — and the relocation must read it
+    worker writes ``<scratch>/MIGRATION/inv.md``, and the relocation must read it
     from the full path. The old basename-only lookup searched ``<scratch>/inv.md``,
     rejected the correctly-produced artifact ("artifact_out not produced in CWD"),
     and forced needless retries until a worker happened to drop the subdir."""
@@ -334,7 +334,7 @@ def _local_senior(
 
 def test_research_starts_on_senior_tier(git_repo: Path, run_dir: RunDir) -> None:
     # research routes to senior (web search). BOTH tiers can succeed, so the
-    # winning tier reveals where the task STARTED — proving local was skipped.
+    # winning tier reveals where the task STARTED, proving local was skipped.
     task = ArtifactTask(
         id="T1", goal="investigate online",
         done_when=[CmdCheck(cmd="test -f notes.md")],
@@ -368,7 +368,7 @@ def test_review_starts_on_senior_tier(git_repo: Path, run_dir: RunDir) -> None:
 
 
 def test_artifact_mode_starts_on_local_tier(git_repo: Path, run_dir: RunDir) -> None:
-    # artifact is production work (no web needed) — starts on local, like implement.
+    # artifact is production work (no web needed), starts on local, like implement.
     task = ArtifactTask(
         id="T1", goal="produce findings",
         done_when=[CmdCheck(cmd="test -f findings.md")],
@@ -417,7 +417,7 @@ def test_visual_implement_routes_to_senior_tier(
 ) -> None:
     # Taste routing: a visual implement epoch is built on the vision-capable
     # senior tier, not the local mode default. BOTH tiers succeed, so the
-    # winning tier reveals where the task STARTED — proving local was skipped.
+    # winning tier reveals where the task STARTED, proving local was skipped.
     outcome = run_one_epoch(
         run_dir, args=_visual_implement(toy_task), mode="implement",
         ladder=_local_senior(make_ok_worker(), make_ok_worker()),
@@ -479,7 +479,7 @@ def test_visual_implement_falls_back_to_local_without_senior(
 def test_artifact_out_is_published_to_the_log_key(
     git_repo: Path, run_dir: RunDir
 ) -> None:
-    """Gate-6 P0: the worker's artifact_out file stayed in scratch — nothing
+    """Gate-6 P0: the worker's artifact_out file stayed in scratch, nothing
     published it to the run-dir log key (handoff.json IS relocated; the
     artifact was not), so artifact_exists checks were structurally
     unsatisfiable and the planner revised phases until the safety valve."""
@@ -511,7 +511,7 @@ def test_missing_artifact_out_fails_the_attempt(
     git_repo: Path, run_dir: RunDir
 ) -> None:
     # Truthful failure: an accepted handoff whose promised artifact_out file
-    # was never produced is a failed attempt — and the already-relocated
+    # was never produced is a failed attempt, and the already-relocated
     # handoff.json is deleted (zero dead artifacts).
     task = ArtifactTask(
         id="T1",
@@ -537,8 +537,8 @@ def test_missing_artifact_out_fails_the_attempt(
 def test_research_citation_of_repo_file_passes(git_repo: Path, run_dir: RunDir) -> None:
     """E2E gate-5 P0: research/review/artifact tasks investigate the TARGET
     REPO, so a repo-root-relative citation must pass grounding. The old gate
-    required every citation INSIDE the scratch dir — structurally impossible
-    for repo files — so legitimate handoffs were rejected every attempt and
+    required every citation INSIDE the scratch dir, structurally impossible
+    for repo files, so legitimate handoffs were rejected every attempt and
     the planner spun phase revisions unbounded (34 codex calls)."""
 
     task = ArtifactTask(
@@ -588,7 +588,7 @@ def test_research_citation_outside_scratch_and_repo_rejected(
 def test_implement_citation_stays_scratch_contained(
     git_repo: Path, run_dir: RunDir, toy_task: ImplementTask
 ) -> None:
-    # Implement scratch IS a repo checkout — the repo root is NOT an extra
+    # Implement scratch IS a repo checkout, the repo root is NOT an extra
     # allowed citation root there; citing the operator checkout absolutely
     # stays rejected.
     payload = handoff_payload(citations=[{"file": str(git_repo / "README.md")}])
@@ -608,7 +608,7 @@ def test_check_handoff_script_injected_and_scope_exempt(
     # runs and appends `python3 check_handoff.py` to the task's runtime
     # done_when (so it reaches the prompt AND the core re-run). The toy task
     # owns only out.txt, so if the script were committed the scope check would
-    # reject it — a clean DONE in one attempt proves it is exempt (dropped
+    # reject it, a clean DONE in one attempt proves it is exempt (dropped
     # pre-commit exactly like handoff.json).
     seen: dict[str, object] = {}
 
@@ -724,7 +724,7 @@ def test_pi_dir_kept_when_worker_leaves_other_content(
     git_repo: Path, run_dir: RunDir, toy_task: ImplementTask
 ) -> None:
     # Cleanup is surgical: remove settings.json and the .pi/ dir ONLY if empty.
-    # If the worker left other content under .pi/, that content stays — the
+    # If the worker left other content under .pi/, that content stays, the
     # ownership scope check then (correctly) rejects the attempt as out-of-scope
     # rather than the orchestrator silently rm -r'ing worker output.
     class _LeavesExtraPiContent:
@@ -751,7 +751,7 @@ def test_missing_review_is_caught_by_core_re_run(
     git_repo: Path, run_dir: RunDir, toy_task: ImplementTask
 ) -> None:
     # A worker that does the work but skips the review (deletes review.md after
-    # the mock wrote it) must be rejected by the CORE re-run — the gate is
+    # the mock wrote it) must be rejected by the CORE re-run, the gate is
     # authoritative, not advisory.
     class _SkipsReview:
         def run(self, request: object) -> None:

@@ -17,7 +17,7 @@ from pathlib import Path
 #: Log-key grammar, mirrored from schemas/epoch_decision.json $defs/log_key.
 _LOG_KEY_RE = re.compile(r"^[A-Za-z0-9][a-zA-Z0-9._/-]{0,127}$")
 
-#: A top-level phase directory (``P1`` … ``P99``) — the root of the keyed log.
+#: A top-level phase directory (``P1`` … ``P99``), the root of the keyed log.
 _PHASE_DIR_RE = re.compile(r"^P[1-9][0-9]?$")
 
 
@@ -49,7 +49,7 @@ class RunDir:
 
     @property
     def run_state_path(self) -> Path:
-        """Run-level cursor (``RunState``) — distinct file so the multi-epoch
+        """Run-level cursor (``RunState``), distinct file so the multi-epoch
         loop and the in-flight epoch never clobber each other's state (S3)."""
 
         return self.root / "run_state.json"
@@ -70,7 +70,7 @@ class RunDir:
         """Sorted relative paths of the durable keyed log (ARCHITECTURE.md).
 
         The log keys a planner may reference as task ``inputs``: every regular
-        file under a phase dir (``P<n>/...`` — handoffs, outcomes, relocated
+        file under a phase dir (``P<n>/...``, handoffs, outcomes, relocated
         artifacts). Excludes ``state.json`` / ``events.ndjson`` / worktrees /
         artifact scratch, none of which are durable references.
         """
@@ -95,7 +95,7 @@ class RunDir:
         """Resolve an artifact reference to an existing file, else ``None``.
 
         Exact log keys resolve directly. A BARE filename (no ``/``) matches
-        iff exactly ONE logged artifact carries that name — a phase exit
+        iff exactly ONE logged artifact carries that name, a phase exit
         criterion is written at skeleton time, when the ``P*/E*/T*/``
         placement the producing task will choose is unknowable (gate-6 RCA);
         ambiguity stays ``None`` so the check fails deterministically rather

@@ -1,4 +1,4 @@
-"""Semantic validators — rules JSON Schema cannot express.
+"""Semantic validators, rules JSON Schema cannot express.
 
 Pure functions: they take the already-typed model plus explicit context
 arguments (no global state) and return a list of violation strings (empty =
@@ -34,7 +34,7 @@ HANDOFF_MAX_BYTES = 8192
 def canonical_bytes(model: Handoff) -> int:
     """Byte length of the handoff's canonical JSON form (the byte-cap measure).
 
-    Canonical = sorted keys, no whitespace, ``None`` optionals dropped — a
+    Canonical = sorted keys, no whitespace, ``None`` optionals dropped, a
     single deterministic form so the cap measures content, not formatting.
     """
 

@@ -12,7 +12,7 @@ runs, as the invoking user:
 2. **The request scripts named in the target repo's config.** `.grindstone/config.yaml`
    names the `models/*.sh` adapters for each role; these are `exec`'d. To blunt the
    clone-and-run risk, a configured `script:` path **must resolve under the bundled
-   `models/` directory** — set `GRINDSTONE_ALLOW_REPO_SCRIPTS=1` to opt a *trusted*
+   `models/` directory**. Set `GRINDSTONE_ALLOW_REPO_SCRIPTS=1` to opt a *trusted*
    repo's own scripts back in.
 3. **The optional final-polish pass edits your repo.** When `final_polish` is
    configured, `codex` runs in `workspace-write` mode against a throwaway worktree.
@@ -28,7 +28,7 @@ runs, as the invoking user:
   user account can.
 - **Prefer a disposable VM or container** for untrusted or experimental work.
 - Do not point Grindstone at a repository you would not run `make` / `npm install`
-  in — its `.grindstone/config.yaml` and its checks are part of its attack surface.
+  in; its `.grindstone/config.yaml` and its checks are part of its attack surface.
 
 ## What is sandboxed / gated
 

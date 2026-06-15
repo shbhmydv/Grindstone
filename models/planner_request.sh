@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# planner_request.sh — the `planner` role. Runs GPT-5.5 via `codex exec` one-shot
+# planner_request.sh, the `planner` role. Runs GPT-5.5 via `codex exec` one-shot
 # against the TARGET repo, read-only. The agent's final message is written to
 # --out (a disk contract); grindstone reads --out and does the tolerant
 # extract_decision_json + validation itself (parsing stays in core).

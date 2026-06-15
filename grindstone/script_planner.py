@@ -3,7 +3,7 @@
 The role-split boundary: grindstone reaches the planner role
 through ``planner_request.sh`` and never learns the transport (codex) or the
 model behind it. The script runs the locked ``codex exec`` invocation against the
-target repo (read-only) and writes the agent's final message to ``--out`` — a
+target repo (read-only) and writes the agent's final message to ``--out``, a
 disk contract, never stdout scraping. grindstone reads ``--out`` and does the
 tolerant ``extract_decision_json`` + validation itself (parsing stays in core,
 ruling 1). ``plan`` Popen's the script as a group leader, supervises wall-clock,

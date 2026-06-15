@@ -70,7 +70,7 @@ def test_find_artifact_exact_key(tmp_path: Path) -> None:
 
 def test_find_artifact_bare_filename_matches_unique_artifact(tmp_path: Path) -> None:
     # Gate-6 RCA: a phase exit criterion is written at SKELETON time, when the
-    # P*/E*/T*/ placement an epoch will choose is unknowable — a bare filename
+    # P*/E*/T*/ placement an epoch will choose is unknowable, a bare filename
     # must match the one logged artifact carrying that name.
     run = create_run_dir(tmp_path, "run-1")
     target = run.resolve("P2/E3/T1/findings.md")

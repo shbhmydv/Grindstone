@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# codex_polish.sh — the B5 FINAL-POLISH pass. Runs codex in WORKSPACE-WRITE against
+# codex_polish.sh, the B5 FINAL-POLISH pass. Runs codex in WORKSPACE-WRITE against
 # a finished, gated worktree and asks it to make tasteful finishing-touch edits per
 # the supplied criteria. Unlike the read-only scripts, codex EDITS files IN PLACE
 # here; there is NO --output-schema / -o verdict. The safety gate is NOT codex's
-# word — grindstone re-runs the run's complete_run evidence against the polished
+# word, grindstone re-runs the run's complete_run evidence against the polished
 # commit and KEEPS the edits only if it still passes (run_loop._final_polish).
 #
 # Mirrors vision_review.sh (codex exec -C <repo>, prompt-before-i ordering, killable
@@ -42,7 +42,7 @@ handle_out="$(cd "$(dirname "$handle_out")" && pwd)/$(basename "$handle_out")"
 # image (codex -i accepts PNG/JPEG only) before codex is ever invoked.
 screenshot_abs=""
 if [[ -n "$screenshot" ]]; then
-  # Reject an absolute path or a `..` path segment before joining onto $repo —
+  # Reject an absolute path or a `..` path segment before joining onto $repo,
   # the same boundary guard as vision_review.sh / the Python contract (Chunk 2),
   # so a crafted screenshot path can never escape the repo.
   case "$screenshot" in
@@ -83,7 +83,7 @@ trap 'rm -f "$err_tmp"' EXIT
 # is passed (and `codex exec` rejects -a). The prompt POSITIONAL must precede -i
 # (codex exec arg-ordering gotcha). The -C cwd is already the writable root, so
 # no --add-dir is needed. workspace-write's network is off by default but the
-# default is INHERITED — a global ~/.codex/config.toml could flip it on — so we
+# default is INHERITED, a global ~/.codex/config.toml could flip it on, so we
 # pin sandbox_workspace_write.network_access=false explicitly (defense-in-depth).
 img_args=()
 if [[ -n "$screenshot_abs" ]]; then

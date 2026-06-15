@@ -3,7 +3,7 @@
 A ``visual`` epoch's gate adds a codex VISION REVIEW on top of the deterministic
 functional floor: codex looks at a rendered-UI screenshot + criteria and writes a
 ``pass``/``reasons`` verdict to ``verdict.json`` (a disk contract grindstone
-re-reads + Pydantic-validates — never stdout). These tests drive the whole gate
+re-reads + Pydantic-validates, never stdout). These tests drive the whole gate
 through ``evaluate_checks`` with a STUB vision-review script behind the
 ``ScriptVisionReviewer`` config seam, so no real codex is ever called.
 """
@@ -28,7 +28,7 @@ from grindstone.script_vision import ScriptVisionReviewer, VisionReviewError
 # --- stub vision-review scripts (honour the --out disk contract) ---------------
 
 #: A stub that writes a canned verdict to ``--out`` and exits ``$RC`` (default 0).
-#: It parses only ``--out`` (the disk contract) — the screenshot/criteria/schema
+#: It parses only ``--out`` (the disk contract), the screenshot/criteria/schema
 #: it ignores, standing in for codex without ever calling it.
 _STUB = """\
 set -euo pipefail
@@ -253,7 +253,7 @@ def test_vision_review_fails_with_no_reviewer_configured(tmp_path: Path) -> None
 
 def test_prior_cmd_produces_screenshot_then_vision_reviews_it(tmp_path: Path) -> None:
     # The designed shape: a cmd check renders the screenshot into the eval cwd,
-    # the following vision_review check judges it — both in order, one cwd.
+    # the following vision_review check judges it, both in order, one cwd.
     run = create_run_dir(tmp_path, "r")
     from grindstone.contracts.models import CmdCheck
 
@@ -336,7 +336,7 @@ def test_vision_screenshot_accepts_normal_relative_path(good: str) -> None:
 
 def test_vision_review_fails_when_screenshot_symlink_escapes(tmp_path: Path) -> None:
     # FIX 3 runtime guard: a screenshot that passes the lexical pattern but
-    # RESOLVES (via symlink) outside the eval worktree is a deterministic FAIL —
+    # RESOLVES (via symlink) outside the eval worktree is a deterministic FAIL,
     # the off-worktree image is never handed to codex.
     run = create_run_dir(tmp_path, "r")
     secret = tmp_path / "secret.png"

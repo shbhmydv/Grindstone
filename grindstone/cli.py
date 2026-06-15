@@ -2,7 +2,7 @@
 
 argparse, no click dependency. ``init`` scaffolds the per-repo config (S5).
 ``run`` creates the run dir, assembles the worker ladder + planner transport from
-``.grindstone/config.yaml`` — each *role* (``planner`` / ``local`` / ``senior``)
+``.grindstone/config.yaml``, each *role* (``planner`` / ``local`` / ``senior``)
 is reached through a request **script** behind the file contract; the CLI never
 learns the transport or model behind a role (those live in ``models/``). No
 config fails loudly and points at ``grindstone init`` (core ships no rig
@@ -46,7 +46,7 @@ from grindstone.tui import watch
 DEFAULT_MAX_PLANNER_CALLS = 96
 
 #: Wall-clock budget (seconds) for one B3 vision-review gate call when the config
-#: does not size it — a single read-only codex look at a screenshot, not a grind.
+#: does not size it, a single read-only codex look at a screenshot, not a grind.
 DEFAULT_VISION_TIMEOUT_S = 600.0
 
 #: Directory of this rig's request scripts (``models/`` beside the package). The
@@ -57,7 +57,7 @@ _MODELS_DIR = Path(__file__).resolve().parents[1] / "models"
 #: The ``.grindstone/config.yaml`` ``init`` scaffolds: one block per *role*
 #: (``planner`` / ``local`` / ``senior``), each naming a request script behind
 #: the file contract plus its slots + wall-clock timeout. The CLI never learns
-#: the transport or model behind a role — that lives in the script. ``senior``
+#: the transport or model behind a role, that lives in the script. ``senior``
 #: is scaffolded active; delete it for a local-only ladder. Loadable as-is by
 #: ``config.load_config``.
 _CONFIG_TEMPLATE = """\
@@ -75,13 +75,13 @@ roles:
     timeout_s: 600
 
   # The local worker role: the on-rig grinders. slots = the epoch fan-out bound
-  # (how many tasks run concurrently — one per free GPU on this rig).
+  # (how many tasks run concurrently, one per free GPU on this rig).
   local:
     script: {models_dir}/local_request.sh
     slots: 2
     timeout_s: 1800
 
-  # The senior worker role: the cloud escalation tier. OPTIONAL — delete this
+  # The senior worker role: the cloud escalation tier. OPTIONAL, delete this
   # whole block for a local-only ladder (a rig with no cloud subscription).
   senior:
     script: {models_dir}/senior_request.sh
@@ -89,7 +89,7 @@ roles:
     timeout_s: 3600
 
 # Per-run planner-call ceiling (omit for the built-in default of 96). A
-# runaway-spin backstop, not a quota ration — the run ends as failed when
+# runaway-spin backstop, not a quota ration, the run ends as failed when
 # reached so a stuck planner can never loop unattended. Raise it for very
 # large jobs; lower it to fail fast on a tight job.
 # max_planner_calls: 96
@@ -105,7 +105,7 @@ roles:
 # The B5 final-polish pass: OFF unless this block is present. After a run's
 # complete_run evidence passes, codex EDITS the finished repo inline (workspace-
 # write) per `criteria`; the edits are KEPT only if the SAME evidence still passes
-# (else discarded — the original completion stands). codex can never bypass the
+# (else discarded, the original completion stands). codex can never bypass the
 # gate or fail a completed run. `script` defaults to the bundled codex_polish.sh;
 # `screenshot` (worktree-relative) is optional for a visual polish brief.
 # final_polish:
@@ -135,7 +135,7 @@ def _no_config_exit() -> SystemExit:
     """The shared failure when ``run`` / ``resume`` find no config (no rig defaults)."""
 
     return SystemExit(
-        "no .grindstone/config.yaml found — run `grindstone init --repo <repo>` "
+        "no .grindstone/config.yaml found, run `grindstone init --repo <repo>` "
         "first, then edit the role scripts it scaffolds (core ships no rig "
         "defaults)."
     )
@@ -146,7 +146,7 @@ def _resolve_planner(
 ) -> PlannerTransport:
     """The planner transport: the ``planner`` role's request script.
 
-    The planner is ALWAYS the script (no transport branching — the script owns
+    The planner is ALWAYS the script (no transport branching, the script owns
     transport + model). No config fails loudly toward ``grindstone init``.
     """
 
@@ -169,7 +169,7 @@ def _resolve_ladder(
     ``local_request.sh``); the optional ``senior`` role appends a second rung
     (the cloud escalation tier) when present. Each worker logs under
     ``<run-dir>/worker_logs`` (never the run dir's state). With NO config the
-    core ships no rig-specific defaults (ARCHITECTURE.md: no model config in core) — it
+    core ships no rig-specific defaults (ARCHITECTURE.md: no model config in core), it
     fails loudly toward ``grindstone init``, whose scaffold carries the editable
     role scripts for the operator to confirm.
     """
@@ -219,7 +219,7 @@ def _resolve_concurrency(
 
 
 def _resolve_max_planner_calls(cfg: GrindstoneConfig | None) -> int:
-    """Planner-call ceiling: config > built-in default — NEVER unbounded.
+    """Planner-call ceiling: config > built-in default, NEVER unbounded.
 
     ``run_grind``'s ``None`` (= off) stays available as a test seam only; every
     CLI-driven run gets a cap so an unattended revision spin cannot drain the
@@ -251,7 +251,7 @@ def _resolve_vision_reviewer(cfg: GrindstoneConfig | None) -> VisionReviewer | N
 
 def _resolve_final_polish(cfg: GrindstoneConfig | None) -> FinalPolish | None:
     """The B5 final-polish wiring: ``None`` unless the config opts in (OFF by
-    default — codex never touches a completed run without it). When present, the
+    default, codex never touches a completed run without it). When present, the
     polisher uses the config'd ``script`` else the bundled ``models/codex_polish.sh``
     (the codex call is swappable via the script path, e.g. a stub in tests)."""
 
@@ -362,10 +362,10 @@ def _cmd_run(
 
 def _watched_grind(grind: Callable[[], RunOutcome], run_dir: RunDir) -> RunOutcome:
     """Run ``grind`` in a background thread while the live TUI renders in the
-    foreground — the single human command. The grind owns every write; the TUI is
+    foreground, the single human command. The grind owns every write; the TUI is
     the same pure journal reader as ``watch``. We join the grind before returning
     so its workers are reaped cleanly (a Ctrl-C stops the view, then the run still
-    finishes — runs are resumable, so abandoning is recoverable, but waiting is
+    finishes, runs are resumable, so abandoning is recoverable, but waiting is
     tidier). The grind's outcome (not the rendered tree) is the return value."""
 
     holder: dict[str, RunOutcome] = {}
@@ -426,7 +426,7 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
 
 def _add_transport_flags(p: argparse.ArgumentParser) -> None:
-    # The CLI no longer knows models / transports / slots — the role scripts and
+    # The CLI no longer knows models / transports / slots, the role scripts and
     # `.grindstone/config.yaml` own them. Only the run-id remains operator-facing.
     p.add_argument("--run-id", help="run id (default: UTC timestamp slug)")
 
@@ -469,7 +469,7 @@ def main(
     ladder: Ladder | None = None,
 ) -> int:
     """Parse ``argv`` and dispatch. ``planner`` / ``ladder`` override the built-in
-    transports (the test seam — like ``run_grind``'s injected ``sleep_fn``)."""
+    transports (the test seam, like ``run_grind``'s injected ``sleep_fn``)."""
 
     args = _build_parser().parse_args(argv)
     if args.command == "init":

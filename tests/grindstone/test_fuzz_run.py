@@ -115,7 +115,7 @@ def test_fuzz_run_always_terminates_bounded(tmp_path: Path, seed: int) -> None:
 
 
 class _MultiPhasePlanner:
-    """A fuzz planner whose skeleton has 3 phases with mixed criteria — one
+    """A fuzz planner whose skeleton has 3 phases with mixed criteria, one
     always-failing phase drives budgets -> phase escalations -> revise/escalate.
 
     Exercises the S4 phase machinery (advancement, budgets, escalation legality)

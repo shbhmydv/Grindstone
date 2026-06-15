@@ -1,6 +1,6 @@
 """S5 ruling 1: the repo-memory READ seam (``load_digest``).
 
-The write-back hook is deliberately absent (ARCHITECTURE.md — organ built after 3-5
+The write-back hook is deliberately absent (ARCHITECTURE.md, organ built after 3-5
 real runs). These tests pin the read path only: a missing digest is ``None``
 (never an error), a present digest is its text, and an over-cap digest is
 truncated with a visible marker rather than failing the run.

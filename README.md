@@ -1,10 +1,9 @@
 # Grindstone
 
-**An epoch-based deep-work orchestrator for coding agents.** You hand it a job
-spec. A strong cloud planner proposes one small, verifiable epoch at a time;
-local workers fan out and grind through the tasks; and a fixed, deterministic
-state machine gates every step through disk contracts until the job's exit
-criteria actually pass.
+An epoch-based deep-work orchestrator for coding agents. You hand it a job spec.
+A strong cloud planner proposes one small, verifiable epoch at a time, local
+workers fan out and grind through the tasks, and a fixed state machine gates
+every step through disk contracts until the job's exit criteria actually pass.
 
 > *The model proposes; the state machine disposes.*
 
@@ -17,36 +16,35 @@ criteria actually pass.
 
 ## Why Grindstone
 
-Most agent harnesses let a single model improvise the whole job — plan, edit,
-decide it's done — and hope the transcript reflects reality. Grindstone refuses
-to trust the model's word for anything that matters:
+Most agent harnesses hand the whole job to one model: it plans the work and makes
+the edits, then reports that it finished. You end up trusting the transcript.
+Grindstone checks the work directly, and the rest of the design follows from that.
 
-- **Deterministic gates, not vibes.** A task is done only when a *command exits 0*
-  or a *required artifact exists* — never because a model said "done". Every
-  worker result crosses a JSON disk contract (`handoff.json`) that is relocated,
-  re-validated, and re-checked in the run directory. **stdout is never parsed.**
-- **Small, bounded planner turns.** The planner emits exactly one constrained
-  tool-call per turn (`propose_skeleton` / `implement` / `review` / `complete_run`
-  / …) — schema-validated before it touches the loop. No runaway agent; the loop
-  is a fixed, inspectable state machine.
-- **Model-agnostic by construction.** Grindstone knows only **three role names** —
-  `planner`, `local`, `senior` — each reached through a `models/*.sh` adapter
-  behind a file contract. Swap GPT-5.5 for Claude, Qwen for Llama, kimi for
-  anything: the orchestrator never changes.
-- **Crash-safe and resumable.** Every state transition is an `fsync`'d line in an
-  append-only `events.ndjson` journal. Kill a run mid-epoch and `resume` it —
-  no work is lost or double-burned. The journal even self-heals a crash-torn tail.
-- **Typed at every boundary.** Python, Pydantic on every wire contract,
-  `mypy --strict` clean. The schemas in `schemas/` are the single source of truth.
-- **Taste, gated.** UI work can be routed to a vision-capable senior model and
-  judged by a planner-driven screenshot review that returns a pass/fail disk
-  contract — so "make it look good" becomes a checkable gate, not a hope.
+- **Deterministic gates.** A task passes when a command exits 0 or a named
+  artifact exists. Every worker result is written to a `handoff.json` file that
+  Grindstone relocates into the run directory, re-validates, and re-checks before
+  accepting it. stdout is never parsed.
+- **Bounded planner turns.** The planner returns one tool call per turn
+  (`propose_skeleton`, `implement`, `review`, `complete_run`, and a few others),
+  validated against a schema before the loop acts on it. The loop is an ordinary
+  state machine you can read top to bottom.
+- **Swappable models.** There are three roles: `planner`, `local`, and `senior`.
+  Each is a `models/*.sh` script behind a file contract, so you can put GPT-5.5
+  where Claude was, or Qwen where Llama was, and the orchestrator stays the same.
+- **Resumable.** Every state change is an fsync'd line in an append-only
+  `events.ndjson` journal. If a run dies mid-epoch, `resume` picks it back up, and
+  the journal repairs a crash-torn tail when it loads.
+- **Typed boundaries.** Python, with Pydantic on every wire contract and the whole
+  package under `mypy --strict`. The files in `schemas/` define the formats.
+- **Taste as a gate.** UI work can route to a vision-capable senior model and be
+  judged by a screenshot review that returns a pass/fail file, so "make it look
+  good" turns into a check the run can enforce.
 
 ## See it work
 
-A two-phase job — *build a greeting module, then document it* — driven to
-completion. Live, while it runs, `--watch` paints the run → phase → epoch → task
-tree (a pure reader of the event journal, in a separate process):
+Here is a two-phase job, building a greeting module and then documenting it, run
+to completion. While it runs, `--watch` paints the run → phase → epoch → task tree
+from the event journal, in a separate reader process:
 
 ```
 ✓ run greet-demo  [completed]  2m31s  · 2/2 phases  · planner calls: 4/96  · last: complete_run
@@ -59,11 +57,11 @@ tree (a pure reader of the event journal, in a separate process):
         └── ✓ T3 (implement)  [done]  32s
 ```
 
-When the run reaches a terminal state it writes a post-mortem `journal.md`,
-rendered from the same event stream — never a second source of truth:
+When a run reaches a terminal state it writes a post-mortem `journal.md` from that
+same event stream, so there is never a second source of truth:
 
 ```markdown
-# Run greet-demo — completed
+# Run greet-demo · completed
 
 - Job: `job.md`
 - Duration: 2m31s   ·   Planner calls: 4/96
@@ -78,27 +76,25 @@ rendered from the same event stream — never a second source of truth:
     - ✓ T3 (implement) [done]  (32s)
 ```
 
-And when a phase carries a **vision-review** gate, a planner-driven model judges
-the rendered UI against your criteria and emits a verdict disk contract. A real
-failing verdict from the taste gate:
+If a phase carries a vision-review gate, a planner-driven model judges the
+rendered UI against your criteria and writes a verdict. Here is a real failing one:
 
 ```json
 {
   "pass": false,
   "reasons": [
     "Primary button is not full-width on mobile; it floats left of center.",
-    "Visual hierarchy is weak — the heading and body copy are the same weight."
+    "Visual hierarchy is weak; the heading and body copy share one weight."
   ]
 }
 ```
 
-That `pass: false` fails the phase's exit criterion deterministically — the run
-does not advance on a UI the judge rejected.
+That `pass: false` fails the phase's exit criterion, so the run will not advance on
+a UI the judge rejected.
 
 ## How it works
 
-A job flows through a fixed lifecycle, and the state machine — not the model —
-decides every transition:
+A job moves through a fixed lifecycle. The state machine decides every transition:
 
 ```
 job.md
@@ -109,16 +105,17 @@ job.md
                           └─ complete_run (re-verifies evidence) ──▶ terminal
 ```
 
-Each worker writes `handoff.json` in its own throwaway git worktree; the
-relocated, re-validated copy in the run dir is the gate. Phases advance only when
-their `exit_criterion` checks pass; `complete_run` re-runs the evidence before
-the run is allowed to finish. See **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)**
-for the full design — the thesis, the script-backed roles, the run-dir layout,
-the taste/vision features, and durability/resume.
+Each worker writes `handoff.json` in its own throwaway git worktree, and the
+relocated, re-validated copy in the run dir is what counts. A phase advances only
+once its `exit_criterion` checks pass, and `complete_run` re-runs the evidence
+before the run is allowed to finish. The full design lives in
+**[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)**: the thesis, the script-backed
+roles, the run-dir layout, the taste and vision features, and how durability and
+resume work.
 
 ## Quickstart
 
-Grindstone runs **from a clone** — no separate package step needed.
+Grindstone runs from a clone, with no separate package step.
 
 ```bash
 # 1. Clone and install (editable; resolves models/ + schemas/ from the repo root).
@@ -134,38 +131,40 @@ $EDITOR /path/to/target-repo/job.md
 # 4. Run it to completion (--watch renders the live TUI; drop it for agents/CI).
 python3 -m grindstone run /path/to/target-repo/job.md --repo /path/to/target-repo --watch
 
-# 5. Watch a run's live tree, or resume a killed run — no work is lost or double-burned.
+# 5. Watch a run's live tree, or resume a killed run; nothing is lost or double-burned.
 python3 -m grindstone watch  <run-id> --repo /path/to/target-repo
 python3 -m grindstone resume <run-id> --repo /path/to/target-repo
 ```
 
-`run` executes in the **foreground** (use `nohup` / `&` to detach). Exit codes
-encode the terminal outcome: **`0`** completed, **`1`** escalated (needs a human),
-**`2`** safety-valve stop. Run state lives under `.grindstone/runs/<run-id>/`
-inside the target repo (an append-only `events.ndjson` journal, `run_state.json`,
-the keyed log `P*/E*/T*/…`, and a post-mortem `journal.md`).
+`run` executes in the foreground; use `nohup` or `&` to detach. The exit code
+tells you the terminal outcome: `0` completed, `1` escalated (needs a human), `2`
+safety-valve stop. Run state lives under `.grindstone/runs/<run-id>/` inside the
+target repo: an append-only `events.ndjson` journal, `run_state.json`, the keyed
+log at `P*/E*/T*/…`, and a post-mortem `journal.md`.
 
 ## Compatibility
 
-Grindstone is the orchestrator; the models behind each role are yours to choose.
-The reference adapters in `models/*.sh` wire up one working stack — point them at
-anything that speaks the file contract.
+Grindstone is the orchestrator; you choose the models behind each role. The
+reference adapters in `models/*.sh` wire up one working stack, but you can point
+them at anything that speaks the file contract.
 
 | Layer            | Reference (what the adapters ship with)            | Swappable with                                  |
 | ---------------- | -------------------------------------------------- | ----------------------------------------------- |
-| **Runtime**      | Python ≥ 3.10 · Linux & macOS                      | —                                               |
+| **Runtime**      | Python ≥ 3.10 · Linux & macOS                      | n/a                                             |
 | **Planner role** | `codex` CLI (GPT-5.5, a ChatGPT/OpenAI plan)       | any CLI that emits the decision JSON contract   |
 | **Local role**   | Qwen via `llama-server`, driven by the `pi` CLI    | any local/remote LLM server                     |
-| **Senior role**  | `opencode` (kimi) with web search — *optional*     | any cloud tier; delete the block for local-only |
+| **Senior role**  | `opencode` (kimi) with web search (*optional*)     | any cloud tier; delete the block for local-only |
 | **Vision/taste** | Qwen 3.6 (native VL, `--mmproj`) + `codex` judge   | any vision model behind the screenshot contract |
-| **Target repo**  | any `git` repository                               | —                                               |
+| **Target repo**  | any `git` repository                               | n/a                                             |
 
-**macOS note:** the role scripts use GNU `timeout` as a wall-clock backstop and
-fall back to `gtimeout` — install it with `brew install coreutils`.
+macOS note: the role scripts use GNU `timeout` as a wall-clock backstop and fall
+back to `gtimeout`, so install it with `brew install coreutils`.
 
-**Bring your own models.** The planner adapter runs whatever your `codex`/ChatGPT
-plan serves and the senior tier is optional, so the one real blank for most rigs is
-your local model. Swap the model identities without touching code:
+### Bring your own models
+
+The planner adapter runs whatever your `codex`/ChatGPT plan serves, and the senior
+tier is optional, so for most rigs the only real blank is your local model. You can
+swap the model identities without touching code:
 
 | Env var                     | Default                 | What it sets                                          |
 | --------------------------- | ----------------------- | ---------------------------------------------------- |
@@ -173,33 +172,32 @@ your local model. Swap the model identities without touching code:
 | `GRINDSTONE_LOCAL_MODEL`    | `qwen-3-6-27b-dense`    | the local `pi --model`                               |
 | `GRINDSTONE_SENIOR_MODEL`   | `opencode-go/kimi-k2.6` | any `opencode -m` target                             |
 
-For anything deeper — a different transport than `pi`/`opencode`/`codex`, extra
-flags, your own endpoint — edit the small `models/*.sh` adapter directly. Each one
-is the whole grindstone↔model boundary, and the working reference is the clearest
-spec of the `handoff.json` contract your replacement must honor (a placeholder
-couldn't teach it). `grindstone init` scaffolds `.grindstone/config.yaml`
-referencing the scripts by absolute path, with editable `slots` (per-role
-concurrency) and `timeout_s` — the orchestrator never needs to know what's behind
-them.
+For anything deeper, such as a different transport than `pi`/`opencode`/`codex`,
+extra flags, or your own endpoint, edit the relevant `models/*.sh` adapter. Each
+one is the whole boundary between Grindstone and a model, and the working reference
+is the clearest spec of the `handoff.json` contract your replacement has to honor.
+`grindstone init` scaffolds `.grindstone/config.yaml` with the scripts referenced
+by absolute path, plus editable `slots` (per-role concurrency) and `timeout_s`.
 
 ## The contracts
 
-The planner emits exactly one constrained tool-call per turn, and every worker
-result crosses a disk contract.
+The planner emits one constrained tool-call per turn, and every worker result
+crosses a disk contract.
 
-- **[`docs/PLANNER_CONTRACT.md`](docs/PLANNER_CONTRACT.md)** — the planner call
-  model, the decision tool set, input construction, and the validation pipeline.
-- **[`schemas/`](schemas/)** — the wire contracts and single source of truth:
+- **[`docs/PLANNER_CONTRACT.md`](docs/PLANNER_CONTRACT.md)** covers the planner
+  call model, the decision tool set, input construction, and the validation
+  pipeline.
+- **[`schemas/`](schemas/)** holds the wire contracts and the source of truth:
   `epoch_decision.json` (the planner's output), `handoff.json` (the worker's
-  result), `vision_verdict.json` (the taste gate). The Pydantic types and
-  validators in `grindstone/contracts/` are kept in lockstep with these.
+  result), and `vision_verdict.json` (the taste gate). The Pydantic types and
+  validators in `grindstone/contracts/` track these files.
 
 ## Security
 
-Grindstone **executes code on your behalf** — it runs planner-chosen shell
-commands (a job's `done_when` / `exit_criterion` / `complete_run` evidence checks)
-and the request scripts named in the target repo's config. **Run it only on job
-specs and target repos you trust**, ideally in a disposable VM or container. See
+Grindstone executes code on your behalf. It runs planner-chosen shell commands (a
+job's `done_when`, `exit_criterion`, and `complete_run` evidence checks) and the
+request scripts named in the target repo's config. Run it only on job specs and
+target repos you trust, ideally in a disposable VM or container. See
 **[`SECURITY.md`](SECURITY.md)** for the full trust model and what is sandboxed.
 
 ## Running the tests
@@ -210,9 +208,9 @@ python3 -m pytest tests/grindstone -m real     # opt-in: live gates (spend real 
 ```
 
 The `-m real` gates exercise live infrastructure (the `codex` planner, the local
-GPU workers) and spend real subscription / GPU quota — they are excluded from the
-default suite and are opt-in only.
+GPU workers) and spend real subscription or GPU quota, so they are excluded from
+the default suite and run only when you ask for them.
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+MIT. See [`LICENSE`](LICENSE).

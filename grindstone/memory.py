@@ -1,4 +1,4 @@
-"""Repo-memory READ seam — the planner's ``<repo_memory>`` digest source.
+"""Repo-memory READ seam, the planner's ``<repo_memory>`` digest source.
 
 S5 ruling 1 / ARCHITECTURE.md. This module is the READ HALF of the deferred write-back
 repo-memory organ, and ONLY the read half. ``load_digest`` reads a per-repo
@@ -14,7 +14,7 @@ system, and a present-but-empty extraction function would be dead code under the
 zero-dead-code rule. Adding the writer behind this fixed read seam later is
 cheap; the seam is the whole point.
 
-Reads NEVER fail a run: a missing digest yields ``None`` (the common case —
+Reads NEVER fail a run: a missing digest yields ``None`` (the common case,
 most repos never grow one), and an oversized digest is truncated to a byte cap
 with a visible marker rather than blowing the planner's prefix budget.
 """
@@ -40,7 +40,7 @@ def load_digest(repo_root: Path) -> str | None:
     """Return the repo-memory digest text for ``repo_root``, or ``None``.
 
     ``None`` when ``.grindstone/memory/digest.md`` is absent (the usual case).
-    When present, its UTF-8 text — truncated to ``DIGEST_MAX_BYTES`` with
+    When present, its UTF-8 text, truncated to ``DIGEST_MAX_BYTES`` with
     ``TRUNCATION_MARKER`` appended (on a UTF-8 boundary, so a multi-byte
     codepoint straddling the cap never raises) when it would otherwise overflow.
     """

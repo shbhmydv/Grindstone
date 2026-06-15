@@ -1,13 +1,13 @@
 """The per-run journal: a markdown render of ``events.ndjson`` (ARCHITECTURE.md).
 
-A human-facing post-mortem — "what got done in what phase / epoch / job" —
+A human-facing post-mortem, "what got done in what phase / epoch / job",
 written once at terminal. It is a DERIVED view of the event stream (the same
 ``replay`` fold the TUI uses), never a second source of truth, so it carries no
 trust/poisoning risk and nothing reads it back into the loop.
 
 Retention: only the LATEST run keeps its ``journal.md``. When a new run starts
 it reaps every other run's journal, leaving just the durable ``events.ndjson``
-behind — and because the journal is derived, any old run stays re-renderable
+behind, and because the journal is derived, any old run stays re-renderable
 from its retained events.
 """
 
@@ -17,7 +17,7 @@ from grindstone.duration import fmt_secs, span_secs
 from grindstone.events import RunTree, read_events, replay
 from grindstone.rundir import RunDir
 
-#: Task-status glyphs (plain unicode — markdown carries no colour).
+#: Task-status glyphs (plain unicode, markdown carries no colour).
 _TASK_GLYPH = {"done": "✓", "failed": "✗", "escalated": "⤴", "retried": "↻"}
 
 
@@ -36,10 +36,10 @@ def render_journal(tree: RunTree) -> str:
         else str(tree.planner_calls)
     )
     run_span = span_secs(tree.started_ts, tree.ended_ts, ref)
-    duration = fmt_secs(run_span) if run_span is not None else "—"
+    duration = fmt_secs(run_span) if run_span is not None else "n/a"
 
     lines: list[str] = [
-        f"# Run {tree.run_id} — {tree.status}",
+        f"# Run {tree.run_id} · {tree.status}",
         "",
         f"- Job: `{tree.job_path}`",
         f"- Duration: {duration}   ·   Planner calls: {calls}",
@@ -75,7 +75,7 @@ def render_journal(tree: RunTree) -> str:
 def write_journal(run_dir: RunDir) -> None:
     """Render the run's journal from its events and write ``journal.md``.
 
-    A no-op when there is no renderable run yet (missing/empty/partial journal —
+    A no-op when there is no renderable run yet (missing/empty/partial journal,
     no ``run_started``), so a killed-before-start run never strands a stub file.
     """
 
@@ -83,7 +83,7 @@ def write_journal(run_dir: RunDir) -> None:
     if not path.exists():
         return
     # Best-effort: the journal is a DERIVED, non-load-bearing view rendered AFTER
-    # the run is durably terminal. It must never raise into that path — a KeyError
+    # the run is durably terminal. It must never raise into that path. A KeyError
     # from an inconsistent event stream or an OSError on write must not throw away
     # an already-durable RunOutcome. Any failure -> no/stale journal.md, never a crash.
     try:
@@ -98,7 +98,7 @@ def reap_sibling_journals(run_dir: RunDir) -> None:
 
     Called when a new run starts: only the latest run keeps a rendered journal;
     siblings keep their ``events.ndjson`` (the durable record) and nothing else.
-    Best-effort — a missing parent or already-gone journal is fine.
+    Best-effort: a missing parent or already-gone journal is fine.
     """
 
     runs_dir = run_dir.root.parent

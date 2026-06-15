@@ -155,7 +155,7 @@ def test_gate_b_full_run_real_codex_and_pi(tmp_path: Path) -> None:
     # REAL workers: a skeleton is proposed, epochs are planned + integrated, and
     # the run reaches a terminal RunOutcome (never hangs/crashes). Whether the
     # local worker lands every toy task within the brief's tight test valve is a
-    # model-capability matter, not the loop's contract — so completion is the
+    # model-capability matter, not the loop's contract, so completion is the
     # logged goal, while the gate asserts the invariants S3 owns.
     assert outcome.status in {"completed", "escalated", "failed"}
     assert state.skeleton is not None, "planner never proposed a skeleton"

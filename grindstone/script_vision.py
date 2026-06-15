@@ -5,11 +5,11 @@ VISION REVIEW layered on a visual epoch's deterministic functional floor. Like
 every other model boundary, grindstone reaches it through a request **script**
 (``models/vision_review.sh``) and never learns the transport (codex) behind it:
 the script runs ``codex exec -i <screenshot> --output-schema <verdict> -o <out>``
-and writes the verdict to ``--out`` — a DISK CONTRACT grindstone re-reads and
+and writes the verdict to ``--out``, a DISK CONTRACT grindstone re-reads and
 Pydantic-validates (never stdout). ``ScriptVisionReviewer`` Popen's the script as
 a group leader, supervises the wall-clock, and on timeout delegates the kill to
-``stop.sh`` (mirrors ``ScriptPlanner``). Any failure — non-zero exit, timeout,
-missing/invalid verdict — raises ``VisionReviewError``, which the core maps to a
+``stop.sh`` (mirrors ``ScriptPlanner``). Any failure, non-zero exit, timeout,
+missing/invalid verdict, raises ``VisionReviewError``, which the core maps to a
 deterministic check FAIL (the gate never crashes the run).
 """
 
@@ -30,7 +30,7 @@ _VERDICT_SCHEMA = Path(__file__).resolve().parents[1] / "schemas" / "vision_verd
 
 #: Slack between the script's own ``--timeout`` (a graceful ``timeout --signal=
 #: TERM``) and the Python wall-clock supervisor's SIGKILL, so the two never fire
-#: simultaneously — the script gets a moment to shut down cleanly first.
+#: simultaneously, the script gets a moment to shut down cleanly first.
 SUPERVISOR_MARGIN_S = 5.0
 
 
@@ -57,7 +57,7 @@ class ScriptVisionReviewer:
 
     ``script`` is the absolute path to ``vision_review.sh``; ``stop.sh`` is its
     sibling. ``timeout_s`` is the transport-owned wall-clock supervisor. ``schema``
-    defaults to the bundled ``vision_verdict.json``. No model identity here — that
+    defaults to the bundled ``vision_verdict.json``. No model identity here, that
     lives in the script.
     """
 
@@ -86,7 +86,7 @@ class ScriptVisionReviewer:
         handle_file = out_dir / "handle"
         # Setup + launch can raise OSError (missing/non-executable script, an
         # unwritable out_dir). That is NOT a VisionReviewError, so it would escape
-        # _vision_result's catch and crash the run — map it to a deterministic
+        # _vision_result's catch and crash the run, map it to a deterministic
         # FAIL instead (the gate is "always fail, never crash").
         try:
             out_dir.mkdir(parents=True, exist_ok=True)

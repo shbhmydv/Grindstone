@@ -2,7 +2,7 @@
 
 One task, end-to-end, to a terminal outcome. Identity is **parameterized**
 (S2 ruling 3): a frozen ``TaskIdentity`` (phase/epoch/task) threads through the
-machine, so the same code drives every task in a fan-out — there are no fixed
+machine, so the same code drives every task in a fan-out, there are no fixed
 ``P1/E1/T1`` constants. The run/phase/epoch scaffold and the journal lifetime
 are owned by ``epoch_loop`` now; this module only grinds one task against a
 **shared, thread-safe** journal and reports its terminal state through a cursor
@@ -16,7 +16,7 @@ Per attempt (ARCHITECTURE.md, implement tasks):
       -> core commits the worktree (models never run git)
       -> ownership scope check: every committed path must fall in file_ownership
       -> DONE (keep branch for integration) | rejected attempt (worktree + branch
-         torn down — zero dead artifacts — and re-queued)
+         torn down, zero dead artifacts, and re-queued)
 
 Artifact tasks keep the S1 run-dir scratch (no worktree, no git): never hand a
 non-write task the live repo as CWD (v7 bugs A/C/H class).
@@ -189,7 +189,7 @@ def _now() -> str:
 #: Modes whose PRIMARY worker tier is ``senior`` (cloud + web tools), not local.
 #: research/review need judgment and web search (Exa via the senior script);
 #: implement/artifact are production work for the local rig. The planner stays
-#: model-agnostic — it emits a MODE; the core maps mode -> the starting tier.
+#: model-agnostic, it emits a MODE; the core maps mode -> the starting tier.
 _SENIOR_FIRST_MODES: frozenset[HandoffMode] = frozenset({"research", "review"})
 _SENIOR_TIER = "senior"
 
@@ -201,12 +201,12 @@ def starting_tier(
 
     research/review begin on the ``senior`` tier (web search + stronger judgment)
     when the ladder has one; implement/artifact begin on tier 0 (the local rig).
-    ``visual`` is taste routing (B3 seam): a VISUAL/taste epoch — UI or polish
-    output — also begins on ``senior`` whatever its mode, because the senior is
+    ``visual`` is taste routing (B3 seam): a VISUAL/taste epoch, UI or polish
+    output, also begins on ``senior`` whatever its mode, because the senior is
     the stronger TASTE-BUILDER (it builds work judged by how it looks). The senior
     is a text model, not vision-capable: the genuine image-based judgment is the
     B3 codex vision-review gate in the phase exit criterion, not this worker. A
-    rig with no senior tier falls every mode back to local — research there is repo
+    rig with no senior tier falls every mode back to local, research there is repo
     investigation only, and a visual epoch grinds locally rather than crash.
     Escalation still walks upward from the start tier.
     """
@@ -228,7 +228,7 @@ def _tier_allowance(tier_index: int, start_tier: int, tier0_attempts: int) -> in
 
 def _strip_pi_settings(scratch: Path) -> None:
     """Remove the worker's per-cwd ``.pi/settings.json`` (and the now-empty
-    ``.pi/`` dir) before commit — orchestration metadata never enters the diff.
+    ``.pi/`` dir) before commit, orchestration metadata never enters the diff.
 
     Surgical: only the settings file and an *empty* ``.pi/`` are removed. If the
     worker left other content under ``.pi/`` it stays, and the ownership scope
@@ -253,7 +253,7 @@ def _grounding_violations(
     Implement scratch IS a repo checkout, so it is the only allowed root there
     (the operator checkout stays out of bounds). research/review/artifact tasks
     investigate the TARGET REPO from a plain scratch dir, so the repo root is a
-    second allowed root — scratch-only rejected every legitimate repo citation
+    second allowed root, scratch-only rejected every legitimate repo citation
     (gate-5 P0: the task could never hand off and the planner spun revisions).
     Citations resolve against scratch first, then the repo root.
     """
@@ -295,7 +295,7 @@ def _run_one_check(check: Check, scratch: Path, run_dir: RunDir) -> tuple[str, i
         return (f"artifact_exists:{check.artifact_exists}", 0 if exists else 1)
     # The taste gate (B3) renders + reviews a screenshot in a TIP worktree
     # (run_loop.evaluate_checks); a worker's done_when CWD is a scratch with no
-    # reviewer wired, so a vision_review here is a planner mis-placement — fail
+    # reviewer wired, so a vision_review here is a planner mis-placement, fail
     # deterministically (never crash) and steer it to the phase exit criterion.
     assert isinstance(check, VisionReviewCheck)
     return (
@@ -380,7 +380,7 @@ def _collect_handoff(
 def _scratch_for(
     identity: TaskIdentity, run_dir: RunDir, attempt: int, *, implement: bool
 ) -> Path:
-    """The attempt's CWD path (NOT yet created for worktrees — git owns that)."""
+    """The attempt's CWD path (NOT yet created for worktrees, git owns that)."""
 
     if implement:
         return run_dir.root / "worktrees" / identity.task_id / f"attempt-{attempt}"
@@ -394,7 +394,7 @@ def _install_attempt_checks(
 
     Writes ``check_handoff.py`` (generated from the dispatched fully-qualified
     task_id + mode) into ``scratch`` and returns a runtime copy of ``task`` with
-    ``python3 check_handoff.py`` appended to ``done_when`` — so it shows in the
+    ``python3 check_handoff.py`` appended to ``done_when``, so it shows in the
     worker prompt's done_when AND in the core's authoritative re-run. Implement
     attempts additionally get the review gate ``test -s review.md`` appended:
     the fresh-context review demanded as a checked artifact (verified to fire;
@@ -407,7 +407,7 @@ def _install_attempt_checks(
     # root (their scratch is a plain dir; the files they investigate live in
     # the repo). Implement attempts bake None: their CWD IS a repo checkout
     # and the operator checkout must stay out of bounds. Mirrors the core
-    # gate's _grounding_violations exactly — worker-vs-core drift on citation
+    # gate's _grounding_violations exactly, worker-vs-core drift on citation
     # semantics was the gate-5 P0 (self-validated green, core rejected).
     (scratch / CHECK_SCRIPT_NAME).write_text(
         generate_check_script(
@@ -439,8 +439,8 @@ def _dispatch_attempt(
     """Run one attempt end-to-end; raise ``_AttemptFailed`` on any failure.
 
     For implement tasks the scratch is a fresh worktree from ``base``; on the
-    handoff's success the core commits and scope-checks the diff. Any failure —
-    transport, handoff, or out-of-scope write — maps identically to a failed
+    handoff's success the core commits and scope-checks the diff. Any failure,
+    transport, handoff, or out-of-scope write, maps identically to a failed
     attempt (ARCHITECTURE.md: the loop never inspects worker internals).
     """
 
@@ -464,12 +464,12 @@ def _dispatch_attempt(
     )
     try:
         worker.run(request)
-    except Exception as exc:  # transport boundary — any raise is a failed attempt
+    except Exception as exc:  # transport boundary, any raise is a failed attempt
         raise _AttemptFailed(f"transport error: {type(exc).__name__}: {exc}") from exc
     handoff = _collect_handoff(request, task, mode, run_dir, identity, repo)
 
     if isinstance(task, ArtifactTask):
-        # Publish the produced artifact to its log key — the artifact analogue
+        # Publish the produced artifact to its log key, the artifact analogue
         # of the handoff relocation. Gate-6 P0: the file stayed in scratch, so
         # artifact_exists checks were structurally unsatisfiable and the
         # planner revised phases until the safety valve. A promised-but-absent
@@ -479,7 +479,7 @@ def _dispatch_attempt(
         # write (prompt + done_when both reference task.artifact_out verbatim, as
         # a CWD-relative path). A basename-only lookup rejected an artifact_out
         # carrying a real subdir (e.g. `MIGRATION/inv.md`) even when the worker
-        # produced it correctly — dogfood-1's 15 spurious rejections + retries.
+        # produced it correctly, dogfood-1's 15 spurious rejections + retries.
         # LogKey is a validated safe relative path (same value resolve() trusts).
         src = scratch / task.artifact_out
         if not src.is_file():
@@ -497,7 +497,7 @@ def _dispatch_attempt(
         # orchestration metadata (the handoff is already relocated to the log
         # key; the validator is core-written; the review was gated by the
         # done_when re-run above; the .pi settings only pin the worker's
-        # subagents), not the task's repo work — drop the scratch copies so they
+        # subagents), not the task's repo work, drop the scratch copies so they
         # never enter the commit or trip the ownership scope check.
         (scratch / "handoff.json").unlink(missing_ok=True)
         (scratch / CHECK_SCRIPT_NAME).unlink(missing_ok=True)
@@ -719,7 +719,7 @@ def run_task(
     """Grind ONE task to terminal against a shared journal (fan-out unit).
 
     Fresh start: dispatch from attempt 0. Resume (``resume_cursor`` with status
-    ``running``): the attempt in flight at kill is **burned** — a killed worker
+    ``running``): the attempt in flight at kill is **burned**, a killed worker
     cannot be trusted, so its worktree + branch are torn down and the attempt is
     NOT re-run (its number is kept); a handoff_rejected is journaled and the
     grind continues from the recorded ladder position. Implement tasks require

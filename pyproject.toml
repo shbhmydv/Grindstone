@@ -26,7 +26,7 @@ dependencies = [
 ]
 
 # The `grindstone` command. An editable install (`pip install -e .`) puts this on
-# PATH so the CLI runs from ANY cwd — crucially from the target repo, not just a
+# PATH so the CLI runs from ANY cwd, crucially from the target repo, not just a
 # checkout of this package. `main` reads sys.argv and returns the process exit code.
 [project.scripts]
 grindstone = "grindstone.cli:main"

@@ -3,7 +3,7 @@
 ARCHITECTURE.md: the event stream alone must be sufficient to render the full
 run -> phase -> epoch -> task tree with statuses, and ``planner_calls_per_run``
 must be derivable. ``replay`` is the proof: it folds an event list into a
-``RunTree`` snapshot. The vocabulary is frozen at S0 — the TUI (S4) and resume
+``RunTree`` snapshot. The vocabulary is frozen at S0, the TUI (S4) and resume
 both consume it.
 """
 
@@ -65,14 +65,14 @@ class RunEscalated(_Event):
 
 class RunFailed(_Event):
     # The production safety valve (planner-call / epoch cap) tripped. Terminal,
-    # but not an escalation — a harness bound the durable state also records. It
+    # but not an escalation, a harness bound the durable state also records. It
     # is a vocabulary event so the journal stays self-describing (the TUI exits).
     event: Literal["run_failed"] = "run_failed"
     reason: str
 
 
 class FinalPolishApplied(_Event):
-    # B5: codex's optional post-completion inline polish pass was KEPT — its edits
+    # B5: codex's optional post-completion inline polish pass was KEPT, its edits
     # re-passed the SAME complete_run evidence, so the run completes on the polish
     # commit. ``commit`` is that adopted commit sha (the final branch now points at
     # it); ``changed_files`` is the polish diff's file list (`git add -A` is blind,
@@ -84,7 +84,7 @@ class FinalPolishApplied(_Event):
 
 
 class FinalPolishSkipped(_Event):
-    # B5: the polish pass made no net change to the certified run — codex changed
+    # B5: the polish pass made no net change to the certified run, codex changed
     # nothing, its edits regressed the evidence (discarded), or the pass errored.
     # The original completion stands; ``reason`` records which (self-describing).
     event: Literal["final_polish_skipped"] = "final_polish_skipped"
@@ -224,7 +224,7 @@ def _truncate_torn_tail(path: Path) -> None:
     A crash mid-write can leave trailing bytes with no terminating newline.
     ``read_events`` TOLERATES such a line on read (it breaks), but if the writer
     then appends after it the new event FUSES onto the partial bytes into a single
-    corrupt NON-final line that every later read rejects — turning a recoverable
+    corrupt NON-final line that every later read rejects, turning a recoverable
     partial write into permanent loss of resume/replay. Truncating back to the
     last complete line (the last newline) keeps the next append on a clean boundary.
     """
@@ -245,7 +245,7 @@ class JournalWriter:
 
     Internally thread-safe (S2 ruling 2): a single lock guards every write, so
     concurrent fan-out tasks may journal at the same time without corrupting the
-    stream. ``emit`` is the concurrency-safe primitive — it assigns the next seq
+    stream. ``emit`` is the concurrency-safe primitive, it assigns the next seq
     and writes the event **atomically under the lock**, so seq stays strictly
     monotonic even when two tasks race; their events simply interleave. ``append``
     (explicit-seq, single-threaded scaffold + tests) shares the same lock.
@@ -374,7 +374,7 @@ class RunTree:
     planner_cap: int | None = None
     started_ts: str | None = None
     ended_ts: str | None = None
-    #: ts of the most recent event seen — the journal's notion of "now", used as
+    #: ts of the most recent event seen, the journal's notion of "now", used as
     #: the elapsed-clock reference when no wall clock is injected (e.g. snapshots).
     last_ts: str | None = None
     #: RunEscalated / RunFailed reason (the terminal "why").

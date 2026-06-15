@@ -28,7 +28,7 @@ from grindstone.rundir import RunDir
 SleepFn = Callable[[float], None]
 NowFn = Callable[[], str]
 
-#: Terminal run statuses the journal can express (incl. `failed` — the safety
+#: Terminal run statuses the journal can express (incl. `failed`, the safety
 #: valve now emits run_failed, so a capped run closes cleanly instead of hanging).
 _TERMINAL = frozenset({"completed", "escalated", "failed"})
 
@@ -57,7 +57,7 @@ def _with_note(text: Text, note: str | None) -> Text:
         text.append(f"  · {clipped}", style="magenta")
     return text
 
-# Per-level (glyph, rich-style) by status — the only place colour lives.
+# Per-level (glyph, rich-style) by status, the only place colour lives.
 _RUN_STYLE: dict[str, tuple[str, str]] = {
     "running": ("●", "yellow"),
     "completed": ("✓", "green"),
@@ -111,8 +111,8 @@ def _phase_label(phase: PhaseNode, now: str | None) -> Text:
 
 
 def _planner_state(tree: RunTree) -> tuple[str, str] | None:
-    """The planner's current standing as ``(label, style)`` — in-flight, last
-    failure (e.g. a rate-limit retry), or last decision — or ``None`` if idle."""
+    """The planner's current standing as ``(label, style)``, in-flight, last
+    failure (e.g. a rate-limit retry), or last decision, or ``None`` if idle."""
 
     if tree.planner_waiting:
         return "planner: running…", "yellow"
@@ -187,7 +187,7 @@ def read_tree(run_dir: RunDir) -> RunTree | None:
 
 
 def render_plain(tree: RunTree, *, width: int = 100, now: str | None = None) -> str:
-    """Plain-text (style-stripped) export of the render tree — the snapshot seam."""
+    """Plain-text (style-stripped) export of the render tree, the snapshot seam."""
 
     console = Console(file=StringIO(), width=width, force_terminal=False, color_system=None)
     console.print(render_tree(tree, now=now))
@@ -217,7 +217,7 @@ def watch(
     Re-reads the journal on file growth (size/mtime) but RE-RENDERS every tick so
     the elapsed clock on running nodes keeps advancing even when no new event has
     landed (otherwise a multi-minute task looks frozen). Quits cleanly on Ctrl-C
-    or — unless ``follow`` — when the run reaches a terminal status (``completed``
+    or, unless ``follow``, when the run reaches a terminal status (``completed``
     / ``escalated`` / ``failed``). The wall clock is the injected ``now_fn`` and
     the pacing the injected ``sleep`` (both stubbable in tests). Returns the last
     rendered tree (its status drives the CLI exit code)."""

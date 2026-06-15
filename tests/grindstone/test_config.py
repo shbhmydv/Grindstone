@@ -1,7 +1,7 @@
 """Role-split: the typed, frozen ``.grindstone/config.yaml``
 loader over the per-role schema.
 
-A minimal Pydantic loader with explicit unknown-key rejection — no schema
+A minimal Pydantic loader with explicit unknown-key rejection, no schema
 framework. Missing config is ``None`` (CLI fails loudly toward init); present
 config parses to a frozen typed object; an unknown key, a missing required role
 (``planner`` / ``local``), or a bad ``slots`` / ``timeout_s`` is a hard error
@@ -177,7 +177,7 @@ def test_empty_config_file_is_rejected_not_silent(tmp_path: Path) -> None:
 
 
 def test_final_polish_is_optional_and_defaults_none(tmp_path: Path) -> None:
-    # B5 codex polish pass: OFF by default — absent block means no polish runs.
+    # B5 codex polish pass: OFF by default, absent block means no polish runs.
     _write(tmp_path, "roles:\n" + _PLANNER + _LOCAL)
     cfg = load_config(tmp_path)
     assert cfg is not None and cfg.final_polish is None
@@ -224,7 +224,7 @@ def test_final_polish_non_positive_timeout_is_rejected(tmp_path: Path) -> None:
 
 # --- FIX 6: configured script paths must resolve under the bundled models/ dir --
 # A cloned repo's .grindstone/config.yaml is attacker-controlled, and every
-# `script:` is Popen'd (final_polish even WRITES) — an unconstrained path is RCE.
+# `script:` is Popen'd (final_polish even WRITES), an unconstrained path is RCE.
 
 
 def _bundled_roles() -> str:

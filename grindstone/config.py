@@ -2,16 +2,16 @@
 
 S5 ruling 3 + role-split. YAML is the owner-facing config
 format (project convention); the loader is a small frozen-Pydantic layer with
-explicit unknown-key rejection — NOT a schema framework. A typo'd key is a hard
+explicit unknown-key rejection, NOT a schema framework. A typo'd key is a hard
 error, never a silently-ignored default, because a config that half-applies is
 worse than no config.
 
 The config knows only *roles*, never models or transports: each role
 (``planner`` / ``local`` / ``senior``) names a request **script** behind the
 file contract (the script owns transport, model identity, GPU arbitration and
-the killable process group — see ``models/``), plus its concurrency ``slots``
+the killable process group, see ``models/``), plus its concurrency ``slots``
 and wall-clock ``timeout_s``. ``planner`` + ``local`` are required; ``senior``
-is optional — a rig with no cloud tier runs a local-only escalation ladder.
+is optional, a rig with no cloud tier runs a local-only escalation ladder.
 
 The CLI consults this loader on ``run`` / ``resume``: present config supplies
 the planner + worker ladder wiring; absent config fails loudly toward
@@ -47,7 +47,7 @@ class RoleConfig(BaseModel):
     ``script`` is the absolute path to the role's request script (``models/``);
     ``slots`` is the authoritative per-role concurrency bound (>= 1);
     ``timeout_s`` is the transport-owned wall-clock supervisor (> 0). No model
-    identity or transport — those live behind the script.
+    identity or transport, those live behind the script.
     """
 
     model_config = _FROZEN
@@ -87,7 +87,7 @@ class VisionReviewConfig(BaseModel):
     """The B3 taste gate behind a request script: ``script`` + ``timeout_s``.
 
     The vision reviewer is a deterministic gate (one codex call per
-    ``vision_review`` check), not a fan-out worker, so it carries no ``slots`` —
+    ``vision_review`` check), not a fan-out worker, so it carries no ``slots``,
     only the script path and the transport-owned wall-clock supervisor (> 0).
     Optional on the whole config: omit it and the CLI falls back to the bundled
     ``models/vision_review.sh``.
@@ -106,7 +106,7 @@ class VisionReviewConfig(BaseModel):
 
 
 class FinalPolishConfig(BaseModel):
-    """The B5 codex inline final-polish pass — OFF unless this block is present.
+    """The B5 codex inline final-polish pass, OFF unless this block is present.
 
     After a run's ``complete_run`` evidence passes, codex may EDIT the finished
     repo inline (workspace-write) per ``criteria``; the edits are kept only if the
@@ -135,7 +135,7 @@ class GrindstoneConfig(BaseModel):
 
     model_config = _FROZEN
     roles: RolesConfig
-    #: Per-run planner-call ceiling. ``None`` = the CLI's built-in default —
+    #: Per-run planner-call ceiling. ``None`` = the CLI's built-in default,
     #: NEVER unbounded (gate-5 P0: a stuck run burned 34 codex calls looping
     #: phase revisions while unattended).
     max_planner_calls: int | None = None
@@ -143,7 +143,7 @@ class GrindstoneConfig(BaseModel):
     #: (``models/vision_review.sh``); set it to point the taste gate at a
     #: different rig's script (or a stub in tests).
     vision_review: VisionReviewConfig | None = None
-    #: The B5 final-polish pass. ``None`` (absent block) = OFF — codex never
+    #: The B5 final-polish pass. ``None`` (absent block) = OFF, codex never
     #: touches a completed run. Present = the gated inline-edit pass runs after
     #: ``complete_run`` evidence passes (kept only if it re-passes).
     final_polish: FinalPolishConfig | None = None
@@ -154,7 +154,7 @@ def load_config(repo_root: Path) -> GrindstoneConfig | None:
 
     ``None`` when the file is absent (CLI uses built-in defaults). A malformed
     document, an unknown key, or a missing required field raises ``ValueError``
-    (Pydantic's ``ValidationError`` is a ``ValueError``) — never a silent fallback.
+    (Pydantic's ``ValidationError`` is a ``ValueError``), never a silent fallback.
     """
 
     path = Path(repo_root) / _CONFIG_REL
@@ -179,8 +179,8 @@ def validate_script_paths(cfg: GrindstoneConfig) -> None:
     """Reject any configured ``script:`` that is not a bundled ``models/`` script.
 
     The target repo's ``.grindstone/config.yaml`` is attacker-controlled (a cloned
-    repo carries its own), and EVERY configured script — ``roles.*`` /
-    ``vision_review`` / ``final_polish`` — is ``Popen``'d (final_polish even WRITES
+    repo carries its own), and EVERY configured script, ``roles.*`` /
+    ``vision_review`` / ``final_polish``, is ``Popen``'d (final_polish even WRITES
     the worktree). An unconstrained path is arbitrary-code execution, so a script
     must resolve under the rig's bundled ``models/`` dir. The
     ``GRINDSTONE_ALLOW_REPO_SCRIPTS=1`` escape hatch opts a TRUSTED repo back in.
@@ -204,7 +204,7 @@ def validate_script_paths(cfg: GrindstoneConfig) -> None:
         listing = "; ".join(f"{name}={p}" for name, p in bad)
         raise ValueError(
             f"configured script(s) outside the bundled models/ dir ({MODELS_DIR}): "
-            f"{listing}. Every configured script is executed — point them at the "
+            f"{listing}. Every configured script is executed, point them at the "
             f"rig's models/ scripts, or set {ALLOW_REPO_SCRIPTS_ENV}=1 to opt in to "
             f"a trusted repo's own scripts."
         )

@@ -3,7 +3,7 @@
 This is the rung that turns the S1 single-task machine into an epoch. Identity
 (phase/epoch/base) is parameterized and the run/phase frame is owned by the
 caller (S3: ``run_loop`` for production, a test helper for epoch-isolation
-tests) — ``run_epoch`` emits ONLY ``epoch_started`` … ``epoch_completed``
+tests), ``run_epoch`` emits ONLY ``epoch_started`` … ``epoch_completed``
 against a journal the caller opens, never the run frame (S3 ruling 8: the
 synthesized scaffold is deleted, the multi-epoch loop owns ``run_started`` /
 ``phase_started`` / ``run_completed`` / ``run_escalated``). The task list is
@@ -14,7 +14,7 @@ REAL, taken from the typed ``ImplementEpochArgs`` / ``ArtifactEpochArgs``.
       escalate). Implement tasks grind in per-attempt worktrees; the core
       commits + scope-checks each success.
     done-predicate -> task queue empty AND nothing in flight (an explicit
-      predicate over the epoch state — the S3 loop's gate, not a pool join).
+      predicate over the epoch state, the S3 loop's gate, not a pool join).
     integration    -> merge every DONE task's branch, in task order, into the
       epoch integration branch. Disjoint ownership + scope check make conflicts
       impossible by construction, so ANY conflict aborts the epoch as
@@ -326,7 +326,7 @@ def _integrate(
 
     Idempotent for resume: a branch already merged is an ancestor of the
     integration branch (or has been deleted) and is skipped. Any conflict aborts
-    the epoch — disjointness makes it structurally impossible.
+    the epoch, disjointness makes it structurally impossible.
     """
 
     wt.ensure_integration_branch(repo, branch, base)
@@ -370,7 +370,7 @@ def _integrate(
         wt.remove_worktree(repo, int_wt)
 
     # Prune the epoch's worktrees, THEN delete the merged task branches (git
-    # refuses to delete a branch still checked out in a worktree) — ruling 7.
+    # refuses to delete a branch still checked out in a worktree), ruling 7.
     wt.prune_tree(repo, run_dir.root / "worktrees")
     for outcome in done_in_order:
         if outcome.branch:
@@ -456,7 +456,7 @@ def run_epoch(
 
     ``journal`` is the caller-owned run journal (this function emits only
     ``epoch_started`` … ``epoch_completed``). Implement epochs require ``repo``;
-    ``base`` is the epoch base commit (the chain tip, ruling 4) — defaulted to
+    ``base`` is the epoch base commit (the chain tip, ruling 4), defaulted to
     repo HEAD when omitted. Artifact epochs need no repo and integrate nothing.
     """
 
@@ -571,7 +571,7 @@ def resume_epoch(
         elif cursor.status == "running":
             to_run.append(task_by_id[tid])
             resume_cursors[tid] = cursor
-        else:  # pending — never dispatched before the kill
+        else:  # pending, never dispatched before the kill
             to_run.append(task_by_id[tid])
             resume_cursors[tid] = None
 
