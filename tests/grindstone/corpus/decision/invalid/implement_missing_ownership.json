@@ -1,0 +1,15 @@
+{
+  "schema_version": "1",
+  "tool": "implement",
+  "args": {
+    "epoch_title": "implement task without file_ownership",
+    "rationale": "file_ownership is required for implement tasks",
+    "tasks": [
+      {
+        "id": "T1",
+        "goal": "g",
+        "done_when": [{ "cmd": "true" }]
+      }
+    ]
+  }
+}

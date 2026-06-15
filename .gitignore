@@ -1,0 +1,24 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# --- grindstone run state (created INSIDE a target repo; never commit) ---
+.grindstone/
+
+# --- local agent / tooling working dirs ---
+.claude/
+CLAUDE.local.md
+.pi/
+.orchestrator/
+.agents/
+.codex/
+.aider*
+
+# --- experiments / scratch ---
+.exp/
+CLAUDE.md

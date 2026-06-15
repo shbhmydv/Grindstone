@@ -1,0 +1,22 @@
+{
+  "schema_version": "1",
+  "tool": "implement",
+  "args": {
+    "epoch_title": "duplicate task ids",
+    "rationale": "structurally valid, semantically bad",
+    "tasks": [
+      {
+        "id": "T1",
+        "goal": "first",
+        "done_when": [{ "cmd": "true" }],
+        "file_ownership": ["src/a/**"]
+      },
+      {
+        "id": "T1",
+        "goal": "second with same id",
+        "done_when": [{ "cmd": "true" }],
+        "file_ownership": ["src/b/**"]
+      }
+    ]
+  }
+}

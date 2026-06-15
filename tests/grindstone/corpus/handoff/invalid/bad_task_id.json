@@ -1,0 +1,8 @@
+{
+  "schema_version": "1",
+  "task_id": "X/Y/Z",
+  "status": "DONE",
+  "resulting_state": "ok",
+  "checks": [],
+  "occupancy": { "compacted": false, "subagent_splits": 0 }
+}

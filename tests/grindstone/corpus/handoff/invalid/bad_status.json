@@ -1,0 +1,8 @@
+{
+  "schema_version": "1",
+  "task_id": "P1/E1/T1",
+  "status": "MAYBE",
+  "resulting_state": "ok",
+  "checks": [],
+  "occupancy": { "compacted": false, "subagent_splits": 0 }
+}

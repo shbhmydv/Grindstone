@@ -1,0 +1,19 @@
+{
+  "schema_version": "1",
+  "tool": "implement",
+  "args": {
+    "epoch_title": "too many tasks",
+    "rationale": "9 tasks exceeds the fan-out cap of 8",
+    "tasks": [
+      { "id": "T1", "goal": "g", "done_when": [{ "cmd": "true" }], "file_ownership": ["a/1"] },
+      { "id": "T2", "goal": "g", "done_when": [{ "cmd": "true" }], "file_ownership": ["a/2"] },
+      { "id": "T3", "goal": "g", "done_when": [{ "cmd": "true" }], "file_ownership": ["a/3"] },
+      { "id": "T4", "goal": "g", "done_when": [{ "cmd": "true" }], "file_ownership": ["a/4"] },
+      { "id": "T5", "goal": "g", "done_when": [{ "cmd": "true" }], "file_ownership": ["a/5"] },
+      { "id": "T6", "goal": "g", "done_when": [{ "cmd": "true" }], "file_ownership": ["a/6"] },
+      { "id": "T7", "goal": "g", "done_when": [{ "cmd": "true" }], "file_ownership": ["a/7"] },
+      { "id": "T8", "goal": "g", "done_when": [{ "cmd": "true" }], "file_ownership": ["a/8"] },
+      { "id": "T8", "goal": "g", "done_when": [{ "cmd": "true" }], "file_ownership": ["a/9"] }
+    ]
+  }
+}

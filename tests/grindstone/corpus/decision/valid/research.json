@@ -1,0 +1,16 @@
+{
+  "schema_version": "1",
+  "tool": "research",
+  "args": {
+    "epoch_title": "survey prior art",
+    "rationale": "need grounding before design",
+    "tasks": [
+      {
+        "id": "T1",
+        "goal": "summarize existing schedulers",
+        "done_when": [{ "artifact_exists": "p1/e1/t1/notes.md" }],
+        "artifact_out": "p1/e1/t1/notes.md"
+      }
+    ]
+  }
+}

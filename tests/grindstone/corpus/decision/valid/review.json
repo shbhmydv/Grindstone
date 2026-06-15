@@ -1,0 +1,17 @@
+{
+  "schema_version": "1",
+  "tool": "review",
+  "args": {
+    "epoch_title": "review the parser",
+    "rationale": "gate before merge",
+    "tasks": [
+      {
+        "id": "T1",
+        "goal": "review tokenizer correctness",
+        "done_when": [{ "artifact_exists": "p1/e2/t1/review.md" }],
+        "artifact_out": "p1/e2/t1/review.md",
+        "targets": ["src/tokenizer/core.py"]
+      }
+    ]
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "schema_version": "1",
+  "tool": "revise_phases",
+  "args": {
+    "reason": "tries to rewrite an already-completed phase",
+    "phases": [
+      {
+        "id": "P1",
+        "title": "rewrite of a completed phase",
+        "exit_criterion": [{ "cmd": "true" }],
+        "epoch_budget": 1
+      },
+      {
+        "id": "P2",
+        "title": "legitimate tail",
+        "exit_criterion": [{ "cmd": "true" }],
+        "epoch_budget": 1
+      }
+    ]
+  }
+}

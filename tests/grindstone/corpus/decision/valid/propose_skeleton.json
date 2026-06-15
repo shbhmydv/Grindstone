@@ -1,0 +1,20 @@
+{
+  "schema_version": "1",
+  "tool": "propose_skeleton",
+  "args": {
+    "phases": [
+      {
+        "id": "P1",
+        "title": "scaffold",
+        "exit_criterion": [{ "cmd": "pytest -q", "expect_exit": 0 }],
+        "epoch_budget": 3
+      },
+      {
+        "id": "P2",
+        "title": "harden",
+        "exit_criterion": [{ "artifact_exists": "p2/review/summary.md" }],
+        "epoch_budget": 2
+      }
+    ]
+  }
+}

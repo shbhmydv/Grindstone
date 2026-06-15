@@ -1,0 +1,16 @@
+{
+  "schema_version": "1",
+  "tool": "artifact",
+  "args": {
+    "epoch_title": "write the design doc",
+    "rationale": "capture the locked design",
+    "tasks": [
+      {
+        "id": "T1",
+        "goal": "draft the HLD",
+        "done_when": [{ "artifact_exists": "p1/e3/t1/hld.md" }],
+        "artifact_out": "p1/e3/t1/hld.md"
+      }
+    ]
+  }
+}

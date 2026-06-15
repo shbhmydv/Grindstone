@@ -1,0 +1,10 @@
+{
+  "schema_version": "1",
+  "task_id": "P1/E1/T1",
+  "status": "DONE",
+  "resulting_state": "surveyed three schedulers; notes written",
+  "downstream_needs": ["p1/e1/t1/notes.md"],
+  "citations": [{ "file": "src/scheduler/loop.py", "line": 42 }],
+  "checks": [{ "check": "test -f notes.md", "exit_code": 0 }],
+  "occupancy": { "compacted": false, "subagent_splits": 0, "peak_context_tokens": 18000 }
+}

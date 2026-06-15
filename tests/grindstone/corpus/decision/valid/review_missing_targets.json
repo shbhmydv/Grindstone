@@ -1,0 +1,16 @@
+{
+  "schema_version": "1",
+  "tool": "review",
+  "args": {
+    "epoch_title": "review without targets",
+    "rationale": "structurally valid, semantically bad",
+    "tasks": [
+      {
+        "id": "T1",
+        "goal": "review something unspecified",
+        "done_when": [{ "artifact_exists": "p1/e2/t1/review.md" }],
+        "artifact_out": "p1/e2/t1/review.md"
+      }
+    ]
+  }
+}

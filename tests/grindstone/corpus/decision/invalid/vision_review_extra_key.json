@@ -1,0 +1,28 @@
+{
+  "schema_version": "1",
+  "tool": "propose_skeleton",
+  "args": {
+    "phases": [
+      {
+        "id": "P1",
+        "title": "build",
+        "exit_criterion": [{ "cmd": "true", "expect_exit": 0 }],
+        "epoch_budget": 2
+      },
+      {
+        "id": "P2",
+        "title": "review",
+        "exit_criterion": [
+          {
+            "vision_review": {
+              "screenshot": "ui/screen.png",
+              "criteria": "polished",
+              "weight": 3
+            }
+          }
+        ],
+        "epoch_budget": 1
+      }
+    ]
+  }
+}

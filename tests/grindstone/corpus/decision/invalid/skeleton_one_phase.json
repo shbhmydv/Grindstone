@@ -1,0 +1,14 @@
+{
+  "schema_version": "1",
+  "tool": "propose_skeleton",
+  "args": {
+    "phases": [
+      {
+        "id": "P1",
+        "title": "only one phase, but minItems is 2",
+        "exit_criterion": [{ "cmd": "true" }],
+        "epoch_budget": 1
+      }
+    ]
+  }
+}

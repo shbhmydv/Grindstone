@@ -1,0 +1,17 @@
+{
+  "schema_version": "1",
+  "tool": "implement",
+  "args": {
+    "epoch_title": "traversal in a log key",
+    "rationale": "input log key starts with .. and fails the grammar",
+    "tasks": [
+      {
+        "id": "T1",
+        "goal": "g",
+        "inputs": ["../escape"],
+        "done_when": [{ "cmd": "true" }],
+        "file_ownership": ["src/**"]
+      }
+    ]
+  }
+}

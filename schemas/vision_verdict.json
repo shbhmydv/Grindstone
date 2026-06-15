@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "grindstone/vision_verdict/v1",
+  "title": "Grindstone vision-review verdict (codex taste-gate output, a disk contract)",
+  "type": "object",
+  "required": ["pass", "reasons"],
+  "additionalProperties": false,
+  "properties": {
+    "pass": {
+      "type": "boolean",
+      "description": "true ONLY if the rendered UI meets the criteria bar."
+    },
+    "reasons": {
+      "type": "array",
+      "items": { "type": "string", "maxLength": 512 },
+      "maxItems": 16,
+      "description": "Why it passed or (especially) failed — surfaced in the failing-check label."
+    }
+  }
+}

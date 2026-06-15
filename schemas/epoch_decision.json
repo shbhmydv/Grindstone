@@ -1,0 +1,254 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "grindstone/epoch_decision/v1",
+  "title": "Grindstone planner decision (one constrained tool-call per planner invocation)",
+  "type": "object",
+  "required": ["schema_version", "tool", "args"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": "1" },
+    "tool": {
+      "enum": [
+        "propose_skeleton",
+        "research",
+        "implement",
+        "review",
+        "artifact",
+        "revise_phases",
+        "escalate_run",
+        "complete_run"
+      ]
+    },
+    "args": { "type": "object" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "tool": { "const": "propose_skeleton" } } },
+      "then": { "properties": { "args": { "$ref": "#/$defs/skeleton_args" } } }
+    },
+    {
+      "if": { "properties": { "tool": { "const": "implement" } } },
+      "then": { "properties": { "args": { "$ref": "#/$defs/implement_epoch_args" } } }
+    },
+    {
+      "if": { "properties": { "tool": { "enum": ["research", "review", "artifact"] } } },
+      "then": { "properties": { "args": { "$ref": "#/$defs/artifact_epoch_args" } } }
+    },
+    {
+      "if": { "properties": { "tool": { "const": "revise_phases" } } },
+      "then": { "properties": { "args": { "$ref": "#/$defs/revise_phases_args" } } }
+    },
+    {
+      "if": { "properties": { "tool": { "const": "escalate_run" } } },
+      "then": { "properties": { "args": { "$ref": "#/$defs/escalate_run_args" } } }
+    },
+    {
+      "if": { "properties": { "tool": { "const": "complete_run" } } },
+      "then": { "properties": { "args": { "$ref": "#/$defs/complete_run_args" } } }
+    }
+  ],
+  "$defs": {
+    "log_key": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][a-zA-Z0-9._/-]{0,127}$",
+      "description": "Key into the run's durable keyed log. Validator additionally requires the key to EXIST when used as an input."
+    },
+    "check": {
+      "description": "One deterministic check. Machine-checkable by construction: a command with an expected exit code, or a required validated artifact.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["cmd"],
+          "additionalProperties": false,
+          "properties": {
+            "cmd": { "type": "string", "minLength": 1, "maxLength": 512 },
+            "expect_exit": { "type": "integer", "default": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["artifact_exists"],
+          "additionalProperties": false,
+          "properties": {
+            "artifact_exists": { "$ref": "#/$defs/log_key" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["vision_review"],
+          "additionalProperties": false,
+          "description": "Taste gate (B3): codex judges a rendered-UI screenshot against criteria and writes a pass/fail verdict (vision_verdict.json) the core re-reads. The screenshot is a path RELATIVE TO THE EVAL WORKTREE that a PRIOR cmd check in the same list produced.",
+          "properties": {
+            "vision_review": {
+              "type": "object",
+              "required": ["screenshot", "criteria"],
+              "additionalProperties": false,
+              "properties": {
+                "screenshot": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$", "description": "Path RELATIVE TO THE EVAL WORKTREE; no leading '/' and no '..' segment (it must not escape the worktree)." },
+                "criteria": { "type": "string", "minLength": 1, "maxLength": 2048 }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "phase": {
+      "type": "object",
+      "required": ["id", "title", "exit_criterion", "epoch_budget"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^P[1-9][0-9]?$" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "exit_criterion": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/check" },
+          "minItems": 1,
+          "maxItems": 8
+        },
+        "epoch_budget": { "type": "integer", "minimum": 1, "maximum": 20 }
+      }
+    },
+    "task_base": {
+      "type": "object",
+      "required": ["id", "goal", "done_when"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^T[1-8]$" },
+        "goal": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "inputs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/log_key" },
+          "maxItems": 12,
+          "default": []
+        },
+        "done_when": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/check" },
+          "minItems": 1,
+          "maxItems": 6
+        },
+        "skills": {
+          "type": "array",
+          "items": { "type": "string", "maxLength": 64 },
+          "maxItems": 6,
+          "default": []
+        }
+      }
+    },
+    "implement_task": {
+      "allOf": [{ "$ref": "#/$defs/task_base" }],
+      "required": ["id", "goal", "done_when", "file_ownership"],
+      "unevaluatedProperties": false,
+      "properties": {
+        "file_ownership": {
+          "description": "Path globs this task owns. Pairwise disjoint across the epoch (validator-enforced); the task diff must stay inside them (post-return check).",
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "minItems": 1,
+          "maxItems": 32
+        }
+      }
+    },
+    "artifact_task": {
+      "allOf": [{ "$ref": "#/$defs/task_base" }],
+      "required": ["id", "goal", "done_when", "artifact_out"],
+      "unevaluatedProperties": false,
+      "properties": {
+        "artifact_out": { "$ref": "#/$defs/log_key" },
+        "targets": {
+          "description": "Paths under review/research. Required for review epochs (semantic validator rule).",
+          "type": "array",
+          "items": { "type": "string", "maxLength": 256 },
+          "maxItems": 32
+        }
+      }
+    },
+    "epoch_args_base": {
+      "type": "object",
+      "required": ["epoch_title", "rationale", "tasks"],
+      "properties": {
+        "epoch_title": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "rationale": { "type": "string", "maxLength": 2048 },
+        "visual": {
+          "description": "Taste routing: set true when the epoch produces or changes UI/visual output, so the core builds its workers on the stronger taste-building senior tier instead of the mode default (the senior is a text model; genuine image judgment is the vision_review gate). Optional; defaults false.",
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "implement_epoch_args": {
+      "allOf": [{ "$ref": "#/$defs/epoch_args_base" }],
+      "unevaluatedProperties": false,
+      "properties": {
+        "tasks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/implement_task" },
+          "minItems": 1,
+          "maxItems": 8
+        }
+      }
+    },
+    "artifact_epoch_args": {
+      "allOf": [{ "$ref": "#/$defs/epoch_args_base" }],
+      "unevaluatedProperties": false,
+      "properties": {
+        "tasks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/artifact_task" },
+          "minItems": 1,
+          "maxItems": 8
+        }
+      }
+    },
+    "skeleton_args": {
+      "type": "object",
+      "required": ["phases"],
+      "additionalProperties": false,
+      "properties": {
+        "phases": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/phase" },
+          "minItems": 2,
+          "maxItems": 10
+        }
+      }
+    },
+    "revise_phases_args": {
+      "type": "object",
+      "required": ["reason", "phases"],
+      "additionalProperties": false,
+      "properties": {
+        "reason": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "phases": {
+          "description": "Replacement TAIL of the skeleton: current phase onward. May not alter completed phases (semantic validator rule).",
+          "type": "array",
+          "items": { "$ref": "#/$defs/phase" },
+          "minItems": 1,
+          "maxItems": 10
+        }
+      }
+    },
+    "escalate_run_args": {
+      "type": "object",
+      "required": ["reason"],
+      "additionalProperties": false,
+      "properties": {
+        "reason": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "needed_from_human": { "type": "string", "maxLength": 1024 }
+      }
+    },
+    "complete_run_args": {
+      "type": "object",
+      "required": ["summary", "evidence"],
+      "additionalProperties": false,
+      "properties": {
+        "summary": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "evidence": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/check" },
+          "minItems": 1,
+          "maxItems": 8
+        }
+      }
+    }
+  }
+}
