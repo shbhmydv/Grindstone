@@ -926,3 +926,157 @@ def test_default_senior_missing_arg_errors(tmp_path: Path) -> None:
     )
     assert res.returncode == 2
     assert "missing required" in res.stderr
+
+
+# --- handoff guarantee (3b) --------------------------------------------------
+# RCA: a worker ran out of turn budget mid-task and its loop ENDED before the
+# "write handoff" step -> ZERO output -> grindstone saw "no handoff.json" and
+# retried blind, twice. The role scripts now SYNTHESIZE a schema-valid FAILED
+# handoff with a diagnosis + log tails when the agent leaves none, and exit 0 so
+# the core consumes it (a non-zero exit short-circuits handoff collection). A
+# real handoff is never clobbered; a genuine 429/rate-limit still propagates.
+
+# A prompt the way build_worker_prompt renders it: the task_id appears as
+# `<task id="...">`, which guarantee_handoff greps out for the synthesized
+# handoff (the script is never told the task_id directly).
+_PROMPT_WITH_TASK_ID = '<task id="P3/E2/T4">\ndo the thing\n</task>\n'
+
+
+def _schema_errors(payload: object) -> list[str]:
+    """Validate a synthesized handoff against the wire schema the core gates on."""
+    from grindstone.contracts import handoff_schema_errors
+
+    return handoff_schema_errors(payload)
+
+
+def _run_worker_with_prompt(
+    script: Path, tmp_path: Path, agent_name: str, agent_body: str, prompt: str
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir()
+    _make_stub(stub_dir, agent_name, agent_body)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text(prompt, encoding="utf-8")
+    res = subprocess.run(
+        [
+            "bash", str(script),
+            "--worktree", str(worktree),
+            "--prompt", str(prompt_file),
+            "--log-dir", str(tmp_path / "logs"),
+            "--handle-out", str(tmp_path / "handle.txt"),
+            "--timeout", "30",
+        ],
+        env=_env_with_stub_path(stub_dir),
+        capture_output=True,
+        text=True,
+    )
+    return res, worktree
+
+
+def _assert_synthesized_failed(worktree: Path, expect_rc_in_diag: str) -> None:
+    handoff_path = worktree / "handoff.json"
+    assert handoff_path.is_file(), "no handoff.json was synthesized"
+    payload = json.loads(handoff_path.read_text(encoding="utf-8"))
+    assert _schema_errors(payload) == [], payload
+    assert payload["task_id"] == "P3/E2/T4"
+    assert payload["status"] == "FAILED"
+    assert "terminated without writing" in payload["resulting_state"]
+    assert ("rc=%s" % expect_rc_in_diag) in payload["resulting_state"]
+
+
+def test_default_local_synthesizes_failed_handoff_when_agent_writes_none(
+    tmp_path: Path,
+) -> None:
+    # Agent exits 0 but never wrote a handoff (ran out of budget mid-task).
+    res, worktree = _run_worker_with_prompt(
+        DEFAULT_LOCAL, tmp_path, "claude",
+        'echo "thinking..." \nexit 0\n', _PROMPT_WITH_TASK_ID,
+    )
+    assert res.returncode == 0, res.stderr  # exit 0 so the core READS the handoff
+    _assert_synthesized_failed(worktree, "0")
+
+
+def test_default_local_synthesizes_failed_handoff_on_nonzero_no_handoff(
+    tmp_path: Path,
+) -> None:
+    # Agent crashed (non-zero, NOT rate-limited) without a handoff: the script
+    # must synthesize a FAILED handoff AND exit 0 so collection isn't skipped.
+    res, worktree = _run_worker_with_prompt(
+        DEFAULT_LOCAL, tmp_path, "claude",
+        'echo "segfault" >&2\nexit 9\n', _PROMPT_WITH_TASK_ID,
+    )
+    assert res.returncode == 0, res.stderr
+    _assert_synthesized_failed(worktree, "9")
+    # The agent's stderr tail is folded into the diagnosis.
+    payload = json.loads((worktree / "handoff.json").read_text(encoding="utf-8"))
+    assert "segfault" in payload["resulting_state"]
+
+
+def test_default_local_does_not_clobber_a_real_handoff(tmp_path: Path) -> None:
+    # The agent wrote its own handoff: leave it byte-for-byte untouched.
+    res, worktree = _run_worker_with_prompt(
+        DEFAULT_LOCAL, tmp_path, "claude",
+        'printf \'{"status":"DONE","mine":true}\' > "$PWD/handoff.json"\nexit 0\n',
+        _PROMPT_WITH_TASK_ID,
+    )
+    assert res.returncode == 0, res.stderr
+    assert (
+        (worktree / "handoff.json").read_text() == '{"status":"DONE","mine":true}'
+    )
+
+
+def test_default_local_rate_limit_propagates_and_synthesizes_nothing(
+    tmp_path: Path,
+) -> None:
+    # A genuine 429 must keep propagating a non-zero exit (transport -> RateLimited)
+    # and must NOT be papered over with a synthesized FAILED handoff.
+    res, worktree = _run_worker_with_prompt(
+        DEFAULT_LOCAL, tmp_path, "claude",
+        'echo "429 rate limit exceeded" >&2\nexit 7\n', _PROMPT_WITH_TASK_ID,
+    )
+    assert res.returncode == 7, res.stderr
+    assert not (worktree / "handoff.json").exists()
+
+
+def test_default_senior_synthesizes_failed_handoff_when_agent_writes_none(
+    tmp_path: Path,
+) -> None:
+    res, worktree = _run_worker_with_prompt(
+        DEFAULT_SENIOR, tmp_path, "claude",
+        'exit 0\n', _PROMPT_WITH_TASK_ID,
+    )
+    assert res.returncode == 0, res.stderr
+    _assert_synthesized_failed(worktree, "0")
+
+
+def test_default_senior_rate_limit_propagates(tmp_path: Path) -> None:
+    res, worktree = _run_worker_with_prompt(
+        DEFAULT_SENIOR, tmp_path, "claude",
+        'echo "rate limit hit" >&2\nexit 7\n', _PROMPT_WITH_TASK_ID,
+    )
+    assert res.returncode == 7, res.stderr
+    assert not (worktree / "handoff.json").exists()
+
+
+def test_override_local_synthesizes_failed_handoff_when_agent_writes_none(
+    tmp_path: Path,
+) -> None:
+    _require(LOCAL)
+    res, worktree = _run_worker_with_prompt(
+        LOCAL, tmp_path, "pi", 'exit 0\n', _PROMPT_WITH_TASK_ID,
+    )
+    assert res.returncode == 0, res.stderr
+    _assert_synthesized_failed(worktree, "0")
+
+
+def test_override_senior_synthesizes_failed_handoff_when_agent_writes_none(
+    tmp_path: Path,
+) -> None:
+    _require(SENIOR)
+    res, worktree = _run_worker_with_prompt(
+        SENIOR, tmp_path, "opencode", 'exit 0\n', _PROMPT_WITH_TASK_ID,
+    )
+    assert res.returncode == 0, res.stderr
+    _assert_synthesized_failed(worktree, "0")

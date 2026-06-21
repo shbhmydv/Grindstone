@@ -258,9 +258,13 @@ def path_in_scope(path: str, ownership: list[str]) -> bool:
 
     fnmatch semantics (case-sensitive), with the explicit ``dir/**`` rule:
     ``dir/**`` matches ``dir`` itself and any file beneath it at any depth.
+    Whole-repo ownership (``**`` or ``**/*``) matches every path, root and
+    nested alike (fnmatch's ``**/*`` would otherwise miss root-level files).
     """
 
     for glob in ownership:
+        if glob in ("**", "**/*"):
+            return True
         if glob.endswith("/**"):
             prefix = glob[:-3]
             if path == prefix or path.startswith(prefix + "/"):
@@ -271,7 +275,9 @@ def path_in_scope(path: str, ownership: list[str]) -> bool:
 
 
 def scope_violations(changed: list[str], ownership: list[str]) -> list[str]:
-    """Changed paths that fall outside every ownership glob (empty = in scope)."""
+    """Changed paths that fall outside every ownership glob. Empty ownership is
+    deny-all: with no globs, every changed path is a violation.
+    """
 
     return [p for p in changed if not path_in_scope(p, ownership)]
 

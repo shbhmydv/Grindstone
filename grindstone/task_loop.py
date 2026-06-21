@@ -39,6 +39,8 @@ from typing import Callable, Literal, Sequence
 from pydantic import BaseModel, ConfigDict
 
 from grindstone.check_handoff import CHECK_COMMAND, CHECK_SCRIPT_NAME, generate_check_script
+from grindstone.config import PrepareConfig
+from grindstone.prepare import materialize_env
 from grindstone.contracts.gate import handoff_schema_errors
 from grindstone.contracts.models import (
     ArtifactExistsCheck,
@@ -456,6 +458,7 @@ def _dispatch_attempt(
     base: str | None,
     scratch: Path,
     branch: str | None,
+    prepare: PrepareConfig | None,
 ) -> Handoff:
     """Run one attempt end-to-end; raise ``_AttemptFailed`` on any failure.
 
@@ -469,6 +472,14 @@ def _dispatch_attempt(
     if implement:
         assert repo is not None and base is not None and branch is not None
         wt.add_worktree(repo, scratch, branch=branch, base=base)
+        # Restore the declared (gitignored) dependency dirs into the worker
+        # worktree so it does not burn turns on a fresh install and shares the
+        # same lockfile-hashed cache the eval gate uses. A prepare failure is a
+        # failed attempt (same cache the gate will hit, fail loudly here).
+        try:
+            materialize_env(repo, scratch, prepare)
+        except Exception as exc:  # PrepareError (or any IO): a clean failed attempt
+            raise _AttemptFailed(f"prepare error: {exc}") from exc
     else:
         scratch.mkdir(parents=True, exist_ok=True)
     task = _install_attempt_checks(task, scratch, mode, identity.fq, repo)
@@ -553,6 +564,7 @@ def _grind(
     tier0_attempts: int,
     first_attempt_already_dispatched: bool,
     visual: bool,
+    prepare: PrepareConfig | None,
 ) -> TaskOutcome:
     """Drive the ladder from ``cursor`` to a terminal outcome.
 
@@ -638,6 +650,7 @@ def _grind(
                     base=base,
                     scratch=scratch,
                     branch=branch,
+                    prepare=prepare,
                 )
             except _AttemptFailed as failure:
                 cursor.failure_context.append(failure.reason)
@@ -737,6 +750,8 @@ def run_task(
     tier0_attempts: int = TIER0_ATTEMPTS,
     resume_cursor: TaskCursorState | None = None,
     visual: bool = False,
+    prepare: PrepareConfig | None = None,
+    epoch_hint: str | None = None,
 ) -> TaskOutcome:
     """Grind ONE task to terminal against a shared journal (fan-out unit).
 
@@ -746,6 +761,11 @@ def run_task(
     NOT re-run (its number is kept); a handoff_rejected is journaled and the
     grind continues from the recorded ladder position. Implement tasks require
     ``repo`` + ``base`` (the epoch base commit).
+
+    ``epoch_hint`` (a planner ``handle_failed_epoch`` retry corrective) seeds the
+    FRESH-start cursor's failure context so the first worker attempt already
+    carries the guidance; it is ignored on resume (the cursor's own accumulated
+    context leads).
     """
 
     if not ladder:
@@ -767,12 +787,16 @@ def run_task(
                 tier_index=starting_tier(mode, [n for n, _ in ladder], visual=visual),
                 tier_attempt=0,
                 attempt=0,
+                failure_context=(
+                    [f"planner retry hint: {epoch_hint}"] if epoch_hint else []
+                ),
             ),
             repo=repo,
             base=base,
             tier0_attempts=tier0_attempts,
             first_attempt_already_dispatched=False,
             visual=visual,
+            prepare=prepare,
         )
 
     # Resume: burn the in-flight attempt.
@@ -808,4 +832,5 @@ def run_task(
         tier0_attempts=tier0_attempts,
         first_attempt_already_dispatched=True,
         visual=visual,
+        prepare=prepare,
     )

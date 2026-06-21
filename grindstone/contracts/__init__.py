@@ -15,6 +15,7 @@ from grindstone.contracts.semantics import (
     canonical_bytes,
     epoch_decision_violations,
     handoff_violations,
+    implement_task_size_violations,
 )
 
 __all__ = [
@@ -26,6 +27,7 @@ __all__ = [
     "epoch_decision_violations",
     "handoff_schema_errors",
     "handoff_violations",
+    "implement_task_size_violations",
     "parse_decision",
     "parse_handoff",
 ]

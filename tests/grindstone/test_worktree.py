@@ -33,6 +33,13 @@ def repo(tmp_path: Path) -> Path:
         ("src/a.py", ["lib/*"], False),
         ("a/b/c.txt", ["a/b/c.txt", "x/*"], True),
         ("a/b/c.txt", ["a/b/*", "x/*"], True),
+        # Whole-repo ownership matches both root-level and nested files.
+        ("app.json", ["**/*"], True),
+        ("app.json", ["**"], True),
+        ("src/a.ts", ["**/*"], True),
+        ("src/a.ts", ["**"], True),
+        # A scoped subtree glob must NOT pull root files into scope.
+        ("app.json", ["src/**"], False),
     ],
 )
 def test_path_in_scope(path: str, ownership: list[str], ok: bool) -> None:

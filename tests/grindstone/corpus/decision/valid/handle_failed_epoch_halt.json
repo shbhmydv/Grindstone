@@ -1,0 +1,8 @@
+{
+  "schema_version": "1",
+  "tool": "handle_failed_epoch",
+  "args": {
+    "action": "halt",
+    "reason": "workers report tsc passes but the gate fails identically; the build env is suspect, not the code"
+  }
+}

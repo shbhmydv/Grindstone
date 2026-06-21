@@ -30,8 +30,19 @@ from grindstone.config import (
     models_script,
     validate_script_paths,
 )
-from grindstone.planner import PlannerTransport
-from grindstone.run_loop import FinalPolish, Ladder, RunOutcome, resume_grind, run_grind
+from grindstone.planner import (
+    DEFAULT_LOCAL_MAX_TASK_FILES,
+    DEFAULT_SENIOR_MAX_TASK_FILES,
+    PlannerTransport,
+)
+from grindstone.run_loop import (
+    DEFAULT_MAX_FAILED_EPOCHS_PER_PHASE,
+    FinalPolish,
+    Ladder,
+    RunOutcome,
+    resume_grind,
+    run_grind,
+)
 from grindstone.rundir import RunDir, create_run_dir
 from grindstone.script_planner import ScriptPlanner
 from grindstone.script_polish import ScriptPolisher
@@ -251,6 +262,29 @@ def _resolve_max_planner_calls(cfg: GrindstoneConfig | None) -> int:
     return DEFAULT_MAX_PLANNER_CALLS
 
 
+def _resolve_failed_epoch_cap(cfg: GrindstoneConfig | None) -> int:
+    """The per-phase failed-epoch cap: config > built-in default (Part C).
+
+    After this many failed epochs in one phase the state machine forces a
+    halt-to-human regardless of the planner, the deterministic backstop against
+    the dogfood spin-loop. ``cfg`` carries its own default (3) when present."""
+
+    if cfg is not None:
+        return cfg.max_failed_epochs_per_phase
+    return DEFAULT_MAX_FAILED_EPOCHS_PER_PHASE
+
+
+def _resolve_task_file_bounds(cfg: GrindstoneConfig | None) -> tuple[int, int]:
+    """The deterministic size-gate ``(local, senior)`` file-count bounds (Part 4B).
+
+    Config > the built-in defaults (which mirror ``GrindstoneConfig``'s own field
+    defaults, so a config-less run and a default config agree)."""
+
+    if cfg is not None:
+        return cfg.local_max_task_files, cfg.senior_max_task_files
+    return DEFAULT_LOCAL_MAX_TASK_FILES, DEFAULT_SENIOR_MAX_TASK_FILES
+
+
 def _resolve_vision_reviewer(cfg: GrindstoneConfig | None) -> VisionReviewer | None:
     """The B3 taste-gate reviewer: the config'd ``vision_review`` script, else the
     bundled ``models/vision_review.sh`` (the codex call is swappable via the
@@ -382,6 +416,10 @@ def _cmd_run(
             max_planner_calls=_resolve_max_planner_calls(cfg),
             vision_reviewer=_resolve_vision_reviewer(cfg),
             final_polish=_resolve_final_polish(cfg),
+            prepare=cfg.prepare if cfg is not None else None,
+            max_failed_epochs_per_phase=_resolve_failed_epoch_cap(cfg),
+            local_max_task_files=_resolve_task_file_bounds(cfg)[0],
+            senior_max_task_files=_resolve_task_file_bounds(cfg)[1],
         )
 
     print(f"run {run_id} -> {run_dir.root}")
@@ -440,6 +478,10 @@ def _cmd_resume(
         max_planner_calls=_resolve_max_planner_calls(cfg),
         vision_reviewer=_resolve_vision_reviewer(cfg),
         final_polish=_resolve_final_polish(cfg),
+        prepare=cfg.prepare if cfg is not None else None,
+        max_failed_epochs_per_phase=_resolve_failed_epoch_cap(cfg),
+        local_max_task_files=_resolve_task_file_bounds(cfg)[0],
+        senior_max_task_files=_resolve_task_file_bounds(cfg)[1],
     )
     _report(outcome)
     return _EXIT[outcome.status]

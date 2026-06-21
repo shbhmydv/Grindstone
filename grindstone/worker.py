@@ -306,6 +306,21 @@ These deterministic checks will be re-run by the orchestrator. They MUST pass:
 {_render_checks(request)}
 </done_when>
 {plan_block}{context_block}
+<stop_rule>
+If the done_when checks cannot be satisfied in THIS verification environment (a
+required tool/dependency is missing, or the task as specified is not achievable
+here), do NOT loop or keep editing. STOP, write handoff.json with status FAILED
+(or PARTIAL) and a concise diagnosis of WHY it cannot be satisfied, then exit.
+Always write handoff.json as your final act before stopping, even when out of
+ideas or running low on budget: a missing handoff tells the planner nothing.
+</stop_rule>
+<scope>
+You edit ONLY files within your file_ownership (or, for non-implement tasks, only
+your CWD). Grindstone (the orchestrator core) handles all git staging and
+committing and may keep its own bookkeeping files in the tree: do NOT git-commit,
+do NOT touch orchestration files, and do not worry about a "working tree clean"
+state, that is grindstone's concern, not yours.
+</scope>
 <handoff>
 When finished, write a file named exactly `handoff.json` in your current working
 directory. It is the ONLY thing the orchestrator reads, stdout is ignored.

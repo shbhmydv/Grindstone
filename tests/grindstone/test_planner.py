@@ -321,3 +321,102 @@ def test_gate_position_legality() -> None:
     res2 = _gate(json.dumps(complete_decision({"cmd": "true"})), skeleton_exists=False)
     assert res2.decision is None
     assert any("must be propose_skeleton" in e for e in res2.errors)
+
+
+# --- size gate (Part 4B): the deterministic decomposition floor ----------------
+
+
+def _impl_task_n(tid: str, *globs: str) -> dict[str, object]:
+    return {
+        "id": tid,
+        "goal": "g",
+        "done_when": [{"cmd": "true"}],
+        "file_ownership": list(globs),
+    }
+
+
+def test_gate_rejects_oversized_implement_task_and_names_it() -> None:
+    import json
+
+    # Seven owned globs > the default local bound (5): rejected, the offending
+    # task id is named so the re-ask tells the planner exactly what to split.
+    big = _impl_task_n("T3", "a", "b", "c", "d", "e", "f", "g")
+    res = validate_decision(
+        json.dumps(implement_decision(big)),
+        existing_log_keys=_EMPTY, completed_phase_ids=_EMPTY, skeleton_exists=True,
+    )
+    assert res.decision is None
+    assert any("T3" in e and "too big" in e for e in res.errors)
+
+
+def test_gate_rejects_whole_repo_ownership_on_fresh_implement() -> None:
+    import json
+
+    for glob in ("**", "**/*", "*"):
+        res = validate_decision(
+            json.dumps(implement_decision(_impl_task_n("T1", glob))),
+            existing_log_keys=_EMPTY, completed_phase_ids=_EMPTY, skeleton_exists=True,
+        )
+        assert res.decision is None, glob
+        assert any("T1" in e and "whole-repo" in e for e in res.errors), glob
+
+
+def test_gate_allows_broad_scope_on_failed_epoch_repair() -> None:
+    import json
+
+    # A handle_failed_epoch retry path is exempt: when a failed epoch is awaiting
+    # disposition the size gate is skipped (a repair can't predict its files).
+    # (Position legality independently constrains the tool here; we assert the
+    # size gate itself does not fire on an implement decision in that mode.)
+    from grindstone.planner import _size_gate_violations
+    from grindstone.contracts.models import parse_decision
+
+    broad = parse_decision(implement_decision(_impl_task_n("T1", "**/*")))
+    # Fresh decomposition: rejected.
+    assert _size_gate_violations(
+        broad, failed_epoch_active=False, has_senior=False,
+        local_max_task_files=5, senior_max_task_files=12,
+    )
+    # Failed-epoch repair: exempt (no violations).
+    assert _size_gate_violations(
+        broad, failed_epoch_active=True, has_senior=False,
+        local_max_task_files=5, senior_max_task_files=12,
+    ) == []
+
+
+def test_gate_size_bound_is_tier_aware_for_visual_epochs() -> None:
+    import json
+
+    # Six globs: over the local bound (5) but under the senior bound (12). A
+    # visual implement epoch starts on senior, so with a senior tier present it
+    # is judged against the senior bound and PASSES; without senior it does not.
+    six = _impl_task_n("T1", "a", "b", "c", "d", "e", "f")
+    dec = implement_decision(six)
+    dec["args"]["visual"] = True  # type: ignore[index]
+    payload = json.dumps(dec)
+    with_senior = validate_decision(
+        payload, existing_log_keys=_EMPTY, completed_phase_ids=_EMPTY,
+        skeleton_exists=True, has_senior=True,
+        local_max_task_files=5, senior_max_task_files=12,
+    )
+    assert with_senior.decision is not None  # senior bound (12) -> passes
+    no_senior = validate_decision(
+        payload, existing_log_keys=_EMPTY, completed_phase_ids=_EMPTY,
+        skeleton_exists=True, has_senior=False,
+        local_max_task_files=5, senior_max_task_files=12,
+    )
+    assert no_senior.decision is None  # falls back to local bound (5) -> rejected
+    assert any("T1" in e and "too big" in e for e in no_senior.errors)
+
+
+def test_preamble_teaches_three_level_skill_split() -> None:
+    # Part 4A: the decomposition guidance is split into clearly delineated,
+    # per-level sections (phasing / epoch / task), one skill each.
+    assert "[LEVEL 1: PHASING]" in SYSTEM_PREAMBLE
+    assert "[LEVEL 2: EPOCH]" in SYSTEM_PREAMBLE
+    assert "[LEVEL 3: TASK]" in SYSTEM_PREAMBLE
+    # The implement-phase baseline-dependencies epoch (committed manifest/lockfile).
+    assert "BASELINE DEPENDENCIES" in SYSTEM_PREAMBLE
+    assert "lockfile" in SYSTEM_PREAMBLE
+    # The size gate is advertised in the task-level guidance.
+    assert "SIZE GATE" in SYSTEM_PREAMBLE

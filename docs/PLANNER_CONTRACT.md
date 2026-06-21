@@ -86,7 +86,8 @@ on the tool name**: modes are function names, not a field a model can fudge.
 | `implement` | epoch boundary | plans an epoch whose deliverable is committed repo files (worktree + commit) |
 | `research` / `artifact` | epoch boundary | plans an epoch that ships an analysis/report through the keyed log (no worktree) |
 | `review` | epoch boundary | judges existing work and ships a verdict through the keyed log |
-| `revise_phases` | epoch boundary | replaces the current phase onward (never a completed phase); separately journaled |
+| `revise_phases` | epoch boundary | the **phase STRUCTURE** is wrong; replaces the current phase onward (never a completed phase); separately journaled |
+| `handle_failed_epoch` | only when an epoch has **failed** and is awaiting disposition | a focused disposition of that epoch: `retry` (with a `hint`, optionally `escalate_tier`), `escalate_senior` (with a `diagnosis`), or `halt` (with a `reason`) |
 | `escalate_run` | epoch boundary | the planner cannot proceed → hand to a human |
 | `complete_run` | epoch boundary | the whole job is done; carries deterministic `evidence` checks |
 
@@ -110,6 +111,29 @@ The planner picks the mode from the deliverable's **destination**:
   plus `targets`).
 
 Never give a task a worktree its deliverable does not need.
+
+### Decomposition is three skills, one per level
+
+The planner decomposes at three distinct levels, in order, with different units
+and biases. Keeping them separate is what makes a failure localizable: a single
+giant epoch with a single giant task cannot be diagnosed when it fails.
+
+1. **PHASING** (`propose_skeleton` / `revise_phases`): split the *job* into
+   phases. **One phase = one MODE** (research / implement / test / review); a
+   phase that mixes modes is two phases. 2–10 phases (§4).
+2. **EPOCH** (one work decision per call): split a *phase* into epochs. **One
+   epoch = one coherent FEATURE or milestone.** For an **implement** phase the
+   **FIRST epoch is an explicit baseline-dependencies epoch**: it stands up the
+   project skeleton and produces the **committed dependency manifest/lockfile**
+   (e.g. `package.json` + its lockfile); later epochs build features on it. (A
+   separate `prepare` mechanism, §config, *installs* from that lockfile when
+   gates run; the baseline epoch only *creates* the manifest, it does not
+   install.) Split sequential steps across epochs *liberally* (below).
+3. **TASK** (the fan-out within an epoch): split an *epoch* into tasks. **One
+   task = one bounded slice, kept SMALL** (a few files), with disjoint
+   `file_ownership`. Split parallel tasks *conservatively* (§5), but a single
+   task may not swallow the whole epoch: the **size gate** (§5) rejects an
+   oversized or whole-repo task.
 
 ### Sequencing: decompose heavy work by tier of thinking
 
@@ -195,7 +219,17 @@ Mode-specific:
 
 - **implement** additionally requires `file_ownership`: 1–32 path globs that must
   be **pairwise disjoint across the epoch**; this is the merge-correctness
-  mechanism (§6), not metadata.
+  mechanism (§6), not metadata. A **deterministic size gate** further bounds a
+  *fresh* implement task: its `file_ownership` glob count may not exceed a
+  **tier-aware** ceiling (`local_max_task_files`, default **5**; the larger
+  `senior_max_task_files`, default **12**, for a `visual` epoch that starts on
+  senior), and a **whole-repo glob** (`**`, `**/*`, or a bare `*`) is rejected
+  outright as "not decomposed". A task over its bound (or claiming the whole
+  repo) bounces back through the same invalid-decision re-ask path (§1), naming
+  the offending task. The gate is **scoped to fresh decomposition**: a
+  `handle_failed_epoch` repair re-dispatches its originating decision directly
+  and may carry broad scope, so it is **exempt** (a repair cannot predict its
+  files). The bounds are config fields (both ≥ 1).
 - **research / review / artifact** additionally require `artifact_out` (the log
   key the task will create). Review tasks also take `targets` (the paths under
   review). These tasks get **no worktree**: a non-write task is never handed the
@@ -281,13 +315,26 @@ telemetry). Only `status == DONE` whose checks all pass is accepted.
 check / validation failure  → re-queue with failure context (retry ≤ 3 on the starting tier)
 starting tier exhausted     → escalate the task to the next ladder tier (one attempt each)
 ladder exhausted            → mark the task FAILED; the epoch continues, the failure lands in the report
-epoch done-predicate        → the planner sees the full report and decides: re-plan / split / revise / escalate / complete
+epoch with a FAILED task    → FOCUSED handle_failed_epoch decision (the ONLY legal tool until disposed):
+                              retry (hint, optional tier bump) | escalate_senior (diagnosis) | halt (reason)
+per-phase failed-epoch cap  → after `max_failed_epochs_per_phase` (default 3) failed epochs in one phase the
+                              state machine FORCES a halt-to-human regardless of the planner's choice
 epoch budget exhausted      → phase escalation → planner (revise_phases | escalate_run only)
 ```
 
-`planner_calls_per_run` is a first-class journal metric, and every CLI-driven run
-carries a `max_planner_calls` backstop so a stuck revision loop can never drain
-the planner subscription unattended.
+When an epoch fails the planner is asked a **focused** `handle_failed_epoch`
+decision, not left to react with a blind `revise_phases`. The decision input
+carries the failing phase checks **with their captured command output** (so the
+planner can tell an environment/gate problem from a code bug) and the worker
+handoffs that claimed an honest pass. If the workers keep reporting a pass while
+the gate fails the **same** way, the contract directs the planner to suspect the
+gate/environment and prefer `halt` over ordering yet another identical repair.
+`revise_phases` is reserved for a genuine phase-structure error.
+
+`planner_calls_per_run` is a first-class journal metric; every CLI-driven run
+carries a `max_planner_calls` backstop AND a deterministic
+`max_failed_epochs_per_phase` cap, so a stuck repair loop can never drain the
+planner subscription nor spin unattended.
 
 ## 9. Versioning
 

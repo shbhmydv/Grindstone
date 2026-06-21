@@ -114,6 +114,18 @@ Only a `DONE` handoff whose checks all pass is accepted; any failure deletes the
 relocated record (zero dead artifacts) and re-queues the attempt. **Stdout is
 never parsed**; the disk file is the only result channel.
 
+The worker owns a narrow lane: it edits ONLY files within its `file_ownership`
+(or, for a non-write task, only its CWD). Grindstone (the core) owns all git
+staging and committing and may keep its own bookkeeping files in the tree, so the
+worker must NOT git-commit, must NOT touch orchestration files, and "working tree
+clean" is grindstone's concern, never the worker's. Because a *missing*
+`handoff.json` would otherwise make grindstone retry blind, the role scripts
+guarantee one: if the agent exits (out of turn budget, a crash) without writing a
+handoff, the script synthesizes a schema-valid `FAILED` handoff carrying a
+diagnosis and a tail of the agent logs, and exits 0 so the core consumes it as a
+reasoned failed attempt. A genuine infra failure (rate limit / 429) is exempt: it
+keeps propagating a non-zero exit so the transport raises `RateLimited`.
+
 ### Deterministic gates
 
 `run_loop.evaluate_checks` is the single evaluator behind both phase exit

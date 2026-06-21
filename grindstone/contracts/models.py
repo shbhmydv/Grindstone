@@ -172,6 +172,41 @@ class RevisePhasesArgs(_Frozen):
     phases: Annotated[list[Phase], Field(min_length=1, max_length=10)]
 
 
+class RetryFailedEpochArgs(_Frozen):
+    """Retry the failed epoch, optionally with corrective guidance + a tier bump."""
+
+    action: Literal["retry"]
+    hint: Annotated[str, StringConstraints(min_length=1, max_length=2048)]
+    escalate_tier: StrictBool = False
+
+
+class EscalateSeniorFailedEpochArgs(_Frozen):
+    """Hand the failed epoch to the senior tier with a diagnosis."""
+
+    action: Literal["escalate_senior"]
+    diagnosis: Annotated[str, StringConstraints(min_length=1, max_length=2048)]
+
+
+class HaltFailedEpochArgs(_Frozen):
+    """Stop the run for a human: the epoch is not satisfiable as specified."""
+
+    action: Literal["halt"]
+    reason: Annotated[str, StringConstraints(min_length=1, max_length=2048)]
+
+
+#: The three focused dispositions of a FAILED epoch, discriminated on ``action``
+#: (mirrors the schema's ``handle_failed_epoch_args`` oneOf). NOT a phase replan
+#: (revise_phases) and NOT a fresh work epoch.
+HandleFailedEpochArgs = Annotated[
+    Union[
+        RetryFailedEpochArgs,
+        EscalateSeniorFailedEpochArgs,
+        HaltFailedEpochArgs,
+    ],
+    Field(discriminator="action"),
+]
+
+
 class EscalateRunArgs(_Frozen):
     reason: Annotated[str, StringConstraints(min_length=1, max_length=2048)]
     needed_from_human: (
@@ -223,6 +258,12 @@ class RevisePhasesDecision(_Frozen):
     args: RevisePhasesArgs
 
 
+class HandleFailedEpochDecision(_Frozen):
+    schema_version: Literal["1"]
+    tool: Literal["handle_failed_epoch"]
+    args: HandleFailedEpochArgs
+
+
 class EscalateRunDecision(_Frozen):
     schema_version: Literal["1"]
     tool: Literal["escalate_run"]
@@ -243,6 +284,7 @@ EpochDecision = Annotated[
         ReviewDecision,
         ArtifactDecision,
         RevisePhasesDecision,
+        HandleFailedEpochDecision,
         EscalateRunDecision,
         CompleteRunDecision,
     ],

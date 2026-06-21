@@ -450,6 +450,44 @@ def escalate_decision(reason: str = "cannot proceed") -> dict[str, object]:
     return {"schema_version": "1", "tool": "escalate_run", "args": {"reason": reason}}
 
 
+def handle_failed_epoch_retry(hint: str = "try again", escalate_tier: bool = False) -> dict[str, object]:
+    args: dict[str, object] = {"action": "retry", "hint": hint}
+    if escalate_tier:
+        args["escalate_tier"] = True
+    return {"schema_version": "1", "tool": "handle_failed_epoch", "args": args}
+
+
+def handle_failed_epoch_escalate(diagnosis: str = "needs senior") -> dict[str, object]:
+    return {
+        "schema_version": "1",
+        "tool": "handle_failed_epoch",
+        "args": {"action": "escalate_senior", "diagnosis": diagnosis},
+    }
+
+
+def handle_failed_epoch_halt(reason: str = "gate is broken, not the code") -> dict[str, object]:
+    return {
+        "schema_version": "1",
+        "tool": "handle_failed_epoch",
+        "args": {"action": "halt", "reason": reason},
+    }
+
+
+class FailingWorker:
+    """A worker that NEVER writes a handoff, so every attempt fails the gate.
+
+    Drives a task to FAILED (ladder exhausted) deterministically. Records which
+    scratches it saw the planner's failure-context hint in, so a test can assert
+    a retry hint reached the worker. Stateless across epochs."""
+
+    def __init__(self) -> None:
+        self.seen_failure_contexts: list[list[str]] = []
+
+    def run(self, request: WorkerRequest) -> None:
+        self.seen_failure_contexts.append(list(request.failure_context))
+        # No handoff.json written -> _collect_handoff raises "no handoff.json".
+
+
 # --- fixtures ------------------------------------------------------------------
 
 

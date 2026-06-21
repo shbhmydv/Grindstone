@@ -19,6 +19,8 @@ set -euo pipefail
 
 # Portable timeout prefix (resolves `timeout`, else `gtimeout`, else none).
 source "$(dirname "$0")/_timeout_prefix.sh"
+# guarantee_handoff: synthesize a FAILED handoff if the agent left none.
+source "$(dirname "$0")/_handoff_guarantee.sh"
 
 # Model identity is THIS script's concern. Override via $GRINDSTONE_SENIOR_MODEL.
 model="${GRINDSTONE_SENIOR_MODEL:-opus}"
@@ -83,8 +85,20 @@ set -e
 cat "$log_err" >&2 || true
 cat "$log_out" || true
 
-if [[ "$rc" -ne 0 ]]; then
-  echo "senior_request: claude exited $rc (model=$model)" >&2
+# A genuine infra failure (rate limit / 429) must still propagate a non-zero exit
+# so grindstone's transport raises RateLimited and backs off, never synthesize a
+# FAILED handoff over it (that would mask the retryable condition as a hard fail).
+if [[ "$rc" -ne 0 ]] && grep -qiE 'rate.?limit|429' "$log_err" 2>/dev/null; then
+  echo "senior_request: claude exited $rc (model=$model, rate-limited)" >&2
   exit "$rc"
+fi
+
+# Otherwise GUARANTEE a handoff before returning (no-op if the agent wrote one,
+# else a synthesized schema-valid FAILED handoff with a diagnosis + log tails),
+# then exit 0 so grindstone reads it instead of retrying a missing handoff blind.
+guarantee_handoff "$worktree" "$prompt_text" "$log_out" "$log_err" "$rc"
+
+if [[ "$rc" -ne 0 ]]; then
+  echo "senior_request: claude exited $rc (model=$model); synthesized/kept a FAILED handoff" >&2
 fi
 exit 0

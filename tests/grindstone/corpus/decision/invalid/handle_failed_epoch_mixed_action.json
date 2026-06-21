@@ -1,0 +1,9 @@
+{
+  "schema_version": "1",
+  "tool": "handle_failed_epoch",
+  "args": {
+    "action": "halt",
+    "reason": "not satisfiable",
+    "hint": "this hint belongs to retry, not halt"
+  }
+}

@@ -169,6 +169,39 @@ class FinalPolishConfig(BaseModel):
         return v
 
 
+class PrepareConfig(BaseModel):
+    """Declared dependency materialization for build gates (optional).
+
+    A phase ``done_when`` like ``npx tsc --noEmit`` runs inside a FRESH detached
+    worktree of the integration tip that carries only COMMITTED files. The
+    gitignored dependency dirs (``node_modules`` / ``.venv`` / ...) are absent
+    there, so the check resolves the wrong stub and fails deterministically
+    regardless of code correctness, every build gate is structurally unpassable.
+
+    This block declares, per ecosystem and never hardcoded, how to restore those
+    dirs into a worktree before checks run: ``cmd`` installs them, ``env_dirs``
+    names the repo-relative gitignored dirs it produces (and that checks need),
+    and ``cache_key_files`` names the repo-relative lockfiles whose content hash
+    keys a snapshot cache (``.grindstone/cache/env/<hash>/``) so an unchanged
+    lockfile reuses the install instead of re-running ``cmd``.
+
+    ``None`` on the whole config (the default) = no materialization, existing
+    runs are byte-unchanged.
+    """
+
+    model_config = _FROZEN
+    cmd: str
+    env_dirs: list[str]
+    cache_key_files: list[str]
+
+    @field_validator("env_dirs", "cache_key_files")
+    @classmethod
+    def _non_empty(cls, v: list[str]) -> list[str]:
+        if not v:
+            raise ValueError("must list at least one path")
+        return v
+
+
 class GrindstoneConfig(BaseModel):
     """The whole per-repo config; unknown keys at any level are rejected."""
 
@@ -178,6 +211,23 @@ class GrindstoneConfig(BaseModel):
     #: NEVER unbounded (gate-5 P0: a stuck run burned 34 codex calls looping
     #: phase revisions while unattended).
     max_planner_calls: int | None = None
+    #: DETERMINISTIC hard cap on consecutive FAILED epochs the planner may
+    #: dispose of within ONE phase (each handle_failed_epoch retry/escalate that
+    #: fails again counts) before the state machine FORCES a halt-to-human,
+    #: regardless of what the planner decides. The backstop against the dogfood
+    #: spin-loop (15 near-identical repair epochs against a structurally
+    #: unpassable gate). A small int; default 3.
+    max_failed_epochs_per_phase: int = 3
+    #: DETERMINISTIC tier-aware ceilings on how many ``file_ownership`` globs a
+    #: single FRESH implement task may declare (the planner-decomposition size
+    #: gate, ``semantics.implement_task_size_violations``). A task over its tier's
+    #: bound is rejected back to the planner with the offending task named,
+    #: reusing the invalid-decision re-ask path, so an undecomposed "do the whole
+    #: app in one task" epoch can never be dispatched. ``local`` is the default
+    #: (local-rig) bound; ``senior`` (visual/taste epochs that start on senior)
+    #: gets a larger one. Both >= 1.
+    local_max_task_files: int = 5
+    senior_max_task_files: int = 12
     #: The B3 vision-review script seam. ``None`` = the CLI's bundled default
     #: (``models/vision_review.sh``); set it to point the taste gate at a
     #: different rig's script (or a stub in tests).
@@ -186,6 +236,25 @@ class GrindstoneConfig(BaseModel):
     #: touches a completed run. Present = the gated inline-edit pass runs after
     #: ``complete_run`` evidence passes (kept only if it re-passes).
     final_polish: FinalPolishConfig | None = None
+    #: Declared dependency materialization. ``None`` (absent block) = OFF, eval
+    #: + worker worktrees carry only committed files (the prior behavior).
+    #: Present = the gitignored dependency dirs are restored (cached) before
+    #: checks/workers run, so build gates are not structurally unpassable.
+    prepare: PrepareConfig | None = None
+
+    @field_validator("max_failed_epochs_per_phase")
+    @classmethod
+    def _failed_cap_positive(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("max_failed_epochs_per_phase must be >= 1")
+        return v
+
+    @field_validator("local_max_task_files", "senior_max_task_files")
+    @classmethod
+    def _task_file_bound_positive(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("max task-file bounds must be >= 1")
+        return v
 
 
 def load_config(repo_root: Path) -> GrindstoneConfig | None:

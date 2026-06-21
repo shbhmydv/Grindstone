@@ -253,6 +253,25 @@ def _implement_request(repo_map: str | None) -> WorkerRequest:
     )
 
 
+def _artifact_request(mode: str) -> WorkerRequest:
+    task = ArtifactTask(
+        id="T1",
+        goal="investigate the thing",
+        done_when=[CmdCheck(cmd="true")],
+        artifact_out="notes.md",
+        targets=["src/widget.py"],
+    )
+    return WorkerRequest(
+        task=task,
+        task_id="P1/E1/T1",
+        inputs={},
+        scratch=Path("/tmp/scratch"),
+        attempt=1,
+        failure_context=[],
+        mode=mode,  # type: ignore[arg-type]
+    )
+
+
 def test_worker_prompt_injects_subtree_when_present() -> None:
     prompt = build_worker_prompt(_implement_request("src/widget.py:\n  def render():"))
     assert "<repo_map>" in prompt
@@ -262,6 +281,32 @@ def test_worker_prompt_injects_subtree_when_present() -> None:
 def test_worker_prompt_omits_subtree_when_absent() -> None:
     prompt = build_worker_prompt(_implement_request(None))
     assert "<repo_map>" not in prompt
+
+
+def test_worker_prompt_carries_convergence_stop_rule() -> None:
+    # The worker mirror of planner gate-skepticism (RCA: a senior rat-holed
+    # instead of declaring a gate unsatisfiable). A short STOP rule: if the
+    # done_when checks can't be met here, write FAILED/PARTIAL and exit, do not
+    # loop. Present in every mode (shared block, not mode-specific).
+    for req in (
+        _implement_request(None),
+        _artifact_request("research"),
+        _artifact_request("review"),
+    ):
+        prompt = build_worker_prompt(req)
+        assert "<stop_rule>" in prompt
+        assert "cannot be satisfied" in prompt
+        assert "do NOT loop" in prompt
+
+
+def test_worker_prompt_carries_seam_scope_note() -> None:
+    # Seam clarity (RCA: the senior wasted minutes reverse-engineering git-clean
+    # / orchestration-file scope). State plainly: edit only your lane, the core
+    # owns git/commit + its bookkeeping files, "working tree clean" is not yours.
+    prompt = build_worker_prompt(_implement_request(None))
+    assert "<scope>" in prompt
+    assert "do NOT git-commit" in prompt
+    assert "working tree clean" in prompt
 
 
 @_needs_grammars

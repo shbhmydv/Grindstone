@@ -136,6 +136,51 @@ def test_max_planner_calls_parses(tmp_path: Path) -> None:
     assert cfg is not None and cfg.max_planner_calls == 12
 
 
+def test_max_failed_epochs_per_phase_defaults_and_parses(tmp_path: Path) -> None:
+    # The dogfood spin-loop backstop: a deterministic per-phase failed-epoch cap.
+    # Defaults to 3 when absent; the owner can size it per repo.
+    _write(tmp_path, "roles:\n" + _PLANNER + _LOCAL)
+    cfg = load_config(tmp_path)
+    assert cfg is not None and cfg.max_failed_epochs_per_phase == 3
+    _write(tmp_path, "roles:\n" + _PLANNER + _LOCAL + "max_failed_epochs_per_phase: 5\n")
+    cfg2 = load_config(tmp_path)
+    assert cfg2 is not None and cfg2.max_failed_epochs_per_phase == 5
+
+
+def test_max_failed_epochs_per_phase_must_be_positive(tmp_path: Path) -> None:
+    _write(tmp_path, "roles:\n" + _PLANNER + _LOCAL + "max_failed_epochs_per_phase: 0\n")
+    with pytest.raises(ValueError):
+        load_config(tmp_path)
+
+
+def test_task_file_bounds_default_and_parse(tmp_path: Path) -> None:
+    # The deterministic size-gate bounds (Part 4B): tier-aware ceilings on a fresh
+    # implement task's file_ownership glob count. Default local=5, senior=12.
+    _write(tmp_path, "roles:\n" + _PLANNER + _LOCAL)
+    cfg = load_config(tmp_path)
+    assert cfg is not None
+    assert cfg.local_max_task_files == 5
+    assert cfg.senior_max_task_files == 12
+    _write(
+        tmp_path,
+        "roles:\n" + _PLANNER + _LOCAL
+        + "local_max_task_files: 3\nsenior_max_task_files: 20\n",
+    )
+    cfg2 = load_config(tmp_path)
+    assert cfg2 is not None
+    assert cfg2.local_max_task_files == 3
+    assert cfg2.senior_max_task_files == 20
+
+
+def test_task_file_bounds_must_be_positive(tmp_path: Path) -> None:
+    _write(tmp_path, "roles:\n" + _PLANNER + _LOCAL + "local_max_task_files: 0\n")
+    with pytest.raises(ValueError):
+        load_config(tmp_path)
+    _write(tmp_path, "roles:\n" + _PLANNER + _LOCAL + "senior_max_task_files: 0\n")
+    with pytest.raises(ValueError):
+        load_config(tmp_path)
+
+
 def test_vision_review_is_optional_and_defaults_none(tmp_path: Path) -> None:
     # B3 taste gate: the vision_review script seam is optional (a rig with no
     # vision tier omits it; the CLI then falls back to the bundled script).
@@ -218,6 +263,58 @@ def test_final_polish_non_positive_timeout_is_rejected(tmp_path: Path) -> None:
     _write(
         tmp_path,
         "roles:\n" + _PLANNER + _LOCAL + "final_polish: {criteria: c, timeout_s: 0}\n",
+    )
+    with pytest.raises(ValueError):
+        load_config(tmp_path)
+
+
+# --- prepare: declared dependency materialization for build gates --------------
+
+
+def test_prepare_is_optional_and_defaults_none(tmp_path: Path) -> None:
+    # Absent block: no dependency materialization, existing runs unchanged.
+    _write(tmp_path, "roles:\n" + _PLANNER + _LOCAL)
+    cfg = load_config(tmp_path)
+    assert cfg is not None and cfg.prepare is None
+
+
+def test_prepare_parses_when_present(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "roles:\n"
+        + _PLANNER
+        + _LOCAL
+        + "prepare: {cmd: npm ci, env_dirs: [node_modules], "
+        "cache_key_files: [package-lock.json]}\n",
+    )
+    cfg = load_config(tmp_path)
+    assert cfg is not None and cfg.prepare is not None
+    assert cfg.prepare.cmd == "npm ci"
+    assert cfg.prepare.env_dirs == ["node_modules"]
+    assert cfg.prepare.cache_key_files == ["package-lock.json"]
+
+
+def test_prepare_empty_lists_rejected(tmp_path: Path) -> None:
+    # An env_dirs / cache_key_files with no entries is a config error, not a
+    # silent no-op (the whole point is to restore real dirs keyed on real files).
+    _write(
+        tmp_path,
+        "roles:\n"
+        + _PLANNER
+        + _LOCAL
+        + "prepare: {cmd: npm ci, env_dirs: [], cache_key_files: [x]}\n",
+    )
+    with pytest.raises(ValueError):
+        load_config(tmp_path)
+
+
+def test_prepare_unknown_key_rejected(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "roles:\n"
+        + _PLANNER
+        + _LOCAL
+        + "prepare: {cmd: x, env_dirs: [a], cache_key_files: [b], bogus: 1}\n",
     )
     with pytest.raises(ValueError):
         load_config(tmp_path)

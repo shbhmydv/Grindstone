@@ -144,6 +144,27 @@ class EpochCompleted(_Event):
     epoch_id: str
 
 
+class EpochFailed(_Event):
+    # An epoch finished with one or more FAILED tasks (the retry ladder was
+    # exhausted). The run is now awaiting a focused handle_failed_epoch
+    # disposition; ``failed_tasks`` names them so the journal renders the why.
+    event: Literal["epoch_failed"] = "epoch_failed"
+    phase_id: str
+    epoch_id: str
+    failed_tasks: list[str]
+
+
+class FailedEpochHandled(_Event):
+    # The planner's focused disposition of a failed epoch (or the deterministic
+    # cap forcing one). ``action`` is retry / escalate_senior / halt / cap_halt;
+    # ``detail`` is the planner's hint/diagnosis/reason (or the cap message).
+    event: Literal["failed_epoch_handled"] = "failed_epoch_handled"
+    phase_id: str
+    epoch_id: str
+    action: str
+    detail: str
+
+
 class TaskDispatched(_Event):
     event: Literal["task_dispatched"] = "task_dispatched"
     epoch_id: str
@@ -202,6 +223,8 @@ Event = Annotated[
         PhaseEscalated,
         EpochStarted,
         EpochCompleted,
+        EpochFailed,
+        FailedEpochHandled,
         TaskDispatched,
         TaskRetried,
         TaskEscalated,
@@ -479,6 +502,12 @@ def replay(events: list[Event]) -> RunTree:
             epoch = epochs_by_id[ev.epoch_id]
             epoch.status = "completed"
             epoch.ended_ts = ev.ts
+        elif isinstance(ev, EpochFailed):
+            epoch = epochs_by_id[ev.epoch_id]
+            epoch.status = "failed"
+            epoch.ended_ts = ev.ts
+        elif isinstance(ev, FailedEpochHandled):
+            epochs_by_id[ev.epoch_id].status = f"failed ({ev.action})"
         elif isinstance(ev, TaskDispatched):
             task = _task(epochs_by_id[ev.epoch_id], ev.task_id)
             task.status = "dispatched"

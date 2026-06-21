@@ -34,8 +34,17 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from grindstone.contracts.gate import decision_schema_errors
-from grindstone.contracts.models import EpochDecision, Phase, parse_decision, parse_handoff
-from grindstone.contracts.semantics import epoch_decision_violations
+from grindstone.contracts.models import (
+    EpochDecision,
+    ImplementDecision,
+    Phase,
+    parse_decision,
+    parse_handoff,
+)
+from grindstone.contracts.semantics import (
+    epoch_decision_violations,
+    implement_task_size_violations,
+)
 from grindstone.epoch_loop import EpochOutcome
 from grindstone.rundir import RunDir
 
@@ -49,6 +58,9 @@ __all__ = [
     "BACKOFF_BASE_S",
     "BACKOFF_CAP_S",
     "BACKOFF_FACTOR",
+    "DEFAULT_LOCAL_MAX_TASK_FILES",
+    "DEFAULT_SENIOR_MAX_TASK_FILES",
+    "FailedEpochInfo",
     "FailureClass",
     "GateResult",
     "MAX_RATE_LIMIT_WAITS",
@@ -81,6 +93,7 @@ TOOL_NAMES: frozenset[str] = frozenset(
         "review",
         "artifact",
         "revise_phases",
+        "handle_failed_epoch",
         "escalate_run",
         "complete_run",
     }
@@ -120,6 +133,14 @@ BACKOFF_CAP_S = 600.0
 MAX_RATE_LIMIT_WAITS = 6
 MAX_TRANSIENT_RETRIES = 3
 MAX_REASKS = 2
+
+#: Default tier-aware ceilings on a fresh implement task's ``file_ownership``
+#: glob count (the planner-decomposition size gate). Mirror the config defaults
+#: (``GrindstoneConfig.local_max_task_files`` / ``senior_max_task_files``); the
+#: run loop passes the configured values, these are the seam default when a
+#: caller validates a decision standalone.
+DEFAULT_LOCAL_MAX_TASK_FILES = 5
+DEFAULT_SENIOR_MAX_TASK_FILES = 12
 
 
 def classify_failure(exc: BaseException) -> FailureClass:
@@ -216,6 +237,25 @@ Rules:
   artifact itself (e.g. `test -s notes.md` in the task CWD, or an
   artifact_exists key), never repo build/test commands; those can only pass in
   implement tasks or phase exit criteria (run in a checkout of the tip).
+- revise_phases means the PHASE STRUCTURE/plan is wrong (wrong milestones, wrong
+  exit criteria, a missing or mis-scoped phase), NOT that one epoch's work
+  failed. Do NOT use revise_phases to react to a failed epoch, the state machine
+  asks you a separate, focused handle_failed_epoch decision for that (below).
+- When an epoch FAILS (a task exhausted its retry ladder, and/or the phase gate
+  kept failing), the next call is CONSTRAINED to handle_failed_epoch: choose
+  exactly one action for THAT epoch, retry (with a `hint`, optionally
+  `escalate_tier:true` to start on senior), escalate_senior (with a `diagnosis`),
+  or halt (with a `reason`, stops the run for a human). The input carries the
+  failed checks WITH their captured command output and the worker handoffs that
+  claimed pass, read them before deciding.
+- GATE SKEPTICISM: if the workers repeatedly report an HONEST pass (their
+  done_when passed in their scratch) while the PHASE GATE keeps failing the SAME
+  way, SUSPECT the gate or the environment, not the code: a missing dependency, a
+  wrong verification context, a check that cannot run where the gate runs it. The
+  captured check output is your evidence. In that situation prefer halt (with a
+  reason naming the suspected env/gate problem) over ordering yet another
+  identical code repair, repeated identical repairs against a structurally
+  unpassable gate is the failure mode this decision exists to stop.
 - escalate_run only when you genuinely cannot proceed. complete_run only when
   the whole job is done; its `evidence` checks are re-run deterministically and
   rejected if they fail.
@@ -223,33 +263,69 @@ Rules:
   (e.g. a build phase then a verify phase); phase ids are "P1","P2",… in order.
   Each epoch has 1-8 tasks with ids "T1"…"T8".
 
-Task sizing, independence, and decomposition:
+Decomposition is THREE distinct skills, one per level. Apply them in order, and
+keep them separate, the bias and unit of work differ at each level:
+
+[LEVEL 1: PHASING] Split the JOB into phases (propose_skeleton / revise_phases).
+- One phase = one MODE: research / implement / test / review. Do not mix modes
+  in a phase; a phase that "builds and reviews" is two phases.
+- A skeleton has BETWEEN 2 AND 10 phases; phase ids "P1","P2",… in order. Even a
+  small job needs at least two (e.g. a build phase then a verify phase).
+- Sequence by tier of thinking: research/review (and visual phases) run on the
+  stronger SENIOR tier, implement/test on the local rig, so phasing is also a
+  routing choice (judgment on senior, production on local).
+
+[LEVEL 2: EPOCH] Split a PHASE into epochs (one work decision per call).
+- One epoch = one coherent FEATURE or milestone, not a whole phase at once and
+  not a single file. Each epoch boundary is a free planner checkpoint plus a
+  deterministic gate.
+- For an IMPLEMENT phase, the FIRST epoch is an explicit BASELINE DEPENDENCIES
+  epoch: stand up the project skeleton and produce the COMMITTED dependency
+  manifest/lockfile (e.g. package.json + its lockfile, pyproject + lockfile).
+  Later feature epochs build ON that baseline. Do NOT fold dependency setup into
+  a feature epoch, and do NOT try to install/build inside it, just create the
+  manifest as committed files; a separate prepare mechanism installs from the
+  lockfile when gates run.
+- Split SEQUENTIAL work across epochs LIBERALLY: give a step its own epoch
+  whenever it needs an earlier step's `artifact_out`, OR a real checkpoint/gate
+  sits between steps, even at the SAME tier. Do not fuse a genuine A-then-B
+  dependency into one opaque epoch; do not manufacture artificial steps either
+  (every epoch costs a planner call, bounded by `epoch_budget`).
+
+[LEVEL 3: TASK] Split an EPOCH into tasks (the parallel fan-out within it).
+- One task = one bounded SLICE, kept SMALL: a few files, with DISJOINT
+  file_ownership. A task that owns the whole repo (or a dozen unrelated files) is
+  NOT decomposed, the size gate will REJECT it and make you split further.
 - Tasks within an epoch run in PARALLEL and MUST NOT consume each other's
   outputs. Anything where one task needs another's result is SEQUENTIAL work,
   put it in a later epoch (or phase), never in a sibling task of the same epoch.
-- Two axes, OPPOSITE biases. Splitting PARALLEL tasks inside one epoch: be
-  CONSERVATIVE (prefer one task when the work is interconnected; see below).
-  Splitting SEQUENTIAL work across epochs: be LIBERAL. Give a step its own epoch
-  whenever it needs an earlier step's `artifact_out`, OR a real checkpoint/gate
-  sits between steps, even at the SAME tier, not only when the tier changes.
-  Each epoch boundary is a free planner checkpoint plus a deterministic gate. Do
-  not fuse a genuine A-then-B dependency into one opaque task; do not manufacture
-  artificial steps either (every epoch costs a planner call, bounded by
-  `epoch_budget`).
+- Two axes, OPPOSITE biases. Splitting SEQUENTIAL work across epochs (LEVEL 2):
+  be LIBERAL. Splitting PARALLEL tasks inside one epoch (this level): be
+  CONSERVATIVE. Decompose CONSERVATIVELY here, at the top level only: you are a
+  powerful planner, prefer ONE task whenever the work is even remotely
+  interconnected and shared context helps. Split into multiple tasks ONLY when
+  the parts are genuinely independent, or genuinely too big for one worker's
+  context. Naive fan-out of intertangled work hands the hardest part, cross-file
+  consistency, to the least-coordinated agents. But a single task may NOT swallow
+  the whole epoch's files: SMALL and bounded beats one giant task (the size gate
+  enforces this, see below).
 - Each task must fit ONE worker with a ~90k-token working context. Treat 90k as
   the sizing CONTRACT: the worker has headroom above it, but that headroom is
   overrun insurance, never plannable budget. If a task cannot plausibly fit, it
   is two tasks or two epochs.
+- SIZE GATE (deterministic, enforced): a fresh implement task's `file_ownership`
+  is capped per tier (a small count on local, a larger one on senior/visual), and
+  a whole-repo glob (`**`, `**/*`, or a bare `*`) is REJECTED outright as "not
+  decomposed". An oversized or whole-repo task bounces back as an invalid
+  decision naming the offending task, split it. (A handle_failed_epoch repair may
+  carry broad scope, that path is exempt.)
 - `epoch_budget` is how many epochs a phase may consume before the state machine
   fires a phase escalation (forcing you to revise_phases or escalate_run). It is
   a ceiling sized to the phase's real arc, a small phase is 1-2, a broad build
-  phase a few more, not a target; unused budget is free.
-- Decompose CONSERVATIVELY, at the top level only. You are a powerful planner:
-  prefer ONE task whenever the work is even remotely interconnected and shared
-  context helps. Split into multiple tasks ONLY when the parts are genuinely
-  independent, or genuinely too big for one worker's context. Naive fan-out of
-  intertangled work hands the hardest part, cross-file consistency, to the
-  least-coordinated agents.
+  phase a few more, not a target; unused budget is free. If the budget runs out
+  because an epoch FAILED, you get the focused handle_failed_epoch decision for
+  that epoch instead (it takes precedence); the revise_phases / escalate_run
+  escalation is for a phase whose gate never passes while its epochs all complete.
 - Carry the relevant job-spec requirements into each task's `goal` VERBATIM, or
   point at the exact input artifacts (by log key) that contain them. Never
   paraphrase or summarize a requirement away, lossy paraphrase silently drops
@@ -266,7 +342,8 @@ The keys schema_version, tool, args are ALL mandatory. Do NOT use the shorthand
 - propose_skeleton: {"phases":[{"id":"P1..","title":..,"exit_criterion":[check..],"epoch_budget":int}]}
 - implement:        {"epoch_title":..,"rationale":..,"visual"?:bool,"tasks":[{"id":"T1..","goal":..,"done_when":[check..],"file_ownership":[glob..],"inputs"?,"skills"?}]}
 - research/review/artifact: {"epoch_title":..,"rationale":..,"visual"?:bool,"tasks":[{"id","goal","done_when","artifact_out","targets"?,"inputs"?,"skills"?}]}
-- revise_phases:    {"reason":..,"phases":[..]}  (replaces the current phase onward; never completed phases)
+- revise_phases:    {"reason":..,"phases":[..]}  (the PHASE STRUCTURE is wrong; replaces the current phase onward, never completed phases)
+- handle_failed_epoch: {"action":"retry","hint":..,"escalate_tier"?:bool} | {"action":"escalate_senior","diagnosis":..} | {"action":"halt","reason":..}  (legal ONLY when an epoch has failed and is awaiting disposition)
 - escalate_run:     {"reason":..,"needed_from_human"?}
 - complete_run:     {"summary":..,"evidence":[check..]}
 A check is {"cmd":..,"expect_exit"?:int} or {"artifact_exists":"<log key>"} or
@@ -379,6 +456,57 @@ class PhaseTailInfo:
     tip_total: int
 
 
+@dataclass(frozen=True)
+class FailedEpochInfo:
+    """The focused context for a ``handle_failed_epoch`` decision (Part B).
+
+    Carried in the volatile tail ONLY when an epoch has failed and is awaiting
+    disposition. ``failed_tasks`` is each failed task's id + last reason;
+    ``failed_checks`` is the phase exit checks that fail (label + captured command
+    output, Part A); ``passing_handoffs`` is each DONE task's id +
+    resulting_state, the workers' HONEST pass claim the planner must weigh against
+    the still-failing gate (the gate-skepticism evidence)."""
+
+    epoch_id: str
+    failed_tasks: list[tuple[str, str]]
+    failed_checks: list[str]
+    passing_handoffs: list[tuple[str, str]]
+    disposed_count: int
+    cap: int
+
+
+def _failed_epoch_block(info: FailedEpochInfo) -> str:
+    tasks = (
+        "\n".join(f"  - {tid}: {reason}" for tid, reason in info.failed_tasks)
+        or "  (none, the phase gate failed though every task passed)"
+    )
+    checks = "\n".join(f"  - {label}" for label in info.failed_checks) or "  (none)"
+    handoffs = (
+        "\n".join(f"  - {tid}: {state}" for tid, state in info.passing_handoffs)
+        or "  (none)"
+    )
+    return (
+        f"<failed_epoch epoch={info.epoch_id} "
+        f"disposed={info.disposed_count}/{info.cap}>\n"
+        "This epoch FAILED. The ONLY legal decision now is handle_failed_epoch "
+        "(retry / escalate_senior / halt). revise_phases is NOT for this, the "
+        "phase STRUCTURE is unchanged.\n"
+        "failed_tasks (retry ladder exhausted):\n"
+        f"{tasks}\n"
+        "failing_phase_checks (deterministic, WITH captured output, env-vs-code "
+        "evidence):\n"
+        f"{checks}\n"
+        "worker handoffs that claimed an HONEST pass (weigh these against the "
+        "still-failing gate, a passing worker + a failing gate that repeats the "
+        "SAME way points at the gate/environment, prefer halt over another "
+        "identical repair):\n"
+        f"{handoffs}\n"
+        f"This phase has disposed of {info.disposed_count} of {info.cap} permitted "
+        "failed epochs; at the cap the state machine halts to a human regardless.\n"
+        "</failed_epoch>\n"
+    )
+
+
 def _phase_status_block(phase_id: str | None, phase: PhaseTailInfo) -> str:
     checks = (
         "\n".join(
@@ -422,6 +550,7 @@ def volatile_tail(
     reask_errors: list[str],
     phase: PhaseTailInfo | None = None,
     repo_map: str | None = None,
+    failed_epoch: FailedEpochInfo | None = None,
 ) -> str:
     """The per-call suffix: running state, phase status, last-epoch report,
     re-ask feedback, request. Never byte-stable, it carries everything that
@@ -442,6 +571,9 @@ def volatile_tail(
         "</state>\n"
     )
     phase_status = _phase_status_block(phase_id, phase) if phase is not None else ""
+    failed_epoch_block = (
+        _failed_epoch_block(failed_epoch) if failed_epoch is not None else ""
+    )
     repo_map_block = (
         "<repo_map>\nStructural map of the target repo at the current integration "
         "tip (most-referenced files/symbols first). A navigation aid, not "
@@ -466,7 +598,9 @@ def volatile_tail(
         "epoch_decision schema. No prose.\n"
         "</request>\n"
     )
-    return state + phase_status + repo_map_block + last + errors + request
+    return (
+        state + phase_status + failed_epoch_block + repo_map_block + last + errors + request
+    )
 
 
 def build_planner_input(
@@ -481,6 +615,7 @@ def build_planner_input(
     phase: PhaseTailInfo | None = None,
     repo_memory: str | None = None,
     repo_map: str | None = None,
+    failed_epoch: FailedEpochInfo | None = None,
 ) -> str:
     """Full constructed input: ``stable_head`` + ``volatile_tail`` (ruling 3).
 
@@ -495,6 +630,7 @@ def build_planner_input(
         reask_errors=reask_errors,
         phase=phase,
         repo_map=repo_map,
+        failed_epoch=failed_epoch,
     )
 
 
@@ -631,7 +767,11 @@ _ESCALATION_TOOLS: frozenset[str] = frozenset({"revise_phases", "escalate_run"})
 
 
 def _position_legality(
-    decision: EpochDecision, skeleton_exists: bool, *, phase_escalated: bool
+    decision: EpochDecision,
+    skeleton_exists: bool,
+    *,
+    phase_escalated: bool,
+    failed_epoch_active: bool,
 ) -> list[str]:
     """Call-position rules the schema cannot express (PLANNER_CONTRACT §3).
 
@@ -640,6 +780,24 @@ def _position_legality(
     under an escalation demand (budget exhausted, S4 ruling 2), the ONLY legal
     tools are ``revise_phases`` / ``escalate_run``, any work epoch is rejected
     back to the planner via the same re-ask ladder.
+
+    ``handle_failed_epoch`` is the FOCUSED disposition of an epoch that FAILED:
+    it is legal ONLY when a failed epoch is awaiting disposition, and conversely
+    when one IS awaiting disposition it is the ONLY legal tool (the planner must
+    decide retry / escalate_senior / halt for THIS epoch, not fan out a fresh
+    one or blindly revise the phase structure, the dogfood spin-loop fix).
+
+    The failed-epoch disposition TAKES PRECEDENCE over budget phase-escalation:
+    when a phase's epoch_budget is exhausted BY a failed epoch, both demands fire
+    at the same boundary, but ``handle_failed_epoch`` already covers "what next"
+    for that epoch (retry / escalate_senior / halt) more specifically than
+    revise_phases / escalate_run. So while a failed epoch is pending, ONLY the
+    handle_failed_epoch rule applies and the phase-escalation rule is skipped;
+    otherwise the two would deadlock (handle_failed_epoch rejected for not being
+    an escalation tool, every other tool rejected for not being handle_failed_epoch).
+    The budget-escalation path stays live for its genuine case: a phase whose gate
+    never passes while its epochs all complete structurally (no task FAILS), which
+    exhausts the budget with NO failed epoch pending.
     """
 
     is_propose = decision.tool == "propose_skeleton"
@@ -647,12 +805,49 @@ def _position_legality(
         return ["propose_skeleton is only legal as the first decision of a run"]
     if not is_propose and not skeleton_exists:
         return ["the first decision of a run must be propose_skeleton"]
+    if failed_epoch_active:
+        if decision.tool != "handle_failed_epoch":
+            return [
+                f"a failed epoch is awaiting disposition: only handle_failed_epoch is "
+                f"legal (retry / escalate_senior / halt), not {decision.tool}"
+            ]
+        return []
+    if decision.tool == "handle_failed_epoch":
+        return [
+            "handle_failed_epoch is only legal when an epoch has failed and is "
+            "awaiting disposition"
+        ]
     if phase_escalated and decision.tool not in _ESCALATION_TOOLS:
         return [
             f"phase escalation in force: only revise_phases or escalate_run are "
             f"legal, not {decision.tool}"
         ]
     return []
+
+
+def _size_gate_violations(
+    decision: EpochDecision,
+    *,
+    failed_epoch_active: bool,
+    has_senior: bool,
+    local_max_task_files: int,
+    senior_max_task_files: int,
+) -> list[str]:
+    """The deterministic per-task SIZE gate for a FRESH implement decomposition.
+
+    Scoped to fresh decomposition: a ``handle_failed_epoch`` repair re-dispatches
+    its originating decision directly (never through this gate) and may need broad
+    scope, and while a failed epoch is awaiting disposition the ONLY legal tool is
+    ``handle_failed_epoch`` anyway, so ``failed_epoch_active`` short-circuits the
+    gate. TIER-AWARE: a ``visual`` implement epoch starts on the senior tier (when
+    the rig has one), so it gets the larger senior bound; everything else is local.
+    """
+
+    if failed_epoch_active or not isinstance(decision, ImplementDecision):
+        return []
+    on_senior = decision.args.visual and has_senior
+    bound = senior_max_task_files if on_senior else local_max_task_files
+    return implement_task_size_violations(list(decision.args.tasks), max_files=bound)
 
 
 def validate_decision(
@@ -662,6 +857,10 @@ def validate_decision(
     completed_phase_ids: frozenset[str],
     skeleton_exists: bool,
     phase_escalated: bool = False,
+    failed_epoch_active: bool = False,
+    has_senior: bool = False,
+    local_max_task_files: int = DEFAULT_LOCAL_MAX_TASK_FILES,
+    senior_max_task_files: int = DEFAULT_SENIOR_MAX_TASK_FILES,
 ) -> GateResult:
     """Gate raw decision text: extract-input → JSON → schema → typed → semantic.
 
@@ -669,6 +868,12 @@ def validate_decision(
     raw output (``None`` when nothing extractable was found). Returns a typed
     decision on success, else the ordered list of human-readable rejection
     reasons that get appended to the re-ask.
+
+    The size gate (``_size_gate_violations``) additionally REJECTS a fresh
+    implement decision whose tasks are not decomposed: a task over its tier's
+    file-count bound, or one claiming whole-repo ownership. A rejection is
+    indistinguishable from any other gate failure to the caller, so it rides the
+    SAME invalid-decision re-ask ladder (the re-ask names the offending task).
     """
 
     if json_text is None:
@@ -691,7 +896,19 @@ def validate_decision(
             completed_phase_ids=completed_phase_ids,
         )
     )
-    errors += _position_legality(decision, skeleton_exists, phase_escalated=phase_escalated)
+    errors += _position_legality(
+        decision,
+        skeleton_exists,
+        phase_escalated=phase_escalated,
+        failed_epoch_active=failed_epoch_active,
+    )
+    errors += _size_gate_violations(
+        decision,
+        failed_epoch_active=failed_epoch_active,
+        has_senior=has_senior,
+        local_max_task_files=local_max_task_files,
+        senior_max_task_files=senior_max_task_files,
+    )
     if errors:
         return GateResult(None, errors)
     return GateResult(decision, [])

@@ -35,6 +35,7 @@ decision; resume delegates to ``resume_epoch`` then continues the loop.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import time
 from dataclasses import dataclass
@@ -44,6 +45,8 @@ from typing import Any, Callable, Literal, Sequence
 from pydantic import BaseModel, ConfigDict
 
 from grindstone import worktree as wt
+from grindstone.config import PrepareConfig
+from grindstone.prepare import PrepareError, materialize_env
 from grindstone.planner import extract_decision_json
 from grindstone.contracts.models import (
     ArtifactEpochArgs,
@@ -53,9 +56,12 @@ from grindstone.contracts.models import (
     CompleteRunDecision,
     EpochDecision,
     EscalateRunDecision,
+    HaltFailedEpochArgs,
+    HandleFailedEpochDecision,
     ImplementEpochArgs,
     Phase,
     ProposeSkeletonDecision,
+    RetryFailedEpochArgs,
     RevisePhasesDecision,
     VisionReviewCheck,
     parse_decision,
@@ -67,6 +73,8 @@ from grindstone.epoch_loop import EpochArgs, EpochOutcome, resume_epoch, run_epo
 from grindstone.journal import reap_sibling_journals, write_journal
 from grindstone.memory import load_digest
 from grindstone.events import (
+    EpochFailed,
+    FailedEpochHandled,
     FinalPolishApplied,
     FinalPolishSkipped,
     JournalWriter,
@@ -89,7 +97,10 @@ from grindstone.events import (
 from grindstone.planner import (
     MAX_RATE_LIMIT_WAITS,
     MAX_REASKS,
+    DEFAULT_LOCAL_MAX_TASK_FILES,
+    DEFAULT_SENIOR_MAX_TASK_FILES,
     MAX_TRANSIENT_RETRIES,
+    FailedEpochInfo,
     PhaseTailInfo,
     PlannerTransport,
     backoff_delay,
@@ -110,6 +121,12 @@ Ladder = Sequence[tuple[str, WorkerTransport]]
 #: Cap on the integration-tip file listing surfaced in the tail (ruling 3b):
 #: a reference, not a payload, the full count is always reported alongside.
 TIP_LISTING_CAP = 200
+
+#: Deterministic default for the per-phase failed-epoch cap (Part C): after this
+#: many failed epochs in one phase the state machine FORCES a halt-to-human
+#: regardless of the planner, so the dogfood spin-loop (15 identical repairs)
+#: can never recur. Config (``max_failed_epochs_per_phase``) overrides it.
+DEFAULT_MAX_FAILED_EPOCHS_PER_PHASE = 3
 
 _EPOCH_MODE: dict[str, HandoffMode] = {
     "implement": "implement",
@@ -160,6 +177,15 @@ class RunState(BaseModel):
     passed_phase_ids: list[str] = []
     #: True while the current phase is under a budget-exhaustion escalation demand.
     phase_escalation_active: bool = False
+    #: The epoch decision that produced a FAILED epoch awaiting a focused
+    #: handle_failed_epoch disposition (retry re-dispatches it), plus the captured
+    #: failure context (failed task reasons, failed phase checks WITH output, the
+    #: handoffs that claimed pass). ``None`` = no failed epoch is pending. Defaulted
+    #: so older states still load.
+    pending_failed_epoch: dict[str, Any] | None = None
+    #: FAILED epochs disposed of within the CURRENT phase (the deterministic
+    #: spin-loop cap, Part C); resets on phase advance AND revise.
+    phase_failed_epochs: int = 0
 
 
 @dataclass(frozen=True)
@@ -236,12 +262,63 @@ class _Boundary:
 # --- deterministic check evaluation (evidence + phase exit criteria) -----------
 
 
+#: How much of a failed command's combined stdout/stderr to keep (gate
+#: observability, Part A): the planner sees WHY a check failed, env-vs-code,
+#: instead of a bare exit code. Bounded so a chatty build cannot bloat the
+#: planner input; the TAIL is kept (errors land last).
+CHECK_OUTPUT_TAIL_BYTES = 3072
+
+
 def _check_label(check: Check) -> str:
     if isinstance(check, CmdCheck):
         return f"cmd `{check.cmd}`"
     if isinstance(check, ArtifactExistsCheck):
         return f"artifact_exists:{check.artifact_exists}"
     return f"vision_review:{check.vision_review.screenshot}"
+
+
+def _safe_output_tail(stdout: str, stderr: str) -> str:
+    """The text-safe, length-bounded tail of a failed command's combined output.
+
+    Joins stdout + stderr, keeps the LAST ``CHECK_OUTPUT_TAIL_BYTES`` bytes
+    (errors land last), and scrubs the result text-safe: control bytes other than
+    tab/newline are stripped so an odd-byte build log can never corrupt the
+    planner input or the persisted record. Empty when the command said nothing.
+    """
+
+    parts = [p for p in (stdout, stderr) if p]
+    combined = "\n".join(parts).strip()
+    if not combined:
+        return ""
+    raw = combined.encode("utf-8", errors="replace")
+    if len(raw) > CHECK_OUTPUT_TAIL_BYTES:
+        raw = b"...(truncated)...\n" + raw[-CHECK_OUTPUT_TAIL_BYTES:]
+    text = raw.decode("utf-8", errors="replace")
+    return "".join(c for c in text if c in "\t\n" or c >= " ")
+
+
+def _indent(text: str, prefix: str = "        ") -> str:
+    return "\n".join(prefix + line for line in text.splitlines())
+
+
+def _persist_check_output(
+    run_dir: RunDir, scratch_name: str, index: int, cmd: str, tail: str
+) -> None:
+    """Durably record a failed check's captured output under the run dir.
+
+    A flat text file per (eval scratch, check index) so the failure trail
+    survives the run and is auditable alongside the journal; best-effort, a
+    persist failure never breaks check evaluation (the label still carries the
+    same tail to the planner)."""
+
+    try:
+        out_dir = run_dir.root / "check_output" / scratch_name
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / f"c{index}.txt").write_text(
+            f"$ {cmd}\n{tail}\n", encoding="utf-8"
+        )
+    except OSError:
+        pass
 
 
 def _vision_result(
@@ -299,6 +376,7 @@ def evaluate_checks(
     run_dir: RunDir,
     scratch_name: str,
     vision_reviewer: VisionReviewer | None = None,
+    prepare: PrepareConfig | None = None,
 ) -> list[tuple[str, bool]]:
     """Run a list of deterministic checks; return ``(label, passed)`` IN ORDER.
 
@@ -327,6 +405,16 @@ def evaluate_checks(
             # letting the GitError escape evaluate_checks and crash the whole run.
             worktree = None
             worktree_error = f"unresolvable eval ref {ref or 'HEAD'!r}"
+        else:
+            # Restore the declared (gitignored, uncommittable) dependency dirs into
+            # the throwaway worktree before the cmd checks run, otherwise a build
+            # gate like `npx tsc` is structurally unpassable (node_modules absent).
+            # A failed prepare FAILS the cmd/vision checks with a clear reason
+            # rather than silently leaving them unpassable.
+            try:
+                materialize_env(repo, worktree, prepare)
+            except PrepareError as exc:
+                worktree_error = str(exc)
     cwd = worktree if worktree is not None else run_dir.root
     try:
         results: list[tuple[str, bool]] = []
@@ -353,7 +441,19 @@ def evaluate_checks(
                     check.cmd, shell=True, cwd=str(cwd), capture_output=True, text=True
                 )
                 ok = proc.returncode == check.expect_exit
-                results.append((_check_label(check), ok))
+                label = _check_label(check)
+                if not ok:
+                    # Gate observability (Part A): a FAILED cmd check keeps its
+                    # output so the planner can tell env-vs-code, the dogfood
+                    # spin-loop blind spot. Persist the full-ish tail under the
+                    # run dir AND fold a short tail into the label that flows to
+                    # the planner's next decision input.
+                    tail = _safe_output_tail(proc.stdout, proc.stderr)
+                    label = f"{label} (exit {proc.returncode})"
+                    if tail:
+                        _persist_check_output(run_dir, scratch_name, index, check.cmd, tail)
+                        label += "\n      output:\n" + _indent(tail)
+                results.append((label, ok))
         return results
     finally:
         if worktree is not None and repo is not None:
@@ -367,6 +467,7 @@ def recheck_evidence(
     final_branch: str | None,
     run_dir: RunDir,
     vision_reviewer: VisionReviewer | None = None,
+    prepare: PrepareConfig | None = None,
 ) -> list[str]:
     """Deterministically re-run a ``complete_run``'s evidence; return the failing
     labels (empty = the run's certificate holds). Command checks run against the
@@ -382,6 +483,7 @@ def recheck_evidence(
             run_dir=run_dir,
             scratch_name="_evidence",
             vision_reviewer=vision_reviewer,
+            prepare=prepare,
         )
         if not ok
     ]
@@ -437,6 +539,7 @@ def _advance_phases(
     passed: set[str],
     started: set[str],
     vision_reviewer: VisionReviewer | None,
+    prepare: PrepareConfig | None,
 ) -> list[tuple[str, bool]]:
     """Evaluate the current phase and advance through every satisfied one.
 
@@ -464,6 +567,7 @@ def _advance_phases(
             run_dir=run_dir,
             scratch_name="_phase_eval",
             vision_reviewer=vision_reviewer,
+            prepare=prepare,
         )
         if not all(ok for _, ok in results):
             return results
@@ -480,6 +584,8 @@ def _advance_phases(
             phase_epoch_index=0,
             phase_budget_used=0,
             phase_escalation_active=False,
+            phase_failed_epochs=0,
+            pending_failed_epoch=None,
         )
         if nxt.id not in started:
             journal.emit(lambda s: PhaseStarted(seq=s, ts=_now(), phase_id=nxt.id))
@@ -494,12 +600,13 @@ def _phase_preamble(
     passed: set[str],
     started: set[str],
     vision_reviewer: VisionReviewer | None,
+    prepare: PrepareConfig | None,
 ) -> _PhaseContext:
     """Advance phases, fire a one-shot ``phase_escalated`` on budget exhaustion,
     and assemble the cumulative-state tail context (rulings 1-3)."""
 
     results = _advance_phases(
-        journal, store, run_dir, repo, passed, started, vision_reviewer
+        journal, store, run_dir, repo, passed, started, vision_reviewer, prepare
     )
     skeleton = store.state.skeleton
     assert skeleton is not None
@@ -591,6 +698,11 @@ def _plan_boundary(
     phase_ctx: _PhaseContext | None,
     completed_phase_ids: frozenset[str],
     vision_reviewer: VisionReviewer | None,
+    prepare: PrepareConfig | None,
+    failed_epoch: FailedEpochInfo | None,
+    has_senior: bool,
+    local_max_task_files: int,
+    senior_max_task_files: int,
 ) -> _Boundary:
     """Drive planner calls at one epoch boundary to a dispatchable decision.
 
@@ -600,6 +712,10 @@ def _plan_boundary(
     on an invalid decision (journaled ``planner_call_failed("transient")``) and on
     a ``complete_run`` whose evidence fails, both share the ≤2 re-ask budget;
     exhausting it escalates the run.
+
+    When ``failed_epoch`` is set, the boundary is a FOCUSED disposition: the input
+    carries the failed-epoch context (Part B) and the gate constrains the decision
+    to ``handle_failed_epoch``.
     """
 
     reasks = 0
@@ -620,6 +736,7 @@ def _plan_boundary(
             phase=phase_ctx.info if phase_ctx is not None else None,
             repo_memory=store.state.repo_memory,
             repo_map=repo_map,
+            failed_epoch=failed_epoch,
         )
         try:
             raw = _transport_call(journal, store, planner, sleep_fn, prompt, max_planner_calls)
@@ -634,6 +751,10 @@ def _plan_boundary(
             completed_phase_ids=completed_phase_ids,
             skeleton_exists=store.state.skeleton is not None,
             phase_escalated=phase_ctx is not None and phase_ctx.escalation_active,
+            failed_epoch_active=failed_epoch is not None,
+            has_senior=has_senior,
+            local_max_task_files=local_max_task_files,
+            senior_max_task_files=senior_max_task_files,
         )
         if gate.decision is None:
             journal.emit(
@@ -659,6 +780,7 @@ def _plan_boundary(
                 final_branch=store.state.last_integration_branch,
                 run_dir=run_dir,
                 vision_reviewer=vision_reviewer,
+                prepare=prepare,
             )
             if failures:
                 if reasks >= MAX_REASKS:
@@ -698,6 +820,8 @@ def _apply_skeleton(
         phase_epoch_index=0,
         phase_budget_used=0,
         phase_escalation_active=False,
+        phase_failed_epochs=0,
+        pending_failed_epoch=None,
     )
 
 
@@ -736,6 +860,8 @@ def _apply_revise(
         current_phase_id=first,
         phase_budget_used=0,
         phase_escalation_active=False,
+        phase_failed_epochs=0,
+        pending_failed_epoch=None,
     )
 
 
@@ -748,8 +874,16 @@ def _dispatch_epoch(
     ladder: Ladder,
     concurrency: int | None,
     tier0_attempts: int,
+    prepare: PrepareConfig | None,
+    *,
+    epoch_hint: str | None = None,
+    force_senior: bool = False,
 ) -> EpochOutcome:
-    """Run one epoch from a decision; persist ``running_epoch`` first (resume)."""
+    """Run one epoch from a decision; persist ``running_epoch`` first (resume).
+
+    ``epoch_hint`` / ``force_senior`` carry a ``handle_failed_epoch`` retry's
+    corrective guidance + tier bump into the dispatched epoch.
+    """
 
     mode = _EPOCH_MODE[decision.tool]
     is_implement = decision.tool == "implement"
@@ -776,6 +910,9 @@ def _dispatch_epoch(
         base=base,
         concurrency=concurrency,
         tier0_attempts=tier0_attempts,
+        prepare=prepare,
+        epoch_hint=epoch_hint,
+        force_senior=force_senior,
     )
     _record_epoch(store, outcome)
     return outcome
@@ -803,6 +940,219 @@ def _record_epoch(store: _RunStateStore, outcome: EpochOutcome) -> None:
     )
 
 
+def _epoch_failed(outcome: EpochOutcome) -> bool:
+    """Did this epoch FAIL? Any task that exhausted its retry ladder is FAILED.
+
+    The integration only merges DONE tasks, so a partial epoch still
+    ``status=completed`` structurally; the planner-facing notion of a failed
+    epoch is one where work did not get done, which is the failed-task set."""
+
+    return any(t.status == "failed" for t in outcome.tasks)
+
+
+def _build_failed_epoch_info(
+    outcome: EpochOutcome,
+    run_dir: RunDir,
+    *,
+    phase_check_results: list[tuple[str, bool]],
+    disposed_count: int,
+    cap: int,
+) -> FailedEpochInfo:
+    """Assemble the focused context a ``handle_failed_epoch`` decision needs.
+
+    Failed tasks + their last reason; the phase exit checks that FAIL (label
+    carries the captured command output, Part A); and the DONE tasks' handoff
+    resulting_state, the workers' honest pass claim the planner weighs against
+    the still-failing gate (gate skepticism)."""
+
+    failed_tasks = [
+        (t.task_id, t.failure_reason or "no reason recorded")
+        for t in outcome.tasks
+        if t.status == "failed"
+    ]
+    failed_checks = [label for label, ok in phase_check_results if not ok]
+    passing: list[tuple[str, str]] = []
+    for t in outcome.tasks:
+        if t.status == "done" and t.handoff_key:
+            try:
+                payload = json.loads(
+                    run_dir.resolve(t.handoff_key).read_text(encoding="utf-8")
+                )
+                state = str(payload.get("resulting_state", "")).strip()
+            except (ValueError, OSError):
+                state = ""
+            passing.append((t.task_id, state or "(pass, no state recorded)"))
+    return FailedEpochInfo(
+        epoch_id=outcome.epoch_id,
+        failed_tasks=failed_tasks,
+        failed_checks=failed_checks,
+        passing_handoffs=passing,
+        disposed_count=disposed_count,
+        cap=cap,
+    )
+
+
+def _maybe_open_failed_epoch(
+    journal: JournalWriter,
+    store: _RunStateStore,
+    run_dir: RunDir,
+    decision: EpochDecision,
+    outcome: EpochOutcome,
+    phase_ctx: _PhaseContext | None,
+    cap: int,
+) -> RunOutcome | None:
+    """If the just-run epoch FAILED, open a focused failed-epoch disposition.
+
+    Increments the per-phase failed-epoch counter and, at the deterministic cap,
+    FORCES a halt-to-human regardless of the planner (Part C, the spin-loop
+    backstop). Below the cap it records the originating decision + the failure
+    context in run state so the NEXT boundary is constrained to handle_failed_epoch
+    (Part B). Returns a terminal RunOutcome when the cap halts, else ``None``."""
+
+    if not _epoch_failed(outcome):
+        return None
+    disposed = store.state.phase_failed_epochs + 1
+    phase_id = store.state.current_phase_id or "P1"
+    failed_ids = [t.task_id for t in outcome.tasks if t.status == "failed"]
+    journal.emit(
+        lambda s: EpochFailed(
+            seq=s, ts=_now(), phase_id=phase_id, epoch_id=outcome.epoch_id,
+            failed_tasks=failed_ids,
+        )
+    )
+    phase_checks = phase_ctx.info.check_results if phase_ctx is not None else []
+    info = _build_failed_epoch_info(
+        outcome, run_dir, phase_check_results=phase_checks,
+        disposed_count=disposed, cap=cap,
+    )
+    if disposed >= cap:
+        reason = (
+            f"failed-epoch cap reached: {disposed}/{cap} epochs failed in phase "
+            f"{phase_id}; halting to a human (the gate/environment is likely the "
+            f"problem, not the code)"
+        )
+        journal.emit(
+            lambda s: FailedEpochHandled(
+                seq=s, ts=_now(), phase_id=phase_id, epoch_id=outcome.epoch_id,
+                action="cap_halt", detail=reason,
+            )
+        )
+        store.update(phase_failed_epochs=disposed, pending_failed_epoch=None)
+        return _escalate(journal, store, reason)
+    store.update(
+        phase_failed_epochs=disposed,
+        pending_failed_epoch={
+            "decision": decision.model_dump(mode="json"),
+            "epoch_id": info.epoch_id,
+            "failed_tasks": info.failed_tasks,
+            "passing_handoffs": info.passing_handoffs,
+        },
+    )
+    return None
+
+
+def _pending_failed_epoch_info(
+    store: _RunStateStore, phase_ctx: _PhaseContext | None
+) -> FailedEpochInfo | None:
+    """Rebuild the pending failed-epoch context from run state (resume-safe).
+
+    The originating decision + the failed-task / passing-handoff snapshot are
+    durable in run state; the failing-check labels (with the latest captured
+    output, Part A) are refreshed from THIS pass's phase evaluation so the planner
+    always sees the current gate output. ``None`` when nothing is pending."""
+
+    pending = store.state.pending_failed_epoch
+    if pending is None:
+        return None
+    failed_checks = (
+        [label for label, ok in phase_ctx.info.check_results if not ok]
+        if phase_ctx is not None
+        else []
+    )
+    return FailedEpochInfo(
+        epoch_id=str(pending["epoch_id"]),
+        failed_tasks=[(t[0], t[1]) for t in pending["failed_tasks"]],
+        failed_checks=failed_checks,
+        passing_handoffs=[(h[0], h[1]) for h in pending["passing_handoffs"]],
+        disposed_count=store.state.phase_failed_epochs,
+        cap=store.state.phase_failed_epochs,  # display only; cap re-applied on action
+    )
+
+
+def _apply_failed_epoch_decision(
+    journal: JournalWriter,
+    run_dir: RunDir,
+    store: _RunStateStore,
+    decision: HandleFailedEpochDecision,
+    repo: Path | None,
+    ladder: Ladder,
+    concurrency: int | None,
+    tier0_attempts: int,
+    prepare: PrepareConfig | None,
+    cap: int,
+) -> tuple[RunOutcome | None, EpochOutcome | None]:
+    """Dispatch a handle_failed_epoch decision; clear the pending failure.
+
+    ``halt`` is terminal (escalation). ``retry`` / ``escalate_senior`` re-dispatch
+    the SAME originating epoch decision, retry optionally bumping the starting tier
+    + threading the planner's hint to the workers, escalate_senior forcing senior.
+    Returns ``(RunOutcome, None)`` on a terminal branch, else ``(None, outcome)``
+    with the re-dispatched epoch's outcome for the caller to chain.
+    """
+
+    pending = store.state.pending_failed_epoch
+    assert pending is not None, "handle_failed_epoch without a pending failed epoch"
+    phase_id = store.state.current_phase_id or "P1"
+    epoch_id = str(pending["epoch_id"])
+    args = decision.args
+
+    if isinstance(args, HaltFailedEpochArgs):
+        journal.emit(
+            lambda s: FailedEpochHandled(
+                seq=s, ts=_now(), phase_id=phase_id, epoch_id=epoch_id,
+                action="halt", detail=args.reason,
+            )
+        )
+        store.update(pending_failed_epoch=None)
+        return _escalate(journal, store, f"planner halted failed epoch: {args.reason}"), None
+
+    if isinstance(args, RetryFailedEpochArgs):
+        action, detail = "retry", args.hint
+        epoch_hint = args.hint
+        force_senior = args.escalate_tier
+    else:  # EscalateSeniorFailedEpochArgs
+        action, detail = "escalate_senior", args.diagnosis
+        epoch_hint = f"senior diagnosis: {args.diagnosis}"
+        force_senior = True
+
+    journal.emit(
+        lambda s: FailedEpochHandled(
+            seq=s, ts=_now(), phase_id=phase_id, epoch_id=epoch_id,
+            action=action, detail=detail,
+        )
+    )
+    store.update(pending_failed_epoch=None)
+    # The originating decision is always an epoch tool (implement / research /
+    # review / artifact); it is what produced the failed epoch we re-dispatch.
+    epoch_decision = parse_decision(pending["decision"])
+    if epoch_decision.tool == "implement" and repo is None:
+        return _escalate(journal, store, "implement epoch requested but no repo configured"), None
+    outcome = _dispatch_epoch(
+        journal, run_dir, store, epoch_decision, repo, ladder, concurrency,
+        tier0_attempts, prepare, epoch_hint=epoch_hint, force_senior=force_senior,
+    )
+    if outcome.status == "integration_conflict":
+        return _escalate(
+            journal, store, f"integration conflict in {outcome.epoch_id} (structural bug)"
+        ), None
+    # A re-dispatched epoch can itself fail; re-open the disposition (counter keeps
+    # climbing toward the cap, so a retry-loop terminates deterministically).
+    result = _maybe_open_failed_epoch(
+        journal, store, run_dir, epoch_decision, outcome, None, cap
+    )
+    return result, outcome
+
+
 # --- B5 final polish: gated, optional, never-fails post-completion pass ---------
 
 
@@ -814,6 +1164,7 @@ def _final_polish(
     evidence: Sequence[Check],
     final_polish: FinalPolish | None,
     vision_reviewer: VisionReviewer | None,
+    prepare: PrepareConfig | None,
 ) -> None:
     """Optionally let codex polish the finished repo inline, model proposes, the
     state machine disposes. Runs only when configured AND a repo + final branch
@@ -834,7 +1185,8 @@ def _final_polish(
         return
     try:
         _run_final_polish(
-            journal, store, run_dir, repo, branch, evidence, final_polish, vision_reviewer
+            journal, store, run_dir, repo, branch, evidence, final_polish,
+            vision_reviewer, prepare,
         )
     except Exception as exc:  # broad: polish must never fail a completed run
         journal.emit(
@@ -867,6 +1219,7 @@ def _run_final_polish(
     evidence: Sequence[Check],
     final_polish: FinalPolish,
     vision_reviewer: VisionReviewer | None,
+    prepare: PrepareConfig | None,
 ) -> None:
     """The polish body (caller guards every failure into a no-op).
 
@@ -882,6 +1235,10 @@ def _run_final_polish(
     base_commit = wt.resolve_commit(repo, branch)  # pre-polish tip (for the diff)
     worktree = run_dir.root / "worktrees" / "_polish"
     wt.add_worktree_detached(repo, worktree, ref=branch)
+    # Restore declared deps so codex can run build commands while polishing (and so
+    # they are present for the evidence re-check below). A prepare failure here is
+    # caught by the caller's broad guard -> the polish pass is a clean no-op.
+    materialize_env(repo, worktree, prepare)
     try:
         ok = final_polish.polisher.polish(
             worktree=worktree,
@@ -906,6 +1263,7 @@ def _run_final_polish(
             final_branch=polish_commit,
             run_dir=run_dir,
             vision_reviewer=vision_reviewer,
+            prepare=prepare,
         )
         if failures:
             journal.emit(
@@ -997,10 +1355,17 @@ def _drive(
     passed_phases: set[str],
     vision_reviewer: VisionReviewer | None,
     final_polish: FinalPolish | None,
+    prepare: PrepareConfig | None,
+    max_failed_epochs_per_phase: int,
+    local_max_task_files: int = DEFAULT_LOCAL_MAX_TASK_FILES,
+    senior_max_task_files: int = DEFAULT_SENIOR_MAX_TASK_FILES,
 ) -> RunOutcome:
     last_epoch_rows = (
         flatten_last_epoch(run_dir, last_epoch) if last_epoch is not None else None
     )
+    # A ``senior`` tier in the ladder means a visual implement epoch starts on
+    # senior, so the size gate applies the senior file-count bound to it.
+    has_senior = any(name == "senior" for name, _ in ladder)
     while True:
         if max_epochs is not None and store.state.epoch_counter >= max_epochs:
             return _fail_valve(journal, store, f"safety valve: {max_epochs} epochs reached")
@@ -1018,10 +1383,17 @@ def _drive(
                 passed_phases,
                 started_phases,
                 vision_reviewer,
+                prepare,
             )
             if store.state.skeleton is not None
             else None
         )
+
+        # A FAILED epoch awaiting a focused disposition (Part B): rebuild its
+        # context (refreshing the phase-check output from this pass, Part A) and
+        # constrain the next decision to handle_failed_epoch. Resume-safe: the
+        # originating decision + raw context live in run state.
+        failed_epoch_info = _pending_failed_epoch_info(store, phase_ctx)
 
         boundary = _plan_boundary(
             journal,
@@ -1035,6 +1407,11 @@ def _drive(
             phase_ctx,
             frozenset(passed_phases),
             vision_reviewer,
+            prepare,
+            failed_epoch_info,
+            has_senior,
+            local_max_task_files,
+            senior_max_task_files,
         )
         if boundary.kind == "escalate":
             return _escalate(journal, store, boundary.reason or "planner escalated")
@@ -1050,12 +1427,23 @@ def _drive(
         if isinstance(decision, RevisePhasesDecision):
             _apply_revise(journal, store, decision, passed_phases, started_phases)
             continue
+        if isinstance(decision, HandleFailedEpochDecision):
+            result, outcome = _apply_failed_epoch_decision(
+                journal, run_dir, store, decision, repo, ladder, concurrency,
+                tier0_attempts, prepare, max_failed_epochs_per_phase,
+            )
+            if result is not None:
+                return result
+            assert outcome is not None
+            last_epoch = outcome
+            last_epoch_rows = flatten_last_epoch(run_dir, outcome)
+            continue
         if isinstance(decision, EscalateRunDecision):
             return _escalate(journal, store, decision.args.reason)
         if isinstance(decision, CompleteRunDecision):
             _final_polish(
                 journal, store, run_dir, repo, decision.args.evidence,
-                final_polish, vision_reviewer,
+                final_polish, vision_reviewer, prepare,
             )
             return _complete(journal, store, decision.args.summary)
 
@@ -1063,12 +1451,19 @@ def _drive(
         if decision.tool == "implement" and repo is None:
             return _escalate(journal, store, "implement epoch requested but no repo configured")
         outcome = _dispatch_epoch(
-            journal, run_dir, store, decision, repo, ladder, concurrency, tier0_attempts
+            journal, run_dir, store, decision, repo, ladder, concurrency,
+            tier0_attempts, prepare,
         )
         if outcome.status == "integration_conflict":
             return _escalate(
                 journal, store, f"integration conflict in {outcome.epoch_id} (structural bug)"
             )
+        result = _maybe_open_failed_epoch(
+            journal, store, run_dir, decision, outcome, phase_ctx,
+            max_failed_epochs_per_phase,
+        )
+        if result is not None:
+            return result
         last_epoch = outcome
         last_epoch_rows = flatten_last_epoch(run_dir, outcome)
 
@@ -1091,6 +1486,10 @@ def run_grind(
     tier0_attempts: int = TIER0_ATTEMPTS,
     vision_reviewer: VisionReviewer | None = None,
     final_polish: FinalPolish | None = None,
+    prepare: PrepareConfig | None = None,
+    max_failed_epochs_per_phase: int = DEFAULT_MAX_FAILED_EPOCHS_PER_PHASE,
+    local_max_task_files: int = DEFAULT_LOCAL_MAX_TASK_FILES,
+    senior_max_task_files: int = DEFAULT_SENIOR_MAX_TASK_FILES,
 ) -> RunOutcome:
     """Run a job end-to-end: planner ⇄ core until completion or escalation.
 
@@ -1153,6 +1552,10 @@ def run_grind(
             passed_phases=set(),
             vision_reviewer=vision_reviewer,
             final_polish=final_polish,
+            prepare=prepare,
+            max_failed_epochs_per_phase=max_failed_epochs_per_phase,
+            local_max_task_files=local_max_task_files,
+            senior_max_task_files=senior_max_task_files,
         )
     # Events are fully flushed (writer closed): render the post-mortem journal.
     write_journal(run_dir)
@@ -1172,6 +1575,10 @@ def resume_grind(
     tier0_attempts: int = TIER0_ATTEMPTS,
     vision_reviewer: VisionReviewer | None = None,
     final_polish: FinalPolish | None = None,
+    prepare: PrepareConfig | None = None,
+    max_failed_epochs_per_phase: int = DEFAULT_MAX_FAILED_EPOCHS_PER_PHASE,
+    local_max_task_files: int = DEFAULT_LOCAL_MAX_TASK_FILES,
+    senior_max_task_files: int = DEFAULT_SENIOR_MAX_TASK_FILES,
 ) -> RunOutcome:
     """Re-enter a killed run from ``run_state.json`` + the journal (ruling 6).
 
@@ -1221,6 +1628,7 @@ def resume_grind(
                 repo=repo,
                 concurrency=concurrency,
                 tier0_attempts=tier0_attempts,
+                prepare=prepare,
             )
             _record_epoch(store, outcome)
             if outcome.status == "integration_conflict":
@@ -1248,6 +1656,10 @@ def resume_grind(
                 passed_phases=passed_phases,
                 vision_reviewer=vision_reviewer,
                 final_polish=final_polish,
+                prepare=prepare,
+                max_failed_epochs_per_phase=max_failed_epochs_per_phase,
+                local_max_task_files=local_max_task_files,
+                senior_max_task_files=senior_max_task_files,
             )
     # Events flushed (writer closed): refresh this run's post-mortem journal.
     write_journal(run_dir)

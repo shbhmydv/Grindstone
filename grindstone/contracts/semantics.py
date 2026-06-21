@@ -120,6 +120,57 @@ def _review_targets(tasks: list[ArtifactTask]) -> list[str]:
     return out
 
 
+#: Globs that own the WHOLE repo: a fresh implement task carrying one of these
+#: has not been decomposed at all (it claims everything), which defeats the
+#: localize-the-failure point of file_ownership. Mirrors the whole-repo set
+#: ``worktree.path_in_scope`` treats as matching every path, plus the bare
+#: top-level ``*``. A scoped wildcard (``src/*``, ``src/**``) is NOT unbounded.
+_UNBOUNDED_OWNERSHIP: frozenset[str] = frozenset({"**", "**/*", "*"})
+
+
+def implement_task_size_violations(
+    tasks: list[ImplementTask], *, max_files: int
+) -> list[str]:
+    """Deterministic per-task SIZE gate for a FRESH implement decomposition.
+
+    Two structural rejections, both derived from the decision alone (no
+    filesystem, no model trust), so the planner CANNOT emit an oversized task:
+
+    - **Too broad**: a task whose ``file_ownership`` carries more than
+      ``max_files`` globs is not a bounded slice; the planner is told to split it.
+      ``max_files`` is TIER-AWARE: the caller passes the bound for the epoch's
+      target tier (local default vs the larger senior default).
+    - **Unbounded**: a whole-repo glob (``**`` / ``**/*`` / a bare ``*``) means
+      "I did not decompose", it owns every path, so the merge-disjointness and
+      scope checks lose all meaning. Rejected outright for a normal implement
+      task. A scoped wildcard (``src/**``) is fine; only the whole-repo forms are.
+
+    This gate is scoped to FRESH decomposition by the CALLER (it is skipped while
+    a failed epoch is awaiting disposition): a ``handle_failed_epoch`` repair
+    re-dispatches the ORIGINATING decision directly and may legitimately need
+    broad scope, so it never re-enters this gate.
+    """
+
+    out: list[str] = []
+    for task in tasks:
+        unbounded = [g for g in task.file_ownership if g in _UNBOUNDED_OWNERSHIP]
+        if unbounded:
+            out.append(
+                f"implement task {task.id} claims whole-repo ownership "
+                f"({', '.join(repr(g) for g in unbounded)}): that is not a "
+                f"decomposed slice, split it into tasks that each own a bounded "
+                f"set of files"
+            )
+        elif len(task.file_ownership) > max_files:
+            out.append(
+                f"implement task {task.id} owns {len(task.file_ownership)} "
+                f"file_ownership globs (> {max_files} for its tier): the task is "
+                f"too big, split it into smaller tasks (or later epochs) so each "
+                f"owns at most {max_files}"
+            )
+    return out
+
+
 def epoch_decision_violations(
     decision: EpochDecision,
     *,

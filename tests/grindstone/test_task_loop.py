@@ -20,11 +20,12 @@ from grindstone.contracts.models import (
     ImplementTask,
     parse_handoff,
 )
+from grindstone.config import PrepareConfig
 from grindstone.epoch_loop import EpochOutcome, EpochState
 from grindstone.events import RunStarted, read_events, replay
 from grindstone.mock_worker import MockWorker
-from grindstone.rundir import RunDir
-from grindstone.worker import WorkerTransport
+from grindstone.rundir import RunDir, create_run_dir
+from grindstone.worker import WorkerRequest, WorkerTransport
 
 from grindstone.worker import PI_SETTINGS_RELPATH
 
@@ -33,9 +34,12 @@ from tests.grindstone.conftest import (
     OUT_FILE,
     HandoffWorker,
     artifact_epoch,
+    git,
     handoff_payload,
     implement_epoch,
+    init_git_repo,
     make_ok_worker,
+    make_toy_task,
     run_one_epoch,
     tracked_files,
 )
@@ -82,6 +86,52 @@ def test_first_attempt_success(git_repo: Path, run_dir: RunDir, toy_task: Implem
     assert handoff.status == "DONE"
     assert handoff.task_id == FQ
     assert _epoch_state(run_dir).tasks["T1"].status == "done"
+
+
+class _EnvSpyWorker:
+    """An ok worker that records whether its scratch carries the materialized
+    env_dir, so the worker-path materialization can be asserted."""
+
+    def __init__(self) -> None:
+        self.saw_env_dir = False
+
+    def run(self, request: WorkerRequest) -> None:
+        self.saw_env_dir = (request.scratch / "node_modules" / "marker").is_file()
+        (request.scratch / "review.md").write_text("reviewed\n", encoding="utf-8")
+        (request.scratch / OUT_FILE).write_text(OUT_CONTENT, encoding="utf-8")
+        (request.scratch / "handoff.json").write_text(
+            json.dumps(handoff_payload(FQ)), encoding="utf-8"
+        )
+
+
+def test_worker_worktree_gets_declared_deps_materialized(tmp_path: Path) -> None:
+    """The worker worktree is seeded with the declared (gitignored) deps before
+    the agent runs, so it does not burn turns on a fresh install and shares the
+    eval gate's cache. node_modules is gitignored so it never enters the commit."""
+
+    repo = init_git_repo(tmp_path / "repo")
+    (repo / ".gitignore").write_text(
+        ".grindstone/\n__pycache__/\nnode_modules/\n", encoding="utf-8"
+    )
+    (repo / "package-lock.json").write_text("v1", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "lockfile")
+    run = create_run_dir(repo, "run-worker-prep")
+
+    prepare = PrepareConfig(
+        cmd="mkdir -p node_modules && echo ok > node_modules/marker",
+        env_dirs=["node_modules"],
+        cache_key_files=["package-lock.json"],
+    )
+    spy = _EnvSpyWorker()
+    outcome = _run_impl(
+        repo, run, make_toy_task(), _ladder(spy), prepare=prepare
+    )
+    [task] = outcome.tasks
+    assert task.status == "done"
+    assert spy.saw_env_dir is True  # deps were present when the worker ran
+    # node_modules is gitignored -> the commit carries only the owned file.
+    assert "node_modules/marker" not in tracked_files(repo, outcome.integration.branch or "HEAD")
 
 
 def test_journal_replays_into_coherent_tree(

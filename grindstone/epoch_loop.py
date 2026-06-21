@@ -45,6 +45,7 @@ from typing import Literal, Sequence
 from pydantic import BaseModel, ConfigDict
 
 from grindstone import worktree as wt
+from grindstone.config import PrepareConfig
 from grindstone.contracts.models import (
     ArtifactEpochArgs,
     ImplementEpochArgs,
@@ -280,6 +281,8 @@ def _fan_out(
     concurrency: int,
     tier0_attempts: int,
     visual: bool,
+    prepare: PrepareConfig | None,
+    epoch_hint: str | None = None,
 ) -> dict[str, TaskOutcome]:
     """Run ``to_run`` tasks concurrently; return outcomes keyed by short task id."""
 
@@ -301,6 +304,8 @@ def _fan_out(
             tier0_attempts=tier0_attempts,
             resume_cursor=resume_cursors.get(task.id),
             visual=visual,
+            prepare=prepare,
+            epoch_hint=epoch_hint,
         )
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
@@ -451,6 +456,9 @@ def run_epoch(
     base: str | None = None,
     concurrency: int | None = None,
     tier0_attempts: int = TIER0_ATTEMPTS,
+    prepare: PrepareConfig | None = None,
+    epoch_hint: str | None = None,
+    force_senior: bool = False,
 ) -> EpochOutcome:
     """Run ONE epoch (fresh start) to a terminal EpochOutcome.
 
@@ -458,6 +466,11 @@ def run_epoch(
     ``epoch_started`` … ``epoch_completed``). Implement epochs require ``repo``;
     ``base`` is the epoch base commit (the chain tip, ruling 4), defaulted to
     repo HEAD when omitted. Artifact epochs need no repo and integrate nothing.
+
+    ``epoch_hint`` (a planner handle_failed_epoch ``retry`` corrective) is seeded
+    into every task's failure context so the workers see it on their first
+    attempt; ``force_senior`` starts every task on the senior tier (the planner's
+    tier bump / escalate_senior disposition), reusing the visual routing seam.
     """
 
     if not ladder:
@@ -513,7 +526,9 @@ def run_epoch(
         base=base,
         concurrency=_resolve_concurrency(concurrency, len(tasks)),
         tier0_attempts=tier0_attempts,
-        visual=args.visual,
+        visual=args.visual or force_senior,
+        prepare=prepare,
+        epoch_hint=epoch_hint,
     )
     if not epoch_done_predicate(store.state):
         raise RuntimeError("epoch loop ended before the done-predicate held")
@@ -539,6 +554,7 @@ def resume_epoch(
     repo: Path | None = None,
     concurrency: int | None = None,
     tier0_attempts: int = TIER0_ATTEMPTS,
+    prepare: PrepareConfig | None = None,
 ) -> EpochOutcome:
     """Re-enter a killed epoch from ``state.json`` against a caller-owned journal.
 
@@ -589,6 +605,7 @@ def resume_epoch(
         concurrency=_resolve_concurrency(concurrency, max(1, len(to_run))),
         tier0_attempts=tier0_attempts,
         visual=args.visual,
+        prepare=prepare,
     )
     outcomes.update(live)
     if not epoch_done_predicate(store.state):

@@ -10,9 +10,10 @@ from grindstone.contracts import (
     canonical_bytes,
     epoch_decision_violations,
     handoff_violations,
+    implement_task_size_violations,
     parse_decision,
 )
-from grindstone.contracts.models import Handoff
+from grindstone.contracts.models import Handoff, ImplementTask
 
 from tests.grindstone.conftest import phase_dict, revise_decision, skeleton_decision
 
@@ -80,6 +81,47 @@ def test_duplicate_phase_ids_rejected() -> None:
     # Unique phase ids pass clean.
     ok = parse_decision(skeleton_decision(phase_dict("P1"), phase_dict("P2")))
     assert epoch_decision_violations(ok, existing_log_keys=EMPTY, completed_phase_ids=EMPTY) == []
+
+
+# --- size gate (Part 4B): deterministic per-task ownership bound ---------------
+
+
+def _itask(tid: str, *globs: str) -> ImplementTask:
+    return ImplementTask.model_validate(
+        {
+            "id": tid,
+            "goal": "x",
+            "done_when": [{"cmd": "true"}],
+            "file_ownership": list(globs),
+        }
+    )
+
+
+def test_size_gate_rejects_too_many_ownership_globs() -> None:
+    # Six globs over a local bound of five: the task is not a bounded slice.
+    big = _itask("T1", "a.py", "b.py", "c.py", "d.py", "e.py", "f.py")
+    bad = implement_task_size_violations([big], max_files=5)
+    assert any("T1" in v and "too big" in v for v in bad)
+    # At the bound it passes; the bound is inclusive.
+    ok = _itask("T1", "a.py", "b.py", "c.py", "d.py", "e.py")
+    assert implement_task_size_violations([ok], max_files=5) == []
+
+
+def test_size_gate_rejects_whole_repo_ownership() -> None:
+    for glob in ("**", "**/*", "*"):
+        bad = implement_task_size_violations([_itask("T1", glob)], max_files=5)
+        assert any("T1" in v and "whole-repo" in v for v in bad), glob
+    # A SCOPED wildcard is decomposed, not whole-repo: it passes.
+    assert implement_task_size_violations([_itask("T1", "src/*")], max_files=5) == []
+    assert implement_task_size_violations([_itask("T1", "src/**")], max_files=5) == []
+
+
+def test_size_gate_bound_is_tier_aware() -> None:
+    six = _itask("T1", "a.py", "b.py", "c.py", "d.py", "e.py", "f.py")
+    # Rejected at the local bound (5)...
+    assert implement_task_size_violations([six], max_files=5) != []
+    # ...accepted at a larger senior bound (12).
+    assert implement_task_size_violations([six], max_files=12) == []
 
 
 def test_review_requires_targets() -> None:

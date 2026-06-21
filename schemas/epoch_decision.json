@@ -15,6 +15,7 @@
         "review",
         "artifact",
         "revise_phases",
+        "handle_failed_epoch",
         "escalate_run",
         "complete_run"
       ]
@@ -37,6 +38,10 @@
     {
       "if": { "properties": { "tool": { "const": "revise_phases" } } },
       "then": { "properties": { "args": { "$ref": "#/$defs/revise_phases_args" } } }
+    },
+    {
+      "if": { "properties": { "tool": { "const": "handle_failed_epoch" } } },
+      "then": { "properties": { "args": { "$ref": "#/$defs/handle_failed_epoch_args" } } }
     },
     {
       "if": { "properties": { "tool": { "const": "escalate_run" } } },
@@ -226,6 +231,38 @@
           "maxItems": 10
         }
       }
+    },
+    "handle_failed_epoch_args": {
+      "type": "object",
+      "description": "A FOCUSED disposition of an epoch that FAILED (a task exhausted its retry ladder, and/or the phase gate kept failing). Exactly one action: retry the epoch (optionally with a corrective hint / escalated tier), escalate it to the senior tier with a diagnosis, or halt the run for a human when the epoch is not satisfiable as specified. This is NOT revise_phases (the phase STRUCTURE is fine) and NOT a fresh work epoch.",
+      "required": ["action"],
+      "oneOf": [
+        {
+          "required": ["action", "hint"],
+          "additionalProperties": false,
+          "properties": {
+            "action": { "const": "retry" },
+            "hint": { "type": "string", "minLength": 1, "maxLength": 2048, "description": "Corrective guidance fed to the retried epoch's workers (e.g. the missing step, the misread requirement)." },
+            "escalate_tier": { "type": "boolean", "default": false, "description": "Start the retried epoch on the senior tier instead of the mode default." }
+          }
+        },
+        {
+          "required": ["action", "diagnosis"],
+          "additionalProperties": false,
+          "properties": {
+            "action": { "const": "escalate_senior" },
+            "diagnosis": { "type": "string", "minLength": 1, "maxLength": 2048, "description": "Why the local rig could not satisfy the epoch; handed to the senior tier." }
+          }
+        },
+        {
+          "required": ["action", "reason"],
+          "additionalProperties": false,
+          "properties": {
+            "action": { "const": "halt" },
+            "reason": { "type": "string", "minLength": 1, "maxLength": 2048, "description": "Why the epoch is not satisfiable as specified (e.g. the gate/environment is suspect, not the code). Stops the run for human attention." }
+          }
+        }
+      ]
     },
     "escalate_run_args": {
       "type": "object",
