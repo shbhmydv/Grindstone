@@ -19,6 +19,7 @@ from grindstone.config import (
     MODELS_DIR,
     GrindstoneConfig,
     load_config,
+    models_script,
     validate_script_paths,
 )
 
@@ -228,13 +229,111 @@ def test_final_polish_non_positive_timeout_is_rejected(tmp_path: Path) -> None:
 
 
 def _bundled_roles() -> str:
-    planner = MODELS_DIR / "planner_request.sh"
-    local = MODELS_DIR / "local_request.sh"
+    planner = MODELS_DIR / "default" / "planner_request.sh"
+    local = MODELS_DIR / "default" / "local_request.sh"
     return (
         "roles:\n"
         f"  planner: {{script: {planner}, slots: 1, timeout_s: 600}}\n"
         f"  local: {{script: {local}, slots: 2, timeout_s: 1800}}\n"
     )
+
+
+def test_rce_guard_accepts_every_rig_subdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The move to default/ + codex/ + override/ subdirs keeps every script UNDER
+    # MODELS_DIR, so the RCE guard accepts all three layers unchanged.
+    monkeypatch.delenv(ALLOW_REPO_SCRIPTS_ENV, raising=False)
+    planner = MODELS_DIR / "codex" / "planner_request.sh"
+    local = MODELS_DIR / "override" / "local_request.sh"
+    senior = MODELS_DIR / "default" / "senior_request.sh"
+    _write(
+        tmp_path,
+        "roles:\n"
+        f"  planner: {{script: {planner}, slots: 1, timeout_s: 600}}\n"
+        f"  local: {{script: {local}, slots: 2, timeout_s: 1800}}\n"
+        f"  senior: {{script: {senior}, slots: 2, timeout_s: 3600}}\n",
+    )
+    cfg = load_config(tmp_path)
+    assert cfg is not None
+    validate_script_paths(cfg)  # default/ + codex/ + override/ -> no raise
+
+
+# --- models_script resolver: override > preset > default ------------------------
+
+
+def _fake_models(root: Path, *, default: tuple[str, ...], codex: tuple[str, ...] = (),
+                 override: tuple[str, ...] = ()) -> None:
+    """Build a fake models/ tree under ``root`` with the named scripts per rig."""
+
+    for sub, names in (("default", default), ("codex", codex), ("override", override)):
+        (root / sub).mkdir(parents=True, exist_ok=True)
+        for name in names:
+            (root / sub / name).write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+
+
+def test_models_script_falls_back_to_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("grindstone.config.MODELS_DIR", tmp_path)
+    _fake_models(tmp_path, default=("planner_request.sh",))
+    resolved = models_script("planner_request.sh")
+    assert resolved == (tmp_path / "default" / "planner_request.sh").resolve()
+    assert resolved.is_absolute()
+
+
+def test_models_script_override_beats_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("grindstone.config.MODELS_DIR", tmp_path)
+    _fake_models(tmp_path, default=("local_request.sh",), override=("local_request.sh",))
+    assert models_script("local_request.sh") == (
+        tmp_path / "override" / "local_request.sh"
+    ).resolve()
+
+
+def test_models_script_rig_inserts_middle_layer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("grindstone.config.MODELS_DIR", tmp_path)
+    _fake_models(
+        tmp_path,
+        default=("planner_request.sh",),
+        codex=("planner_request.sh",),
+    )
+    # rig=codex wins over default...
+    assert models_script("planner_request.sh", rig="codex") == (
+        tmp_path / "codex" / "planner_request.sh"
+    ).resolve()
+    # ...but rig=None ignores the codex layer entirely.
+    assert models_script("planner_request.sh") == (
+        tmp_path / "default" / "planner_request.sh"
+    ).resolve()
+
+
+def test_models_script_override_beats_rig(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("grindstone.config.MODELS_DIR", tmp_path)
+    _fake_models(
+        tmp_path,
+        default=("planner_request.sh",),
+        codex=("planner_request.sh",),
+        override=("planner_request.sh",),
+    )
+    assert models_script("planner_request.sh", rig="codex") == (
+        tmp_path / "override" / "planner_request.sh"
+    ).resolve()
+
+
+def test_models_script_missing_everywhere_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("grindstone.config.MODELS_DIR", tmp_path)
+    _fake_models(tmp_path, default=("planner_request.sh",))
+    with pytest.raises(FileNotFoundError) as exc:
+        models_script("vision_review.sh")
+    assert "vision_review.sh" in str(exc.value)
 
 
 def test_role_script_outside_models_is_rejected(

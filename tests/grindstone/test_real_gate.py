@@ -84,7 +84,8 @@ def test_real_pi_three_task_epoch(tmp_path: Path) -> None:
     run_dir = create_run_dir(repo, "real-gate")
     tasks = [_task(*spec) for spec in _SPEC]
     worker = ScriptWorker(
-        script=_MODELS_DIR / "local_request.sh",
+        script=_MODELS_DIR / "override" / "local_request.sh",
+        stop_script=_MODELS_DIR / "default" / "stop.sh",
         slots=2,
         timeout_s=1800.0,
         log_root=run_dir.root / "worker_logs",

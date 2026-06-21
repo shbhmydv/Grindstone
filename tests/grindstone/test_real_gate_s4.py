@@ -105,10 +105,13 @@ def test_gate_s4_full_job_real_codex_and_pi(tmp_path: Path) -> None:
 
     run_dir = create_run_dir(repo, "s4-gate")
     planner = ScriptPlanner(
-        script=_MODELS_DIR / "planner_request.sh", repo=repo, slots=1, timeout_s=600.0
+        script=_MODELS_DIR / "codex" / "planner_request.sh",
+        stop_script=_MODELS_DIR / "default" / "stop.sh",
+        repo=repo, slots=1, timeout_s=600.0
     )
     worker = ScriptWorker(
-        script=_MODELS_DIR / "local_request.sh",
+        script=_MODELS_DIR / "override" / "local_request.sh",
+        stop_script=_MODELS_DIR / "default" / "stop.sh",
         slots=2,
         timeout_s=1800.0,
         log_root=run_dir.root / "worker_logs",

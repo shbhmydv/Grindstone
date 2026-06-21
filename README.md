@@ -34,8 +34,11 @@ Grindstone checks the work directly, and the rest of the design follows from tha
   repo's spine; a worker sees the neighborhood of the files its task touches.
   Small repos are skipped, and a map that fails to build never fails the run.
 - **Swappable models.** There are three roles: `planner`, `local`, and `senior`.
-  Each is a `models/*.sh` script behind a file contract, so you can put GPT-5.5
-  where Claude was, or Qwen where Llama was, and the orchestrator stays the same.
+  Each is a `models/` script behind a file contract. The shipped default rig
+  (`models/default/`) drives Claude (Opus) for every role, so a fresh clone runs
+  with zero setup; a bundled `codex` planner is opt in (`init --rig codex`), and
+  your own scripts go in `models/override/` (gitignored). Swap any role without
+  touching the orchestrator.
 - **Resumable.** Every state change is an fsync'd line in an append-only
   `events.ndjson` journal. If a run dies mid-epoch, `resume` picks it back up, and
   the journal repairs a crash-torn tail when it loads.
@@ -150,37 +153,41 @@ log at `P*/E*/T*/…`, and a post-mortem `journal.md`.
 ## Compatibility
 
 Grindstone is the orchestrator; you choose the models behind each role. The
-reference adapters in `models/*.sh` wire up one working stack, but you can point
-them at anything that speaks the file contract.
+shipped default rig (`models/default/`) drives Claude (Opus) through the
+`claude -p` CLI for every role, so a fresh clone with Claude Code installed runs
+with zero setup. You can point any role at anything that speaks the file contract.
 
-| Layer            | Reference (what the adapters ship with)            | Swappable with                                  |
+| Layer            | Default rig (`models/default/`)                    | Swappable with                                  |
 | ---------------- | -------------------------------------------------- | ----------------------------------------------- |
 | **Runtime**      | Python ≥ 3.10 · Linux & macOS                      | n/a                                             |
-| **Planner role** | `codex` CLI (GPT-5.5, a ChatGPT/OpenAI plan)       | any CLI that emits the decision JSON contract   |
-| **Local role**   | Qwen via `llama-server`, driven by the `pi` CLI    | any local/remote LLM server                     |
-| **Senior role**  | `opencode` (kimi) with web search (*optional*)     | any cloud tier; delete the block for local-only |
-| **Vision/taste** | Qwen 3.6 (native VL, `--mmproj`) + `codex` judge   | any vision model behind the screenshot contract |
+| **Planner role** | Claude (Opus) via `claude -p`, read-only           | any CLI that emits the decision JSON contract   |
+| **Local role**   | Claude (Opus) via `claude -p` in the worktree      | any local/remote LLM server                     |
+| **Senior role**  | Claude (Opus) via `claude -p`, web search on       | any cloud tier; delete the block for local-only |
+| **Vision/taste** | a `vision_review.sh` adapter (rig-supplied)        | any vision model behind the screenshot contract |
 | **Target repo**  | any `git` repository                               | n/a                                             |
 
-macOS note: the role scripts use GNU `timeout` as a wall-clock backstop and fall
-back to `gtimeout`, so install it with `brew install coreutils`.
+A bundled `codex exec` planner ships at `models/codex/`; opt in with
+`grindstone init --rig codex`. macOS note: the role scripts use GNU `timeout` as a
+wall-clock backstop and fall back to `gtimeout`, so install it with
+`brew install coreutils`.
 
 ### Bring your own models
 
-The planner adapter runs whatever your `codex`/ChatGPT plan serves, and the senior
-tier is optional, so for most rigs the only real blank is your local model. You can
-swap the model identities without touching code:
+The default rig uses one model id (`opus`) for every role; swap it without touching
+code via env vars the scripts read:
 
-| Env var                     | Default                 | What it sets                                          |
-| --------------------------- | ----------------------- | ---------------------------------------------------- |
-| `GRINDSTONE_LOCAL_PROVIDER` | `local-reviewer`        | the `pi --provider` your agent routes to your endpoint |
-| `GRINDSTONE_LOCAL_MODEL`    | `qwen-3-6-27b-dense`    | the local `pi --model`                               |
-| `GRINDSTONE_SENIOR_MODEL`   | `opencode-go/kimi-k2.6` | any `opencode -m` target                             |
+| Env var                     | Default | What it sets                                |
+| --------------------------- | ------- | ------------------------------------------- |
+| `GRINDSTONE_PLANNER_MODEL`  | `opus`  | the planner's `claude --model`              |
+| `GRINDSTONE_LOCAL_MODEL`    | `opus`  | the local worker's `claude --model`         |
+| `GRINDSTONE_SENIOR_MODEL`   | `opus`  | the senior worker's `claude --model`        |
 
-For anything deeper, such as a different transport than `pi`/`opencode`/`codex`,
-extra flags, or your own endpoint, edit the relevant `models/*.sh` adapter. Each
-one is the whole boundary between Grindstone and a model, and the working reference
-is the clearest spec of the `handoff.json` contract your replacement has to honor.
+For anything deeper, such as a different transport (your own local server, a
+different cloud CLI), extra flags, or your own endpoint, drop a replacement script
+into `models/override/` (gitignored, highest priority) or edit the relevant
+`models/default/` adapter. Each one is the whole boundary between Grindstone and a
+model, and the working reference is the clearest spec of the `handoff.json`
+contract your replacement has to honor.
 `grindstone init` scaffolds `.grindstone/config.yaml` with the scripts referenced
 by absolute path, plus editable `slots` (per-role concurrency) and `timeout_s`.
 

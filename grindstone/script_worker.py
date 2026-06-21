@@ -36,30 +36,29 @@ class ScriptWorker:
     """``WorkerTransport`` backed by a role-request script behind a file contract.
 
     ``script`` is the absolute path to ``local_request.sh`` / ``senior_request.sh``;
-    ``stop.sh`` is resolved as its sibling. ``slots`` bounds concurrency,
-    ``timeout_s`` is the transport-owned wall-clock supervisor (NOT loop policy,
-    §10), ``log_root`` is where per-attempt log dirs + handle files are allocated
-    (never the run dir, §7). No provider/model: those moved into the script.
+    ``stop_script`` is the explicit ``stop.sh`` path used to reap the group on
+    timeout (resolved by the CLI via ``models_script``, NOT assumed beside the role
+    script: a role can resolve from a preset/override dir that ships no ``stop.sh``).
+    ``slots`` bounds concurrency, ``timeout_s`` is the transport-owned wall-clock
+    supervisor (NOT loop policy, §10), ``log_root`` is where per-attempt log dirs +
+    handle files are allocated (never the run dir, §7). No provider/model: those
+    moved into the script.
     """
 
     def __init__(
         self,
         *,
         script: Path,
+        stop_script: Path,
         slots: int,
         timeout_s: float,
         log_root: Path,
     ) -> None:
         self.script = Path(script)
+        self._stop_script = Path(stop_script)
         self.timeout_s = timeout_s
         self.log_root = Path(log_root)
         self._sem = threading.Semaphore(slots)
-
-    @property
-    def _stop_script(self) -> Path:
-        """``stop.sh`` sits beside the role script (same ``models/`` dir)."""
-
-        return self.script.parent / "stop.sh"
 
     def run(self, request: WorkerRequest) -> None:
         with self._sem:

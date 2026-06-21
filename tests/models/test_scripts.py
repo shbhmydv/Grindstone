@@ -1,8 +1,16 @@
 """Bash-level tests for the ``models/`` boundary scripts.
 
-These drive the entry scripts as real subprocesses with a STUB ``pi``/``codex``
-prepended onto PATH, so no live model, GPU, or codex/pi binary is ever touched.
-The scripts are the checked artifact of this slice; these tests are the gate.
+These drive the entry scripts as real subprocesses with a STUB
+``pi``/``codex``/``opencode``/``claude`` prepended onto PATH, so no live model,
+GPU, or model binary is ever touched. The scripts are the checked artifact of this
+slice; these tests are the gate.
+
+Layout after the rig split: the shipped Claude rig lives in ``models/default/``
+(tracked), the codex planner preset in ``models/codex/`` (tracked), and the
+operator's personal pi/opencode/codex scripts in ``models/override/`` (GITIGNORED).
+Tests for an override script ``skip`` when it is absent (a fresh clone has no
+override rig), so the suite stays green everywhere while still covering the
+operator's scripts on a rig that ships them.
 """
 
 from __future__ import annotations
@@ -13,13 +21,33 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 MODELS_DIR = Path(__file__).resolve().parents[2] / "models"
-LOCAL = MODELS_DIR / "local_request.sh"
-SENIOR = MODELS_DIR / "senior_request.sh"
-PLANNER = MODELS_DIR / "planner_request.sh"
-VISION = MODELS_DIR / "vision_review.sh"
-STOP = MODELS_DIR / "stop.sh"
+DEFAULT_DIR = MODELS_DIR / "default"
+CODEX_DIR = MODELS_DIR / "codex"
+OVERRIDE_DIR = MODELS_DIR / "override"
+
+# Operator's personal rig (gitignored): pi local, opencode senior, codex gates.
+LOCAL = OVERRIDE_DIR / "local_request.sh"
+SENIOR = OVERRIDE_DIR / "senior_request.sh"
+VISION = OVERRIDE_DIR / "vision_review.sh"
+POLISH = OVERRIDE_DIR / "codex_polish.sh"
+# Tracked presets: codex planner + generic helpers.
+PLANNER = CODEX_DIR / "planner_request.sh"
+STOP = DEFAULT_DIR / "stop.sh"
+# Shipped default Claude rig (tracked).
+DEFAULT_PLANNER = DEFAULT_DIR / "planner_request.sh"
+DEFAULT_LOCAL = DEFAULT_DIR / "local_request.sh"
+DEFAULT_SENIOR = DEFAULT_DIR / "senior_request.sh"
 SCHEMA = Path(__file__).resolve().parents[2] / "schemas" / "vision_verdict.json"
+
+
+def _require(script: Path) -> None:
+    """Skip when ``script`` is absent (the operator's models/override is gitignored,
+    so a fresh clone has no personal rig to exercise)."""
+    if not script.is_file():
+        pytest.skip(f"{script} not present (models/override is gitignored)")
 
 
 def _make_stub(dir_: Path, name: str, body: str) -> None:
@@ -39,6 +67,7 @@ def _env_with_stub_path(stub_dir: Path) -> dict[str, str]:
 
 
 def test_local_request_relays_handoff_and_writes_handle(tmp_path: Path) -> None:
+    _require(LOCAL)
     stub_dir = tmp_path / "bin"
     stub_dir.mkdir()
     # Stub pi writes handoff.json into its CWD (the worktree) and exits 0.
@@ -80,6 +109,7 @@ def test_local_request_relays_handoff_and_writes_handle(tmp_path: Path) -> None:
 
 
 def test_local_request_propagates_nonzero_exit(tmp_path: Path) -> None:
+    _require(LOCAL)
     stub_dir = tmp_path / "bin"
     stub_dir.mkdir()
     # Stub pi prints a rate-limit reason to stderr and exits non-zero.
@@ -112,6 +142,7 @@ def test_local_request_propagates_nonzero_exit(tmp_path: Path) -> None:
 
 
 def test_local_request_missing_arg_errors(tmp_path: Path) -> None:
+    _require(LOCAL)
     res = subprocess.run(
         ["bash", str(LOCAL), "--worktree", str(tmp_path)],
         capture_output=True,
@@ -122,6 +153,7 @@ def test_local_request_missing_arg_errors(tmp_path: Path) -> None:
 
 
 def test_local_request_pins_reviewer_subagent_to_local_model(tmp_path: Path) -> None:
+    _require(LOCAL)
     # The implement plan spawns a `reviewer` pi-subagent which does NOT inherit
     # our --provider/--model; it reads the nearest `.pi/settings.json` and treats
     # that dir as the project root. The script must pin the reviewer to the SAME
@@ -168,6 +200,7 @@ def test_local_request_pins_reviewer_subagent_to_local_model(tmp_path: Path) -> 
 
 
 def test_senior_request_relays_handoff_no_gpu(tmp_path: Path) -> None:
+    _require(SENIOR)
     stub_dir = tmp_path / "bin"
     stub_dir.mkdir()
     # Senior drives the opencode agent (not pi); it writes handoff.json in its CWD.
@@ -204,6 +237,7 @@ def test_senior_request_relays_handoff_no_gpu(tmp_path: Path) -> None:
 
 
 def test_senior_request_runs_opencode_with_exa_and_no_pin(tmp_path: Path) -> None:
+    _require(SENIOR)
     # Senior runs the opencode agent with the Exa websearch tool ON, pinned to the
     # cloud model, auto-approving tools. It writes NO .pi pin (opencode owns its own
     # agents), and the per-attempt OPENCODE_DB lives in the LOG dir, never the
@@ -242,7 +276,7 @@ def test_senior_request_runs_opencode_with_exa_and_no_pin(tmp_path: Path) -> Non
     assert res.returncode == 0, res.stderr
     rec = record.read_text(encoding="utf-8")
     assert "--dangerously-skip-permissions" in rec
-    assert "-m opencode-go/kimi-k2.6" in rec
+    assert "-m opencode-go/glm-5.2" in rec
     assert f"--dir {worktree}" in rec
     assert "EXA=true" in rec
     db_line = rec.split("DB=", 1)[1].splitlines()[0]
@@ -342,6 +376,7 @@ def _vision_inputs(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
 
 
 def test_vision_review_invokes_codex_with_image_schema_and_prompt_first(tmp_path: Path) -> None:
+    _require(VISION)
     # The taste gate calls codex with the screenshot via -i, the verdict schema
     # via --output-schema, and writes the verdict to -o. The PROMPT positional
     # MUST precede -i (codex exec ordering gotcha); the prompt carries the
@@ -401,6 +436,7 @@ def test_vision_review_invokes_codex_with_image_schema_and_prompt_first(tmp_path
 
 
 def test_vision_review_propagates_nonzero_exit(tmp_path: Path) -> None:
+    _require(VISION)
     stub_dir = tmp_path / "bin"
     stub_dir.mkdir()
     _make_stub(stub_dir, "codex", 'echo "model overloaded" >&2\nexit 4\n')
@@ -426,6 +462,7 @@ def test_vision_review_propagates_nonzero_exit(tmp_path: Path) -> None:
 
 
 def test_vision_review_rejects_non_image_screenshot(tmp_path: Path) -> None:
+    _require(VISION)
     # PNG/JPEG only, a non-image screenshot path is a hard error before codex.
     stub_dir = tmp_path / "bin"
     stub_dir.mkdir()
@@ -455,6 +492,7 @@ def test_vision_review_rejects_non_image_screenshot(tmp_path: Path) -> None:
 
 
 def test_vision_review_rejects_traversal_screenshot(tmp_path: Path) -> None:
+    _require(VISION)
     # Defense-in-depth at the script boundary: a `..` path segment (or an absolute
     # path) must be rejected (exit 2) BEFORE it is joined onto $repo, so a crafted
     # screenshot can never escape the repo. Mirrors the Python contract (Chunk 2).
@@ -485,6 +523,7 @@ def test_vision_review_rejects_traversal_screenshot(tmp_path: Path) -> None:
 
 
 def test_vision_review_missing_arg_errors(tmp_path: Path) -> None:
+    _require(VISION)
     res = subprocess.run(
         ["bash", str(VISION), "--repo", str(tmp_path)],
         capture_output=True,
@@ -494,9 +533,7 @@ def test_vision_review_missing_arg_errors(tmp_path: Path) -> None:
     assert "missing required" in res.stderr
 
 
-# --- codex_polish.sh ---------------------------------------------------------
-
-POLISH = MODELS_DIR / "codex_polish.sh"
+# --- codex_polish.sh (override) ----------------------------------------------
 
 
 def _polish_inputs(tmp_path: Path) -> tuple[Path, Path]:
@@ -512,6 +549,7 @@ def _polish_inputs(tmp_path: Path) -> tuple[Path, Path]:
 def test_polish_invokes_codex_workspace_write_with_prompt_and_criteria(
     tmp_path: Path,
 ) -> None:
+    _require(POLISH)
     # The polish pass runs codex in workspace-write against the worktree, with the
     # criteria woven into the prompt. No --output-schema / -o: codex edits files
     # in place (the gate is the evidence re-run, not a verdict file).
@@ -564,6 +602,7 @@ def test_polish_invokes_codex_workspace_write_with_prompt_and_criteria(
 
 
 def test_polish_passes_screenshot_after_prompt(tmp_path: Path) -> None:
+    _require(POLISH)
     # An optional screenshot is forwarded via -i, AFTER the prompt positional
     # (codex exec arg-ordering gotcha, mirrors vision_review.sh).
     stub_dir = tmp_path / "bin"
@@ -600,6 +639,7 @@ def test_polish_passes_screenshot_after_prompt(tmp_path: Path) -> None:
 
 
 def test_polish_propagates_nonzero_exit(tmp_path: Path) -> None:
+    _require(POLISH)
     stub_dir = tmp_path / "bin"
     stub_dir.mkdir()
     _make_stub(stub_dir, "codex", 'echo "model overloaded" >&2\nexit 4\n')
@@ -621,6 +661,7 @@ def test_polish_propagates_nonzero_exit(tmp_path: Path) -> None:
 
 
 def test_polish_missing_arg_errors(tmp_path: Path) -> None:
+    _require(POLISH)
     res = subprocess.run(
         ["bash", str(POLISH), "--repo", str(tmp_path)],
         capture_output=True,
@@ -683,3 +724,205 @@ def test_stop_is_noop_on_missing_handle(tmp_path: Path) -> None:
         text=True,
     )
     assert res.returncode == 0, res.stderr
+
+
+# --- default/ Claude rig (tracked: planner + local + senior) ------------------
+# These exercise the shipped default scripts with a STUB `claude` on PATH. They
+# run everywhere (the default rig is tracked, unlike models/override).
+
+
+def test_default_planner_captures_stdout_to_out_file(tmp_path: Path) -> None:
+    # The default planner runs `claude -p` read-only and the SCRIPT redirects
+    # claude's stdout to --out (the disk contract); grindstone parses --out, never
+    # stdout. The stub claude just prints the decision JSON.
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir()
+    _make_stub(stub_dir, "claude", 'printf \'{"tool":"emit_epoch"}\'\nexit 0\n')
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("plan an epoch", encoding="utf-8")
+    out = tmp_path / "decision.txt"
+    handle = tmp_path / "handle.txt"
+
+    res = subprocess.run(
+        [
+            "bash", str(DEFAULT_PLANNER),
+            "--repo", str(repo),
+            "--prompt", str(prompt),
+            "--out", str(out),
+            "--handle-out", str(handle),
+            "--timeout", "30",
+        ],
+        env=_env_with_stub_path(stub_dir),
+        capture_output=True,
+        text=True,
+    )
+
+    assert res.returncode == 0, res.stderr
+    assert out.read_text() == '{"tool":"emit_epoch"}'
+    assert handle.read_text().strip().isdigit()
+
+
+def test_default_planner_is_read_only_no_skip_permissions(tmp_path: Path) -> None:
+    # The planner must NOT bypass permissions (read-only): it allowlists only
+    # Read/Grep/Glob and never passes --dangerously-skip-permissions, so a headless
+    # run cannot edit the repo.
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir()
+    record = tmp_path / "argv.txt"
+    _make_stub(
+        stub_dir,
+        "claude",
+        f'printf "%s\\0" "$@" > "{record}"\nprintf \'{{"tool":"x"}}\'\nexit 0\n',
+    )
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("plan", encoding="utf-8")
+    res = subprocess.run(
+        [
+            "bash", str(DEFAULT_PLANNER),
+            "--repo", str(repo),
+            "--prompt", str(prompt),
+            "--out", str(tmp_path / "o.txt"),
+            "--handle-out", str(tmp_path / "h.txt"),
+            "--timeout", "30",
+        ],
+        env=_env_with_stub_path(stub_dir),
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0, res.stderr
+    flat = [p.decode() for p in record.read_bytes().split(b"\0") if p]
+    assert "--dangerously-skip-permissions" not in flat
+    assert "--allowedTools" in flat
+    assert "-p" in flat
+
+
+def test_default_planner_propagates_nonzero_exit(tmp_path: Path) -> None:
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir()
+    _make_stub(stub_dir, "claude", 'echo "not logged in" >&2\nexit 3\n')
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("x", encoding="utf-8")
+    res = subprocess.run(
+        [
+            "bash", str(DEFAULT_PLANNER),
+            "--repo", str(repo),
+            "--prompt", str(prompt),
+            "--out", str(tmp_path / "out.txt"),
+            "--handle-out", str(tmp_path / "handle.txt"),
+            "--timeout", "30",
+        ],
+        env=_env_with_stub_path(stub_dir),
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 3
+    assert "not logged in" in res.stderr
+
+
+def test_default_planner_missing_arg_errors(tmp_path: Path) -> None:
+    res = subprocess.run(
+        ["bash", str(DEFAULT_PLANNER), "--repo", str(tmp_path)],
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 2
+    assert "missing required" in res.stderr
+
+
+def _run_default_worker(script: Path, tmp_path: Path, claude_body: str) -> subprocess.CompletedProcess[str]:
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir()
+    _make_stub(stub_dir, "claude", claude_body)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("do the thing", encoding="utf-8")
+    return subprocess.run(
+        [
+            "bash", str(script),
+            "--worktree", str(worktree),
+            "--prompt", str(prompt),
+            "--log-dir", str(tmp_path / "logs"),
+            "--handle-out", str(tmp_path / "handle.txt"),
+            "--timeout", "30",
+        ],
+        env=_env_with_stub_path(stub_dir),
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_default_local_relays_handoff_and_writes_handle(tmp_path: Path) -> None:
+    # The default local worker runs `claude -p` IN the worktree; the agent writes
+    # handoff.json into its CWD (the only result channel).
+    res = _run_default_worker(
+        DEFAULT_LOCAL,
+        tmp_path,
+        'printf \'{"status":"DONE"}\' > "$PWD/handoff.json"\nexit 0\n',
+    )
+    assert res.returncode == 0, res.stderr
+    assert (tmp_path / "wt" / "handoff.json").read_text() == '{"status":"DONE"}'
+    assert (tmp_path / "handle.txt").read_text().strip().isdigit()
+    assert (tmp_path / "logs" / "agent.stdout.log").exists()
+
+
+def test_default_local_full_permissions_in_worktree(tmp_path: Path) -> None:
+    # A worker must be able to edit/exec headlessly: it runs with
+    # --dangerously-skip-permissions inside the isolated worktree.
+    record = tmp_path / "argv.txt"
+    res = _run_default_worker(
+        DEFAULT_LOCAL,
+        tmp_path,
+        f'printf "%s\\0" "$@" > "{record}"\n'
+        'printf \'{"status":"DONE"}\' > "$PWD/handoff.json"\nexit 0\n',
+    )
+    assert res.returncode == 0, res.stderr
+    flat = [p.decode() for p in record.read_bytes().split(b"\0") if p]
+    assert "--dangerously-skip-permissions" in flat
+    assert "-p" in flat
+
+
+def test_default_local_propagates_nonzero_exit(tmp_path: Path) -> None:
+    res = _run_default_worker(
+        DEFAULT_LOCAL, tmp_path, 'echo "429 rate limit exceeded" >&2\nexit 7\n'
+    )
+    assert res.returncode == 7, res.stderr
+    assert "429" in res.stderr or "rate" in res.stderr.lower()
+
+
+def test_default_local_missing_arg_errors(tmp_path: Path) -> None:
+    res = subprocess.run(
+        ["bash", str(DEFAULT_LOCAL), "--worktree", str(tmp_path)],
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 2
+    assert "missing required" in res.stderr
+
+
+def test_default_senior_relays_handoff(tmp_path: Path) -> None:
+    res = _run_default_worker(
+        DEFAULT_SENIOR,
+        tmp_path,
+        'printf \'{"status":"DONE"}\' > "$PWD/handoff.json"\nexit 0\n',
+    )
+    assert res.returncode == 0, res.stderr
+    assert (tmp_path / "wt" / "handoff.json").exists()
+    assert (tmp_path / "handle.txt").read_text().strip().isdigit()
+
+
+def test_default_senior_missing_arg_errors(tmp_path: Path) -> None:
+    res = subprocess.run(
+        ["bash", str(DEFAULT_SENIOR), "--worktree", str(tmp_path)],
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 2
+    assert "missing required" in res.stderr

@@ -10,6 +10,9 @@ venv/
 # --- grindstone run state (created INSIDE a target repo; never commit) ---
 .grindstone/
 
+# --- operator's personal model rig (per-file shadow over models/default) ---
+models/override/
+
 # --- local agent / tooling working dirs ---
 .claude/
 CLAUDE.local.md

@@ -15,9 +15,11 @@ them. Where prose here and the schema disagree, the schema wins.
 
 The planner is a **stateless one-shot call**. There is no warm planner instance
 and no planner-held state; Grindstone reconstructs the full input from durable
-state on every call, so model drift has nowhere to accumulate. The reference
-adapter (`models/planner_request.sh`) drives a strong cloud model (`codex exec`),
-but the role is swappable behind that script.
+state on every call, so model drift has nowhere to accumulate. The shipped default
+adapter (`models/default/planner_request.sh`) drives Claude (Opus) via `claude -p`
+read-only; a bundled `codex exec` alternative lives at `models/codex/planner_request.sh`
+(opt in with `grindstone init --rig codex`), and the role is swappable behind the
+script via `models/override/`.
 
 Grindstone invokes the planner at exactly two kinds of moment:
 
@@ -235,7 +237,7 @@ task `done_when`, a worker scratch has no renderer). Put a `cmd` check *first*
 in the same criterion that builds + screenshots the UI into the tip worktree
 (e.g. `{"cmd": "npm run build && node shot.js ui/screen.png"}`), then a
 `vision_review` of that `ui/screen.png` against the design bar. Grindstone runs
-the gate through a request script (`models/vision_review.sh`), re-reads the
+the gate through a request script (the rig's `vision_review.sh`), re-reads the
 returned `vision_verdict.json` (a disk contract, never stdout), and treats a
 failed taste verdict exactly like a failed command.
 

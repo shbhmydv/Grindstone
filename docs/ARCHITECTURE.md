@@ -25,19 +25,25 @@ each through a request **script** behind a file contract. It never learns the
 transport, model identity, or GPU assignment hiding behind a script; those live
 entirely in `models/`.
 
-| role | what it does | reference adapter (`models/`) |
+| role | what it does | shipped default adapter (`models/default/`) |
 |---|---|---|
-| **planner** | plans one epoch at a time as a constrained tool-call | `planner_request.sh` → a strong cloud model (`codex exec`) |
-| **local** | the on-rig grinders that fan out across an epoch's tasks | `local_request.sh` → a local LLM server (Qwen via llama-server, driven by the `pi` CLI) |
-| **senior** | optional cloud escalation / web-research / taste tier | `senior_request.sh` → `opencode` (kimi) with web search |
+| **planner** | plans one epoch at a time as a constrained tool-call | `planner_request.sh` → Claude (Opus) via `claude -p`, read-only |
+| **local** | the on-rig grinders that fan out across an epoch's tasks | `local_request.sh` → Claude (Opus) via `claude -p` in the worktree |
+| **senior** | optional escalation / web-research / taste tier | `senior_request.sh` → Claude (Opus) via `claude -p`, web search on |
 
-Two more optional scripts back the taste features: `vision_review.sh` (the
-screenshot-judge gate) and `codex_polish.sh` (the final-polish pass);
-`stop.sh` + `_timeout_prefix.sh` are shared kill/timeout helpers. All scripts are
-**reference adapters**: point them at your own backends, or replace them. The
-per-repo `.grindstone/config.yaml` names each role's script plus its `slots`
-(per-role concurrency) and `timeout_s`; `planner` + `local` are required,
-`senior` is optional (its absence means a local-only escalation ladder).
+`models/` is layered as a rig stack: `default/` is the tracked Claude rig a fresh
+clone runs with zero setup; `codex/` is a bundled alternative (a `codex exec`
+planner, opt in via `grindstone init --rig codex`); and `override/` (gitignored)
+is the operator's personal per-file rig, which wins where present. `init` resolves
+each role to the first existing of `override/` > `<rig>/` > `default/` and bakes
+the absolute path into `.grindstone/config.yaml`. `stop.sh` + `_timeout_prefix.sh`
+are shared kill/timeout helpers under `default/`. Two optional scripts back the
+taste features when a rig supplies them: `vision_review.sh` (the screenshot-judge
+gate) and `codex_polish.sh` (the final-polish pass). All scripts are **reference
+adapters**: point them at your own backends, or drop a replacement into
+`override/`. The per-repo `.grindstone/config.yaml` names each role's script plus
+its `slots` (per-role concurrency) and `timeout_s`; `planner` + `local` are
+required, `senior` is optional (its absence means a local-only escalation ladder).
 
 `grindstone/config.py` loads that YAML into a frozen, unknown-key-rejecting
 Pydantic object, and refuses any configured `script:` path that does not resolve
@@ -186,7 +192,7 @@ Grindstone can build and judge work that is evaluated by how it *looks*:
   (the stronger taste-builder) instead of the local default.
 - **The `vision_review` gate** is a deterministic phase check: after a `cmd`
   check builds and screenshots the UI into the tip worktree, a `vision_review`
-  check shows that screenshot to a vision model (via `models/vision_review.sh`)
+  check shows that screenshot to a vision model (via the rig's `vision_review.sh`)
   with criteria for "what polished looks like". The script writes a
   `vision_verdict.json` that the core re-reads and validates (a disk contract,
   never stdout, `grindstone/script_vision.py`); a failed taste verdict fails the

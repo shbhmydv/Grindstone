@@ -34,6 +34,45 @@ _CONFIG_REL = Path(".grindstone") / "config.yaml"
 #: ``script:`` must live UNDER here unless the operator opts out (below).
 MODELS_DIR = Path(__file__).resolve().parents[1] / "models"
 
+#: The tracked base rig: the shipped Claude (Opus) scripts a fresh cloner runs with
+#: zero setup. ``models_script`` always falls back here.
+_DEFAULT_RIG = "default"
+
+#: The operator's personal rig (gitignored): a per-file shadow with the HIGHEST
+#: priority, so a local pi/GPU/codex script overrides the shipped default.
+_OVERRIDE_RIG = "override"
+
+
+def models_script(name: str, rig: str | None = None) -> Path:
+    """Resolve a bundled request script ``name`` to its absolute path.
+
+    The first existing of, in priority order:
+
+    1. ``models/override/<name>`` (the operator's personal rig, gitignored);
+    2. ``models/<rig>/<name>`` (a named preset, e.g. ``codex``), only when ``rig``
+       is given;
+    3. ``models/default/<name>`` (the tracked base rig).
+
+    Every candidate sits under ``MODELS_DIR``, so the resolved path passes the
+    ``validate_script_paths`` RCE guard unchanged. Returns an absolute, resolved
+    path; raises ``FileNotFoundError`` (listing the dirs searched) when no rig
+    supplies the script.
+    """
+
+    searched: list[Path] = []
+    for sub in (_OVERRIDE_RIG, rig, _DEFAULT_RIG):
+        if sub is None:
+            continue
+        candidate = MODELS_DIR / sub / name
+        searched.append(candidate)
+        if candidate.is_file():
+            return candidate.resolve()
+    listing = ", ".join(str(p) for p in searched)
+    raise FileNotFoundError(
+        f"no bundled models/ script named {name!r} "
+        f"(rig={rig!r}); searched: {listing}"
+    )
+
 #: Opt-in escape hatch for a trusted repo whose config names its OWN scripts: set
 #: ``GRINDSTONE_ALLOW_REPO_SCRIPTS=1`` to skip the under-``models/`` requirement.
 ALLOW_REPO_SCRIPTS_ENV = "GRINDSTONE_ALLOW_REPO_SCRIPTS"

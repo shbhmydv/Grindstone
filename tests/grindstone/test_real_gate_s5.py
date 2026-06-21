@@ -86,11 +86,11 @@ def _config_yaml(models_dir: Path) -> str:
     return (
         "roles:\n"
         "  planner:\n"
-        f"    script: {models_dir}/planner_request.sh\n"
+        f"    script: {models_dir}/codex/planner_request.sh\n"
         "    slots: 1\n"
         "    timeout_s: 600\n"
         "  local:\n"
-        f"    script: {models_dir}/local_request.sh\n"
+        f"    script: {models_dir}/override/local_request.sh\n"
         "    slots: 2\n"
         "    timeout_s: 1800\n"
     )

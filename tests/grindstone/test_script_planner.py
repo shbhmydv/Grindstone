@@ -53,7 +53,9 @@ echo 'DECISION TEXT' > "$out"
 exit 0
 """,
     )
-    planner = ScriptPlanner(script=script, repo=repo, slots=1, timeout_s=10.0)
+    planner = ScriptPlanner(
+        script=script, stop_script=tmp_path / "stop.sh", repo=repo, slots=1, timeout_s=10.0
+    )
     result = planner.plan("the prompt")
     assert result.strip() == "DECISION TEXT"
 
@@ -72,7 +74,9 @@ def test_rate_limit_stderr_maps_to_rate_limited(tmp_path: Path) -> None:
         tmp_path / "planner_request.sh",
         'echo "429 usage limit exceeded" >&2\nexit 1\n',
     )
-    planner = ScriptPlanner(script=script, repo=repo, slots=1, timeout_s=10.0)
+    planner = ScriptPlanner(
+        script=script, stop_script=tmp_path / "stop.sh", repo=repo, slots=1, timeout_s=10.0
+    )
     with pytest.raises(RateLimited):
         planner.plan("p")
 
@@ -84,7 +88,9 @@ def test_auth_stderr_maps_to_planner_hard_error(tmp_path: Path) -> None:
         tmp_path / "planner_request.sh",
         'echo "401 Unauthorized: please run codex login" >&2\nexit 1\n',
     )
-    planner = ScriptPlanner(script=script, repo=repo, slots=1, timeout_s=10.0)
+    planner = ScriptPlanner(
+        script=script, stop_script=tmp_path / "stop.sh", repo=repo, slots=1, timeout_s=10.0
+    )
     with pytest.raises(PlannerHardError):
         planner.plan("p")
 
@@ -96,7 +102,9 @@ def test_other_nonzero_stderr_maps_to_transport_error(tmp_path: Path) -> None:
         tmp_path / "planner_request.sh",
         'echo "transient network hiccup" >&2\nexit 1\n',
     )
-    planner = ScriptPlanner(script=script, repo=repo, slots=1, timeout_s=10.0)
+    planner = ScriptPlanner(
+        script=script, stop_script=tmp_path / "stop.sh", repo=repo, slots=1, timeout_s=10.0
+    )
     with pytest.raises(TransportError):
         planner.plan("p")
 
@@ -131,18 +139,27 @@ echo $$ > "$handle"
 sleep 30
 """,
     )
-    planner = ScriptPlanner(script=script, repo=repo, slots=1, timeout_s=1.0)
+    planner = ScriptPlanner(
+        script=script, stop_script=tmp_path / "stop.sh", repo=repo, slots=1, timeout_s=1.0
+    )
     with pytest.raises(WorkerTimeout):
         planner.plan("p")
     assert stop_marker.is_file(), "stop.sh was not invoked on timeout"
 
 
-def test_stop_script_is_sibling_of_planner_script(tmp_path: Path) -> None:
-    script = tmp_path / "models" / "planner_request.sh"
+def test_stop_script_is_the_explicit_path_not_a_sibling(tmp_path: Path) -> None:
+    # The planner script can resolve from a preset dir (e.g. codex/) with no sibling
+    # stop.sh, so stop.sh is passed EXPLICITLY (resolved by the CLI), never assumed
+    # beside the planner script.
+    script = tmp_path / "codex" / "planner_request.sh"
     script.parent.mkdir()
     script.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-    planner = ScriptPlanner(script=script, repo=tmp_path, slots=1, timeout_s=1.0)
-    assert planner._stop_script == script.parent / "stop.sh"
+    stop = tmp_path / "default" / "stop.sh"
+    planner = ScriptPlanner(
+        script=script, stop_script=stop, repo=tmp_path, slots=1, timeout_s=1.0
+    )
+    assert planner._stop_script == stop
+    assert planner._stop_script != script.parent / "stop.sh"
 
 
 # --- relocated extractor (grindstone.planner.extract_decision_json) ------------

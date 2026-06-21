@@ -60,7 +60,13 @@ exit 0
     scratch.mkdir()
     log_root = tmp_path / "logs"
 
-    worker = ScriptWorker(script=script, slots=1, timeout_s=10.0, log_root=log_root)
+    worker = ScriptWorker(
+        script=script,
+        stop_script=tmp_path / "stop.sh",
+        slots=1,
+        timeout_s=10.0,
+        log_root=log_root,
+    )
     worker.run(_request(scratch))
 
     # handoff relayed into the worktree (the disk contract)
@@ -84,7 +90,9 @@ def test_nonzero_rate_limit_stderr_maps_to_rate_limited(tmp_path: Path) -> None:
         tmp_path / "local_request.sh",
         'echo "Error: rate limit exceeded" >&2\nexit 1\n',
     )
-    worker = ScriptWorker(script=script, slots=1, timeout_s=10.0, log_root=tmp_path / "l")
+    worker = ScriptWorker(
+        script=script, stop_script=tmp_path / "stop.sh", slots=1, timeout_s=10.0, log_root=tmp_path / "l"
+    )
     with pytest.raises(RateLimited):
         worker.run(_request(tmp_path))
 
@@ -94,7 +102,9 @@ def test_nonzero_other_stderr_maps_to_transport_error(tmp_path: Path) -> None:
         tmp_path / "local_request.sh",
         'echo "some unexpected failure" >&2\nexit 1\n',
     )
-    worker = ScriptWorker(script=script, slots=1, timeout_s=10.0, log_root=tmp_path / "l")
+    worker = ScriptWorker(
+        script=script, stop_script=tmp_path / "stop.sh", slots=1, timeout_s=10.0, log_root=tmp_path / "l"
+    )
     with pytest.raises(TransportError):
         worker.run(_request(tmp_path))
 
@@ -129,7 +139,13 @@ echo $$ > "$handle"
 sleep 30
 """,
     )
-    worker = ScriptWorker(script=script, slots=1, timeout_s=1.0, log_root=tmp_path / "l")
+    worker = ScriptWorker(
+        script=script,
+        stop_script=tmp_path / "stop.sh",
+        slots=1,
+        timeout_s=1.0,
+        log_root=tmp_path / "l",
+    )
     with pytest.raises(WorkerTimeout):
         worker.run(_request(tmp_path / "wt"))
     assert stop_marker.is_file(), "stop.sh was not invoked on timeout"
@@ -168,7 +184,9 @@ echo '{{}}' > "$worktree/handoff.json"
 exit 0
 """,
     )
-    worker = ScriptWorker(script=script, slots=slots, timeout_s=10.0, log_root=tmp_path / "l")
+    worker = ScriptWorker(
+        script=script, stop_script=tmp_path / "stop.sh", slots=slots, timeout_s=10.0, log_root=tmp_path / "l"
+    )
 
     n = 6
     errors: list[BaseException] = []
@@ -193,13 +211,20 @@ exit 0
     assert observed_max >= 1
 
 
-def test_stop_script_is_sibling_of_role_script(tmp_path: Path) -> None:
-    script = tmp_path / "models" / "local_request.sh"
+def test_stop_script_is_the_explicit_path_not_a_sibling(tmp_path: Path) -> None:
+    # The role script can resolve from a preset/override dir with no sibling
+    # stop.sh, so stop.sh is passed EXPLICITLY (resolved by the CLI), never assumed
+    # beside the role script.
+    script = tmp_path / "override" / "local_request.sh"
     script.parent.mkdir()
     script.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     script.chmod(script.stat().st_mode | stat.S_IXUSR)
-    worker = ScriptWorker(script=script, slots=1, timeout_s=1.0, log_root=tmp_path)
-    assert worker._stop_script == script.parent / "stop.sh"
+    stop = tmp_path / "default" / "stop.sh"
+    worker = ScriptWorker(
+        script=script, stop_script=stop, slots=1, timeout_s=1.0, log_root=tmp_path
+    )
+    assert worker._stop_script == stop
+    assert worker._stop_script != script.parent / "stop.sh"
 
 
 def test_log_artifacts_land_under_log_root_not_run_dir(tmp_path: Path) -> None:
@@ -222,7 +247,9 @@ exit 0
     scratch = tmp_path / "wt"
     scratch.mkdir()
     log_root = tmp_path / "logroot"
-    worker = ScriptWorker(script=script, slots=1, timeout_s=10.0, log_root=log_root)
+    worker = ScriptWorker(
+        script=script, stop_script=tmp_path / "stop.sh", slots=1, timeout_s=10.0, log_root=log_root
+    )
     worker.run(_request(scratch))
     # a per-attempt dir with the handle file exists under log_root, not in scratch
     attempt_dir = log_root / "P1-E1-T1-attempt-1"

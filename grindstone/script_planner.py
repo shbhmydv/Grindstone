@@ -29,8 +29,11 @@ from grindstone.worker import RateLimited, TransportError, WorkerTimeout
 class ScriptPlanner:
     """``PlannerTransport`` backed by ``planner_request.sh`` behind a file contract.
 
-    ``script`` is the absolute path to ``planner_request.sh``; ``stop.sh`` is its
-    sibling. ``repo`` is the target repo (the planner's read-only working root).
+    ``script`` is the absolute path to ``planner_request.sh``; ``stop_script`` is
+    the explicit ``stop.sh`` path used to reap the group on timeout (resolved by the
+    CLI via ``models_script``, NOT assumed beside the planner script: the planner
+    can resolve from a preset dir, e.g. ``codex/``, that ships no ``stop.sh``).
+    ``repo`` is the target repo (the planner's read-only working root).
     ``slots`` bounds concurrency; ``timeout_s`` is the transport-owned wall-clock
     supervisor. No model identity: that moved into the script. CLI failures map
     onto the exception family: rate/limit/429/quota → RateLimited (→ backoff),
@@ -42,18 +45,16 @@ class ScriptPlanner:
         self,
         *,
         script: Path,
+        stop_script: Path,
         repo: Path,
         slots: int,
         timeout_s: float,
     ) -> None:
         self.script = Path(script)
+        self._stop_script = Path(stop_script)
         self.repo = Path(repo)
         self.timeout_s = timeout_s
         self._sem = threading.Semaphore(slots)
-
-    @property
-    def _stop_script(self) -> Path:
-        return self.script.parent / "stop.sh"
 
     def plan(self, prompt: str) -> str:
         with self._sem:

@@ -24,7 +24,12 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
-from grindstone.config import GrindstoneConfig, load_config, validate_script_paths
+from grindstone.config import (
+    GrindstoneConfig,
+    load_config,
+    models_script,
+    validate_script_paths,
+)
 from grindstone.planner import PlannerTransport
 from grindstone.run_loop import FinalPolish, Ladder, RunOutcome, resume_grind, run_grind
 from grindstone.rundir import RunDir, create_run_dir
@@ -49,42 +54,52 @@ DEFAULT_MAX_PLANNER_CALLS = 96
 #: does not size it, a single read-only codex look at a screenshot, not a grind.
 DEFAULT_VISION_TIMEOUT_S = 600.0
 
-#: Directory of this rig's request scripts (``models/`` beside the package). The
-#: scaffolded config references them by ABSOLUTE path so a run from any CWD finds
-#: them; edit the paths to point at a different rig's scripts.
-_MODELS_DIR = Path(__file__).resolve().parents[1] / "models"
-
 #: The ``.grindstone/config.yaml`` ``init`` scaffolds: one block per *role*
 #: (``planner`` / ``local`` / ``senior``), each naming a request script behind
 #: the file contract plus its slots + wall-clock timeout. The CLI never learns
 #: the transport or model behind a role, that lives in the script. ``senior``
-#: is scaffolded active; delete it for a local-only ladder. Loadable as-is by
-#: ``config.load_config``.
-_CONFIG_TEMPLATE = """\
+#: is scaffolded active; delete it for a local-only ladder. Each role's ABSOLUTE
+#: script path is resolved through ``models_script`` so it honors the rig stack
+#: (override > preset > default), and a run from any CWD finds it. Loadable as-is
+#: by ``config.load_config``.
+def _render_config_template(rig: str | None) -> str:
+    """The scaffolded config text with each role's script path resolved for ``rig``.
+
+    ``models_script`` bakes the FIRST existing of override/ > ``<rig>``/ > default/
+    for every role, so a fresh clone gets the shipped Claude rig, an operator's
+    ``models/override`` scripts win where present, and ``--rig codex`` swaps in the
+    bundled codex planner. The optional vision/polish lines stay commented out and
+    name only the bare script (resolved at run time if the block is uncommented).
+    """
+
+    planner = models_script("planner_request.sh", rig=rig)
+    local = models_script("local_request.sh", rig=rig)
+    senior = models_script("senior_request.sh", rig=rig)
+    return f"""\
 # Grindstone per-repo config (.grindstone/config.yaml).
 # Owner-facing settings for `grindstone run` / `grindstone resume`. Each role is
 # a request script behind a file contract; the script owns the transport, model
 # identity and GPU. Delete this file to fall back to `grindstone init`.
 
 roles:
-  # The planner role: a strong cloud model plans one epoch at a time. slots=1
+  # The planner role: a strong model plans one epoch at a time. slots=1
   # (one planner call in flight); timeout is the per-call wall-clock budget.
   planner:
-    script: {models_dir}/planner_request.sh
+    script: {planner}
     slots: 1
     timeout_s: 600
 
   # The local worker role: the on-rig grinders. slots = the epoch fan-out bound
-  # (how many tasks run concurrently, one per free GPU on this rig).
+  # (how many tasks run concurrently on this rig).
   local:
-    script: {models_dir}/local_request.sh
+    script: {local}
     slots: 2
     timeout_s: 1800
 
-  # The senior worker role: the cloud escalation tier. OPTIONAL, delete this
-  # whole block for a local-only ladder (a rig with no cloud subscription).
+  # The senior worker role: the escalation tier. OPTIONAL, delete this whole
+  # block for a local-only ladder.
   senior:
-    script: {models_dir}/senior_request.sh
+    script: {senior}
     slots: 2
     timeout_s: 3600
 
@@ -95,25 +110,26 @@ roles:
 # max_planner_calls: 96
 
 # The B3 vision-review (taste) gate: a `vision_review` exit-criterion check runs
-# this script, which shows codex a rendered-UI screenshot + criteria and writes a
-# pass/fail verdict the core re-reads. Omit this block to use the bundled
-# models/vision_review.sh; set it to point the gate at a different rig's script.
+# this script, which shows a vision model a rendered-UI screenshot + criteria and
+# writes a pass/fail verdict the core re-reads. Omit this block to use the bundled
+# vision_review.sh (resolved through the rig stack); set it to point the gate at a
+# different script.
 # vision_review:
-#   script: {models_dir}/vision_review.sh
+#   script: /absolute/path/to/vision_review.sh
 #   timeout_s: 600
 
 # The B5 final-polish pass: OFF unless this block is present. After a run's
-# complete_run evidence passes, codex EDITS the finished repo inline (workspace-
-# write) per `criteria`; the edits are KEPT only if the SAME evidence still passes
-# (else discarded, the original completion stands). codex can never bypass the
-# gate or fail a completed run. `script` defaults to the bundled codex_polish.sh;
-# `screenshot` (worktree-relative) is optional for a visual polish brief.
+# complete_run evidence passes, the polisher EDITS the finished repo inline per
+# `criteria`; the edits are KEPT only if the SAME evidence still passes (else
+# discarded, the original completion stands). It can never bypass the gate or fail
+# a completed run. `script` defaults to the bundled codex_polish.sh (resolved
+# through the rig stack); `screenshot` (worktree-relative) is optional.
 # final_polish:
 #   criteria: "tasteful finishing touches; do not change behavior"
 #   timeout_s: 900
-#   # script: {models_dir}/codex_polish.sh
+#   # script: /absolute/path/to/codex_polish.sh
 #   # screenshot: ui/home.png
-""".format(models_dir=_MODELS_DIR)
+"""
 
 #: The single line `init` ensures in the repo's .gitignore (the run dir + config
 #: live under .grindstone/ and must never be committed).
@@ -154,6 +170,7 @@ def _resolve_planner(
         raise _no_config_exit()
     return ScriptPlanner(
         script=cfg.roles.planner.script,
+        stop_script=models_script("stop.sh"),
         repo=repo,
         slots=cfg.roles.planner.slots,
         timeout_s=cfg.roles.planner.timeout_s,
@@ -177,11 +194,13 @@ def _resolve_ladder(
     if cfg is None:
         raise _no_config_exit()
     log_root = run_dir.root / "worker_logs"
+    stop_script = models_script("stop.sh")
     tiers: list[tuple[str, ScriptWorker]] = [
         (
             "local",
             ScriptWorker(
                 script=cfg.roles.local.script,
+                stop_script=stop_script,
                 slots=cfg.roles.local.slots,
                 timeout_s=cfg.roles.local.timeout_s,
                 log_root=log_root,
@@ -195,6 +214,7 @@ def _resolve_ladder(
                 "senior",
                 ScriptWorker(
                     script=senior.script,
+                    stop_script=stop_script,
                     slots=senior.slots,
                     timeout_s=senior.timeout_s,
                     log_root=log_root,
@@ -244,9 +264,16 @@ def _resolve_vision_reviewer(cfg: GrindstoneConfig | None) -> VisionReviewer | N
         return ScriptVisionReviewer(
             script=cfg.vision_review.script, timeout_s=cfg.vision_review.timeout_s
         )
-    return ScriptVisionReviewer(
-        script=_MODELS_DIR / "vision_review.sh", timeout_s=DEFAULT_VISION_TIMEOUT_S
-    )
+    # No config block: fall back to a bundled vision_review.sh resolved through the
+    # rig stack. The shipped default rig carries no taste gate (it is a codex-
+    # flavored script that lives in models/override on a rig that uses it), so when
+    # none resolves we return None and the gate degrades to a deterministic FAIL on
+    # any vision_review check rather than crashing a run that has no such check.
+    try:
+        script = models_script("vision_review.sh")
+    except FileNotFoundError:
+        return None
+    return ScriptVisionReviewer(script=script, timeout_s=DEFAULT_VISION_TIMEOUT_S)
 
 
 def _resolve_final_polish(cfg: GrindstoneConfig | None) -> FinalPolish | None:
@@ -258,7 +285,10 @@ def _resolve_final_polish(cfg: GrindstoneConfig | None) -> FinalPolish | None:
     if cfg is None or cfg.final_polish is None:
         return None
     fp = cfg.final_polish
-    script = fp.script if fp.script is not None else _MODELS_DIR / "codex_polish.sh"
+    # `script` omitted -> the bundled codex_polish.sh, resolved through the rig
+    # stack. final_polish is opt-in; if no rig supplies the script, models_script
+    # raises a clear error (the operator must point `final_polish.script` at one).
+    script = fp.script if fp.script is not None else models_script("codex_polish.sh")
     return FinalPolish(
         polisher=ScriptPolisher(script=script, timeout_s=fp.timeout_s),
         criteria=fp.criteria,
@@ -302,7 +332,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
         print(f"config exists, leaving as-is: {cfg_path}")
     else:
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
-        cfg_path.write_text(_CONFIG_TEMPLATE, encoding="utf-8")
+        cfg_path.write_text(_render_config_template(args.rig), encoding="utf-8")
         print(f"wrote {cfg_path}")
     if _ensure_gitignored(repo):
         print(f"added {_GITIGNORE_LINE} to .gitignore")
@@ -437,6 +467,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     init = sub.add_parser("init", help="scaffold .grindstone/config.yaml + .gitignore")
     init.add_argument("--repo", required=True, help="target repo to initialize")
+    init.add_argument(
+        "--rig",
+        default=None,
+        help="bundled preset rig for the planner/worker scripts (e.g. `codex`); "
+        "default is the shipped Claude rig. An operator's models/override scripts "
+        "always win where present.",
+    )
 
     run = sub.add_parser("run", help="run a job.md to completion in the foreground")
     run.add_argument("job", help="path to the job spec (job.md)")

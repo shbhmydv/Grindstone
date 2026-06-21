@@ -62,18 +62,56 @@ _LOCAL_ONLY = (
 # --- init ----------------------------------------------------------------------
 
 
-def test_init_writes_loadable_config(tmp_path: Path) -> None:
-    assert main(["init", "--repo", str(tmp_path)]) == 0
-    cfg_path = tmp_path / ".grindstone" / "config.yaml"
+def _fake_models(root: Path, *, codex: bool = False) -> Path:
+    """A hermetic models/ tree (default rig + optional codex preset, no override)
+    so init's baked paths are deterministic regardless of the operator's gitignored
+    models/override on the dev machine."""
+
+    models = root / "models"
+    for sub in ("default", "codex", "override"):
+        (models / sub).mkdir(parents=True, exist_ok=True)
+    for name in ("planner_request.sh", "local_request.sh", "senior_request.sh", "stop.sh"):
+        (models / "default" / name).write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    if codex:
+        (models / "codex" / "planner_request.sh").write_text(
+            "#!/usr/bin/env bash\nexit 0\n", encoding="utf-8"
+        )
+    return models
+
+
+def test_init_writes_loadable_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    models = _fake_models(tmp_path)
+    monkeypatch.setattr("grindstone.config.MODELS_DIR", models)
+    assert main(["init", "--repo", str(repo)]) == 0
+    cfg_path = repo / ".grindstone" / "config.yaml"
     assert cfg_path.is_file()
-    cfg = load_config(tmp_path)  # the scaffold parses to a valid config
+    cfg = load_config(repo)  # the scaffold parses to a valid config
     assert isinstance(cfg, GrindstoneConfig)
-    # Absolute script paths resolved from the grindstone install root (models/).
-    models_dir = Path(__file__).resolve().parents[2] / "models"
-    assert cfg.roles.planner.script == models_dir / "planner_request.sh"
-    assert cfg.roles.local.script == models_dir / "local_request.sh"
+    # Default rig: every role's baked path resolves under models/default/.
+    assert cfg.roles.planner.script == (models / "default" / "planner_request.sh").resolve()
+    assert cfg.roles.local.script == (models / "default" / "local_request.sh").resolve()
     assert cfg.roles.senior is not None
-    assert cfg.roles.senior.script == models_dir / "senior_request.sh"
+    assert cfg.roles.senior.script == (models / "default" / "senior_request.sh").resolve()
+
+
+def test_init_rig_codex_bakes_codex_planner_default_workers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `init --rig codex` inserts the codex preset for the planner only; the workers
+    # have no codex/ script so they fall back to default/.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    models = _fake_models(tmp_path, codex=True)
+    monkeypatch.setattr("grindstone.config.MODELS_DIR", models)
+    assert main(["init", "--repo", str(repo), "--rig", "codex"]) == 0
+    cfg = load_config(repo)
+    assert cfg is not None
+    assert cfg.roles.planner.script == (models / "codex" / "planner_request.sh").resolve()
+    assert cfg.roles.local.script == (models / "default" / "local_request.sh").resolve()
+    assert cfg.roles.senior is not None
+    assert cfg.roles.senior.script == (models / "default" / "senior_request.sh").resolve()
 
 
 def test_init_appends_gitignore_idempotently(tmp_path: Path) -> None:

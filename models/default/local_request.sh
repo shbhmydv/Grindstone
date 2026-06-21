@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# local_request.sh, the DEFAULT `local` worker role. Runs Claude (Opus) headless
+# via `claude -p` one-shot IN the task worktree, with edit + exec permissions so
+# it can modify files, run the done_when checks, and write handoff.json.
+#
+# This is the shipped default rig: a fresh cloner with Claude Code installed runs
+# with zero setup. An operator's own local worker (e.g. a local-GPU model) goes in
+# models/override/local_request.sh (gitignored, highest priority).
+#
+# Grindstone passes only a worktree, a prompt file, a log dir, a handle-out path
+# and a timeout; it never learns the transport or the model behind the role. The
+# agent writes handoff.json into the worktree; that file is the ONLY result
+# channel, stdout is never parsed. We propagate claude's exit code and forward its
+# stderr to ours so the caller can grep `rate|limit|429`.
+set -euo pipefail
+
+# Portable timeout prefix (resolves `timeout`, else `gtimeout`, else none).
+source "$(dirname "$0")/_timeout_prefix.sh"
+
+# Model identity is THIS script's concern. The owner's decision is Opus for every
+# role. Override for your own rig via $GRINDSTONE_LOCAL_MODEL (any `claude --model`
+# target). local and senior differ by ROLE WORDING (below), not by model.
+model="${GRINDSTONE_LOCAL_MODEL:-opus}"
+
+worktree="" prompt="" log_dir="" handle_out="" timeout=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --worktree)   worktree="$2"; shift 2 ;;
+    --prompt)     prompt="$2";   shift 2 ;;
+    --log-dir)    log_dir="$2";  shift 2 ;;
+    --handle-out) handle_out="$2"; shift 2 ;;
+    --timeout)    timeout="$2";  shift 2 ;;
+    *) echo "local_request: unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+for req in worktree prompt log_dir handle_out; do
+  if [[ -z "${!req}" ]]; then
+    echo "local_request: missing required --${req//_/-}" >&2
+    exit 2
+  fi
+done
+
+# Resolve paths to absolute BEFORE we cd into the worktree.
+worktree="$(cd "$worktree" && pwd)"
+prompt_text="$(cat "$prompt")"
+mkdir -p "$log_dir"; log_dir="$(cd "$log_dir" && pwd)"
+mkdir -p "$(dirname "$handle_out")"
+handle_out="$(cd "$(dirname "$handle_out")" && pwd)/$(basename "$handle_out")"
+
+# Write the killable process-group id BEFORE grinding so stop.sh can always reap
+# us. Grindstone launches this script with start_new_session=True, so claude (and
+# any subprocess it spawns) inherits this group.
+pgid="$(ps -o pgid= -p $$ | tr -d '[:space:]')"
+echo "$pgid" > "$handle_out"
+
+# CWD = worktree (where the agent writes handoff.json); fence git's upward repo
+# discovery at the worktree's parent (ports the GIT_CEILING_DIRECTORIES scar).
+export GIT_CEILING_DIRECTORIES="$(dirname "$worktree")"
+cd "$worktree"
+
+log_out="$log_dir/agent.stdout.log"
+log_err="$log_dir/agent.stderr.log"
+
+# Honor --timeout as a backstop (grindstone also supervises wall-clock).
+build_timeout_prefix "$timeout"
+
+# The `local` role is the on-rig grinder: build the task and verify it. The
+# worktree is an isolated, throwaway checkout, so --dangerously-skip-permissions
+# (full tool access: Edit/Write/Bash) is safe and required for a headless run that
+# must edit files, run the done_when checks, and write handoff.json without ever
+# blocking on a permission prompt.
+sys_append="You are the LOCAL grinder for a grindstone task. Work only inside this worktree (your CWD). Make the change, run the done_when checks, and write handoff.json exactly as the task instructs."
+
+set +e
+"${timeout_prefix[@]}" claude -p \
+  --model "$model" \
+  --dangerously-skip-permissions \
+  --append-system-prompt "$sys_append" \
+  "$prompt_text" \
+  < /dev/null > "$log_out" 2> "$log_err"
+rc=$?
+set -e
+
+# Tee the agent's stderr to ours (log already holds it) so the caller can map the
+# failure reason; stdout is never parsed but we surface it for debugging too.
+cat "$log_err" >&2 || true
+cat "$log_out" || true
+
+if [[ "$rc" -ne 0 ]]; then
+  echo "local_request: claude exited $rc (model=$model)" >&2
+  exit "$rc"
+fi
+exit 0
