@@ -131,6 +131,13 @@
           "minItems": 1,
           "maxItems": 6
         },
+        "criteria": {
+          "description": "Natural-language semantic acceptance statements judged later by an agentic verification pass, never by a shell command. Deterministic done_when/checks cover STRUCTURAL facts (build, test, type-check, file existence); content/semantic acceptance belongs here. Optional; each entry is a non-empty prose statement.",
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 512 },
+          "maxItems": 8,
+          "default": []
+        },
         "skills": {
           "type": "array",
           "items": { "type": "string", "maxLength": 64 },

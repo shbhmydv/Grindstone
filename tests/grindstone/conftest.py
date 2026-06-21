@@ -190,10 +190,8 @@ def make_toy_task(
     return ImplementTask(
         id=task_id,
         goal=f"create {out_file} containing GRINDSTONE",
-        done_when=[
-            CmdCheck(cmd=f"test -f {out_file}"),
-            CmdCheck(cmd=f"grep -q GRINDSTONE {out_file}"),
-        ],
+        done_when=[CmdCheck(cmd=f"test -f {out_file}")],
+        criteria=[f"{out_file} contains the token GRINDSTONE"],
         file_ownership=owned if owned is not None else [out_file],
     )
 

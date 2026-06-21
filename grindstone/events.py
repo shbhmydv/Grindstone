@@ -165,6 +165,76 @@ class FailedEpochHandled(_Event):
     detail: str
 
 
+class InfraCheckDetected(_Event):
+    # A gate check failed for an ENVIRONMENTAL reason (infra.classify_check_failure:
+    # exit 127, missing tool/dependency, install failure), not a real assertion
+    # failure. The core will auto-dispatch a senior infra-repair instead of
+    # charging the worker. ``command`` is the failing check; ``reason`` is the
+    # matched signature.
+    event: Literal["infra_check_detected"] = "infra_check_detected"
+    phase_id: str
+    command: str
+    reason: str
+
+
+class InfraRepairDispatched(_Event):
+    # A bounded, host-guarded senior infra-repair was dispatched against the gate's
+    # tip worktree to make the environment satisfiable. ``attempt`` is 1-based;
+    # ``cap`` is the configured infra_repair.attempts ceiling.
+    event: Literal["infra_repair_dispatched"] = "infra_repair_dispatched"
+    phase_id: str
+    command: str
+    attempt: int
+    cap: int
+
+
+class InfraRepairResolved(_Event):
+    # A senior infra-repair fixed the environment: the previously infra-failing
+    # gate checks now pass (re-run deterministically). ``attempt`` is the cycle
+    # that resolved it.
+    event: Literal["infra_repair_resolved"] = "infra_repair_resolved"
+    phase_id: str
+    attempt: int
+
+
+class InfraRepairExhausted(_Event):
+    # The infra-repair cap was reached and the gate is STILL infra-failing. The run
+    # escalates to a human; ``command`` names the unsatisfiable tool/command so the
+    # message is clear (not a vague worker failure).
+    event: Literal["infra_repair_exhausted"] = "infra_repair_exhausted"
+    phase_id: str
+    command: str
+    reason: str
+
+
+class EpochVerificationStarted(_Event):
+    # The end-of-epoch agentic verification pass (G4) began: the epoch cleared its
+    # deterministic floor and carries criteria, so the local tier judges them against
+    # the produced artifacts in a tip worktree. ``criteria`` is how many were judged.
+    event: Literal["epoch_verification_started"] = "epoch_verification_started"
+    phase_id: str
+    epoch_id: str
+    criteria: int
+
+
+class EpochVerificationPassed(_Event):
+    # The verification pass judged EVERY criterion met by the actual artifacts; the
+    # epoch's semantic gate is clear and the run proceeds.
+    event: Literal["epoch_verification_passed"] = "epoch_verification_passed"
+    phase_id: str
+    epoch_id: str
+
+
+class EpochVerificationFailed(_Event):
+    # The verification pass found an unmet criterion (or could not produce a valid
+    # verdict, a fail-safe). The epoch is routed through the failed-epoch machinery
+    # with the gaps as the planner-facing reason. ``gaps`` names what was unmet.
+    event: Literal["epoch_verification_failed"] = "epoch_verification_failed"
+    phase_id: str
+    epoch_id: str
+    gaps: list[str]
+
+
 class TaskDispatched(_Event):
     event: Literal["task_dispatched"] = "task_dispatched"
     epoch_id: str
@@ -225,6 +295,13 @@ Event = Annotated[
         EpochCompleted,
         EpochFailed,
         FailedEpochHandled,
+        InfraCheckDetected,
+        InfraRepairDispatched,
+        InfraRepairResolved,
+        InfraRepairExhausted,
+        EpochVerificationStarted,
+        EpochVerificationPassed,
+        EpochVerificationFailed,
         TaskDispatched,
         TaskRetried,
         TaskEscalated,
@@ -508,6 +585,14 @@ def replay(events: list[Event]) -> RunTree:
             epoch.ended_ts = ev.ts
         elif isinstance(ev, FailedEpochHandled):
             epochs_by_id[ev.epoch_id].status = f"failed ({ev.action})"
+        elif isinstance(ev, EpochVerificationStarted):
+            epochs_by_id[ev.epoch_id].status = "verifying"
+        elif isinstance(ev, EpochVerificationPassed):
+            epochs_by_id[ev.epoch_id].status = "verified"
+        elif isinstance(ev, EpochVerificationFailed):
+            epoch = epochs_by_id[ev.epoch_id]
+            epoch.status = "verification_failed"
+            epoch.ended_ts = ev.ts
         elif isinstance(ev, TaskDispatched):
             task = _task(epochs_by_id[ev.epoch_id], ev.task_id)
             task.status = "dispatched"

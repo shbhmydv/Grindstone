@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from grindstone.config import PrepareConfig
+from grindstone.config import FloorConfig, PrepareConfig
 from grindstone.contracts.models import CmdCheck
 from grindstone.prepare import PrepareError, materialize_env
 from grindstone.rundir import create_run_dir
@@ -218,3 +218,80 @@ def test_evaluate_checks_surfaces_prepare_failure(tmp_path: Path) -> None:
     label, ok = results[0]
     assert ok is False
     assert "prepare failed" in label
+
+
+# --- the deterministic FLOOR through the gate (gate-rebalance G2) ---------------
+
+
+def test_floor_checks_run_in_the_gate(tmp_path: Path) -> None:
+    """A configured ``floor.checks`` command runs in the eval worktree and its
+    pass/fail becomes a gate result, appended after the supplied checks."""
+
+    repo = init_git_repo(tmp_path / "repo")
+    (repo / "marker.txt").write_text("ok\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "marker")
+    run = create_run_dir(repo, "run-floor")
+    floor = FloorConfig(checks=["test -f marker.txt"])
+    results = evaluate_checks(
+        [CmdCheck(cmd="true")],
+        repo=repo,
+        ref="HEAD",
+        run_dir=run,
+        scratch_name="_eval_floor_ok",
+        floor=floor,
+    )
+    # The supplied check, then the floor check, both pass.
+    assert [ok for _, ok in results] == [True, True]
+    assert "test -f marker.txt" in results[1][0]
+
+
+def test_failing_floor_check_fails_the_gate_with_output(tmp_path: Path) -> None:
+    """A FAILING floor check fails the gate exactly like a failed done_when, and
+    its captured output is surfaced (the planner can see WHY, not a bare exit)."""
+
+    repo = init_git_repo(tmp_path / "repo")
+    run = create_run_dir(repo, "run-floor-fail")
+    floor = FloorConfig(checks=["echo floor-stderr >&2 && exit 2"])
+    results = evaluate_checks(
+        [CmdCheck(cmd="true")],
+        repo=repo,
+        ref="HEAD",
+        run_dir=run,
+        scratch_name="_eval_floor_fail",
+        floor=floor,
+    )
+    assert results[0][1] is True  # supplied check passes
+    label, ok = results[1]  # floor check fails the gate
+    assert ok is False
+    assert "exit 2" in label
+    assert "floor-stderr" in label  # captured output reaches the planner
+
+
+def test_floor_runs_after_prepare_so_a_dep_check_passes(tmp_path: Path) -> None:
+    """The floor runs AFTER ``prepare`` materializes deps: a floor check that
+    needs the gitignored env_dir PASSES because prepare restored it first."""
+
+    repo = init_git_repo(tmp_path / "repo")
+    (repo / ".gitignore").write_text(
+        ".grindstone/\n__pycache__/\nnode_modules/\n", encoding="utf-8"
+    )
+    _write_lock(repo, "v1")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "lockfile")
+    run = create_run_dir(repo, "run-floor-prep")
+    counter = tmp_path / "counter"
+    prepare = _counting_prepare(counter)  # produces node_modules/marker
+    # The floor check needs node_modules, absent in the committed tip, present
+    # only because prepare ran FIRST.
+    floor = FloorConfig(checks=["test -f node_modules/marker"])
+    results = evaluate_checks(
+        [],
+        repo=repo,
+        ref="HEAD",
+        run_dir=run,
+        scratch_name="_eval_floor_after_prep",
+        prepare=prepare,
+        floor=floor,
+    )
+    assert results[0][1] is True  # the floor check passed thanks to prepare

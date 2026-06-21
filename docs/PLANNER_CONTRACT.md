@@ -206,13 +206,24 @@ Common shape:
 - `inputs`: **log keys only.** The validator rejects a key that does not exist
   in the keyed log at validation time, the structural guard against the planner
   hallucinating an upstream artifact.
-- `done_when`: 1–6 deterministic checks (see *Checks* below). The worker runs
-  them, then Grindstone re-runs them on return; a task whose checks cannot run is
-  FAILED, never vibes-DONE. `done_when` is scoped by mode: a research / review /
-  artifact task runs in a scratch dir that is **not** a repo checkout, so its
-  `done_when` must verify the artifact itself (e.g. `test -s notes.md`), never a
-  repo build/test command (those can only pass in an implement task or a phase
-  exit criterion).
+- `done_when`: 1–6 deterministic **structural** checks (see *Checks* below). The
+  worker runs them, then Grindstone re-runs them on return; a task whose checks
+  cannot run is FAILED, never vibes-DONE. `done_when` is scoped by mode: a
+  research / review / artifact task runs in a scratch dir that is **not** a repo
+  checkout, so its `done_when` must verify the artifact itself (e.g.
+  `test -s notes.md`), never a repo build/test command (those can only pass in an
+  implement task or a phase exit criterion). Checks are for **structural facts
+  only** (build, test, type-check, file existence); a **content-grep** (`rg` /
+  `grep` / `egrep` / `fgrep` / `ag` / `ack` for a token) is a brittle proxy and is
+  **rejected by the validator** in any segment of a check command. The
+  verification **floor** (a clean worktree, a valid handoff, committed work, and
+  the repo's own build/test) is owned by the repo config and the core and runs on
+  every gate automatically; do not restate it in `done_when`.
+- `criteria`: optional list of natural-language **semantic acceptance**
+  statements (e.g. "the plan maps every Honey/Sky/Pink/Ink ramp to a React Native
+  equivalent"). These are judged by an agentic verification pass, never by a shell
+  command. Express the bar here whenever it is content or semantic rather than
+  structural, the content-grep you would otherwise reach for is exactly this.
 - `skills`: optional catalog names (reserved seam).
 
 Mode-specific:
@@ -256,7 +267,10 @@ rather than crash.) Omit the flag for backend / logic / plain-text work.
 A check is one of three shapes:
 
 - `{"cmd": "...", "expect_exit": 0}`: a shell command; passes when its exit code
-  equals `expect_exit` (default 0).
+  equals `expect_exit` (default 0). It must assert a **structural** fact (a build
+  / test / type-check command, or `test -f` for existence); a content-grep
+  (`rg` / `grep` / `egrep` / `fgrep` / `ag` / `ack` for a token, in any pipeline
+  segment) is rejected, use `criteria` for the semantic bar instead.
 - `{"artifact_exists": "<log key>"}`: passes when the keyed log holds that
   artifact (an exact key, or a bare filename that matches exactly one logged
   artifact, useful in a phase exit criterion written before the producing task's
@@ -274,6 +288,28 @@ in the same criterion that builds + screenshots the UI into the tip worktree
 the gate through a request script (the rig's `vision_review.sh`), re-reads the
 returned `vision_verdict.json` (a disk contract, never stdout), and treats a
 failed taste verdict exactly like a failed command.
+
+### Who verifies what: three sources, not one
+
+Verification has **three sources, owned by three parties**, and the planner owns
+only two of them:
+
+1. **The floor** (repo config + the core, NOT the planner). The core invariants
+   (clean worktree, valid handoff, committed work) plus the repo's own canonical
+   build/test commands run on **every** gate automatically. Do not author or
+   restate them; a planner-invented proxy can never gate a structurally-correct
+   build.
+2. **Structural `checks`** (you, deterministic). Your `done_when` / exit criteria
+   add **structural facts** on top of the floor: a command's exit code, file
+   existence. A content-grep is rejected (above).
+3. **Semantic `criteria`** (you, natural language). Judged by an **agentic
+   verification pass** (the local tier, adversarial, told to find gaps and default
+   to FAIL), **not** by a shell command. After an epoch clears its floor, that
+   pass reads the produced artifacts against your `criteria` and writes a verdict;
+   if a criterion is unmet, the epoch is **failed** and routed to you as a
+   `handle_failed_epoch` decision carrying the concrete `semantic_gaps` (§8). So
+   the content-grep you would reach for, write as `criteria` and the pass enforces
+   it; a passing structural gate does not let an incomplete epoch slip.
 
 ## 6. Integration policy (implement epochs)
 
@@ -317,6 +353,10 @@ starting tier exhausted     → escalate the task to the next ladder tier (one a
 ladder exhausted            → mark the task FAILED; the epoch continues, the failure lands in the report
 epoch with a FAILED task    → FOCUSED handle_failed_epoch decision (the ONLY legal tool until disposed):
                               retry (hint, optional tier bump) | escalate_senior (diagnosis) | halt (reason)
+floor passed, criterion unmet → the agentic verification pass FAILS the epoch → the SAME focused
+                              handle_failed_epoch decision, carrying the concrete semantic_gaps
+infra-classified gate failure → the core auto-dispatches a bounded SENIOR infra-repair (no decision asked);
+                              re-runs the gate; cap exhausted → run escalates to a human, naming the command
 per-phase failed-epoch cap  → after `max_failed_epochs_per_phase` (default 3) failed epochs in one phase the
                               state machine FORCES a halt-to-human regardless of the planner's choice
 epoch budget exhausted      → phase escalation → planner (revise_phases | escalate_run only)
@@ -325,11 +365,21 @@ epoch budget exhausted      → phase escalation → planner (revise_phases | es
 When an epoch fails the planner is asked a **focused** `handle_failed_epoch`
 decision, not left to react with a blind `revise_phases`. The decision input
 carries the failing phase checks **with their captured command output** (so the
-planner can tell an environment/gate problem from a code bug) and the worker
-handoffs that claimed an honest pass. If the workers keep reporting a pass while
-the gate fails the **same** way, the contract directs the planner to suspect the
-gate/environment and prefer `halt` over ordering yet another identical repair.
-`revise_phases` is reserved for a genuine phase-structure error.
+planner can tell an environment/gate problem from a code bug), the worker
+handoffs that claimed an honest pass, and, when the *agentic verification pass*
+is what failed the epoch, the `semantic_gaps` it found (the unmet `criteria`,
+re-derived from the verdict, not a check label). A semantic gap is disposed of
+exactly like a task failure: `retry` (the gaps ride to the worker as corrective
+feedback), `escalate_senior`, or `halt`. If the workers keep reporting a pass
+while the gate fails the **same** way, the contract directs the planner to
+suspect the gate/environment and prefer `halt` over ordering yet another
+identical repair. `revise_phases` is reserved for a genuine phase-structure error.
+
+An **infra-classified** gate failure (exit 127, a missing tool/dependency, an
+install failure, see ARCHITECTURE.md) is **not** surfaced to the planner at all:
+the core auto-dispatches a bounded senior infra-repair and re-runs the gate, so
+the planner never spends a decision (or a failed-epoch budget) on an environment
+problem. Only when the repair cap is exhausted does the run escalate to a human.
 
 `planner_calls_per_run` is a first-class journal metric; every CLI-driven run
 carries a `max_planner_calls` backstop AND a deterministic

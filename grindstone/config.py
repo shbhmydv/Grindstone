@@ -202,6 +202,86 @@ class PrepareConfig(BaseModel):
         return v
 
 
+class FloorConfig(BaseModel):
+    """The deterministic FLOOR: the repo's canonical verification commands.
+
+    The first of three verification sources (the gate-rebalance brief): the
+    commands the REPO and the CORE own, never the planner. Each ``check`` is a
+    shell command re-run in the eval worktree AFTER ``prepare`` materializes deps,
+    with the same pass/fail semantics as a ``done_when`` (exit 0 == pass); a
+    failing floor check fails the gate exactly like a failed exit criterion, its
+    captured output surfaced to the planner. The planner never authors or restates
+    the floor, so a brittle planner-invented proxy (token greps, host-tool paths)
+    can never gate a structurally-correct build.
+
+    ``checks`` may be EMPTY: a fresh project starts with a minimal floor and grows
+    it. ``None`` on the whole config (the default) = no repo floor commands, only
+    the core invariants apply, existing runs are byte-unchanged.
+    """
+
+    model_config = _FROZEN
+    checks: list[str]
+
+    @field_validator("checks")
+    @classmethod
+    def _checks_non_empty_strings(cls, v: list[str]) -> list[str]:
+        # An empty LIST is allowed (a minimal fresh-project floor); an empty
+        # COMMAND string in the list is a config typo that would silently pass.
+        if any(not c.strip() for c in v):
+            raise ValueError("every floor check must be a non-empty command")
+        return v
+
+
+class InfraRepairConfig(BaseModel):
+    """The automatic senior infra-repair policy (gate-rebalance G3).
+
+    When a gate check fails for an ENVIRONMENTAL reason (``infra.classify_check_failure``:
+    exit 127, a missing tool/dependency, an install failure), the core does NOT
+    charge the worker or open a semantic failed epoch. It dispatches a SENIOR
+    infra-repair task against a worktree of the failing gate's tip, told to make
+    the gate environment satisfiable WITHOUT rewriting application logic, then
+    re-runs the gate. ``attempts`` bounds the repair cycles per gate (>= 0; 0
+    disables auto-repair, an infra fail then escalates immediately); on exhaustion
+    the run escalates to a human naming the unsatisfiable command.
+
+    ``allow_host_commands`` is the HOST-COMMAND GUARD: repo-local / in-worktree
+    fixes (``npm install`` a dep landing in package.json, editing config inside the
+    repo) are intended to be automatic, while host-level / privileged actions
+    (``sudo``, ``apt``, system-wide installs, writes outside the repo) should be
+    declined unless their leading token is listed here. The allowlist is CARRIED
+    into the repair dispatch and surfaced in the repair prompt (repo-local-only +
+    the exact allowlist). It is ADVISORY ONLY: the default senior adapter runs the
+    repair agent with ``--dangerously-skip-permissions`` and full Bash, so this list
+    is a prompt-level policy the senior is asked to honour, NOT a kernel/sandbox
+    boundary it is prevented from crossing. A confused or adversarial senior CAN run
+    a host-mutating command despite an empty allowlist. This is bounded by the repair
+    running in a throwaway worktree and a false DONE being caught by the post-repair
+    gate recheck, but it is not a hard sandbox: only enable ``infra_repair`` on a
+    TRUSTED host and a repo you trust. Default EMPTY (nothing host-level allowed).
+
+    ``None`` on the whole config (the default) = no auto-repair; an infra fail is
+    surfaced but routes through the ordinary failed-epoch / gate path unchanged.
+    """
+
+    model_config = _FROZEN
+    attempts: int = 2
+    allow_host_commands: list[str] = []
+
+    @field_validator("attempts")
+    @classmethod
+    def _attempts_non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("infra_repair.attempts must be >= 0")
+        return v
+
+    @field_validator("allow_host_commands")
+    @classmethod
+    def _host_commands_non_empty(cls, v: list[str]) -> list[str]:
+        if any(not c.strip() for c in v):
+            raise ValueError("every allow_host_commands entry must be non-empty")
+        return v
+
+
 class GrindstoneConfig(BaseModel):
     """The whole per-repo config; unknown keys at any level are rejected."""
 
@@ -241,6 +321,25 @@ class GrindstoneConfig(BaseModel):
     #: Present = the gitignored dependency dirs are restored (cached) before
     #: checks/workers run, so build gates are not structurally unpassable.
     prepare: PrepareConfig | None = None
+    #: The deterministic FLOOR: repo-owned canonical verification commands run
+    #: every gate AFTER ``prepare``, never authored by the planner. ``None``
+    #: (absent block) = OFF, only the core invariants apply (existing runs are
+    #: byte-unchanged). Present = each ``floor.checks`` command is re-run in the
+    #: eval worktree as a deterministic check (exit 0 == pass).
+    floor: FloorConfig | None = None
+    #: The automatic senior infra-repair policy (G3). ``None`` (absent block) =
+    #: OFF, an infra-classified gate failure routes through the ordinary path
+    #: unchanged. Present = an infra fail auto-dispatches a bounded, host-guarded
+    #: senior repair that makes the gate satisfiable, then re-runs the gate.
+    infra_repair: InfraRepairConfig | None = None
+    #: The end-of-epoch agentic verification pass (G4). Default ON: whenever an epoch
+    #: carries natural-language ``criteria`` AND a local tier exists, the core runs
+    #: one adversarial verification pass over those criteria after the deterministic
+    #: floor clears; an unmet criterion fails the epoch through the failed-epoch
+    #: machinery. The pass NEVER runs (and never errors) when an epoch has no criteria
+    #: or there is no local tier. Set to ``false`` to disable the pass entirely (the
+    #: deterministic floor + planner review epochs still gate). A bool, default True.
+    verify_epochs: bool = True
 
     @field_validator("max_failed_epochs_per_phase")
     @classmethod

@@ -43,7 +43,6 @@ for req in repo prompt out handle_out; do
 done
 
 repo="$(cd "$repo" && pwd)"
-prompt_text="$(cat "$prompt")"
 mkdir -p "$(dirname "$out")"
 out="$(cd "$(dirname "$out")" && pwd)/$(basename "$out")"
 mkdir -p "$(dirname "$handle_out")"
@@ -73,18 +72,19 @@ trap 'rm -f "$err_tmp"' EXIT
 # The append-system-prompt reinforces the JSON-only contract the prompt requests.
 sys_append="Output ONLY a single JSON object that matches the grindstone epoch-decision schema (schema_version, tool, args). No prose, no markdown code fences, no commentary before or after the object."
 
-# Arg ORDER is load-bearing: --allowedTools is variadic (greedy), so it MUST be
-# followed by another OPTION (here --append-system-prompt), never directly by the
-# positional prompt, or the prompt would be swallowed as a tool name. Keep the
-# prompt last, immediately after a single-value option.
+# The prompt is fed to claude on STDIN (`claude -p` reads the prompt from stdin),
+# never as an argv string: a large constructed planner input (job spec + skeleton
+# + repo memory + repo map) could otherwise exceed the kernel's MAX_ARG_STRLEN
+# (~128KB) and the CLI dies before launching ("Argument list too long"). Stdin
+# makes the prompt size irrelevant; --allowedTools is no longer adjacent to a
+# positional, so its greedy variadic parse is also safe.
 set +e
 ( cd "$repo" && "${timeout_prefix[@]}" claude -p \
   --model "$model" \
   --output-format text \
   --allowedTools Read Grep Glob \
-  --append-system-prompt "$sys_append" \
-  "$prompt_text" ) \
-  < /dev/null > "$out" 2> "$err_tmp"
+  --append-system-prompt "$sys_append" ) \
+  < "$prompt" > "$out" 2> "$err_tmp"
 rc=$?
 set -e
 

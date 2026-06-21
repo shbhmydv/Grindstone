@@ -1,0 +1,20 @@
+{
+  "schema_version": "1",
+  "tool": "implement",
+  "args": {
+    "epoch_title": "build the welcome screen",
+    "rationale": "semantic acceptance rides criteria, not a content-grep",
+    "tasks": [
+      {
+        "id": "T1",
+        "goal": "implement the Welcome screen per the design plan",
+        "done_when": [{ "cmd": "test -f src/screens/Welcome.tsx" }],
+        "criteria": [
+          "the Welcome screen maps the Honey/Sky/Pink/Ink ramps to React Native equivalents",
+          "the Baloo font is applied to the headline"
+        ],
+        "file_ownership": ["src/screens/Welcome.tsx"]
+      }
+    ]
+  }
+}

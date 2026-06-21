@@ -49,6 +49,7 @@ from grindstone.script_polish import ScriptPolisher
 from grindstone.script_vision import ScriptVisionReviewer, VisionReviewer
 from grindstone.script_worker import ScriptWorker
 from grindstone.tui import watch
+from grindstone.verify import EpochVerifier, WorkerEpochVerifier
 
 #: Per-run planner-call ceiling when the config does not set one. This is a
 #: runaway-spin BACKSTOP, not a quota ration: the codex subscription has ample
@@ -310,6 +311,22 @@ def _resolve_vision_reviewer(cfg: GrindstoneConfig | None) -> VisionReviewer | N
     return ScriptVisionReviewer(script=script, timeout_s=DEFAULT_VISION_TIMEOUT_S)
 
 
+def _resolve_verifier(ladder: Ladder, cfg: GrindstoneConfig | None) -> EpochVerifier | None:
+    """The G4 end-of-epoch verifier: the LOCAL tier wrapped as a ``WorkerEpochVerifier``.
+
+    Default ON (``verify_epochs`` true): the verification pass runs whenever an epoch
+    carries ``criteria`` AND a local tier exists. ``None`` (the pass is disabled)
+    when the config opts out (``verify_epochs: false``) or there is no ``local`` tier;
+    the run loop then skips the pass entirely (it still never errors with no criteria)."""
+
+    if cfg is not None and not cfg.verify_epochs:
+        return None
+    for name, transport in ladder:
+        if name == "local":
+            return WorkerEpochVerifier(transport)
+    return None
+
+
 def _resolve_final_polish(cfg: GrindstoneConfig | None) -> FinalPolish | None:
     """The B5 final-polish wiring: ``None`` unless the config opts in (OFF by
     default, codex never touches a completed run without it). When present, the
@@ -417,6 +434,9 @@ def _cmd_run(
             vision_reviewer=_resolve_vision_reviewer(cfg),
             final_polish=_resolve_final_polish(cfg),
             prepare=cfg.prepare if cfg is not None else None,
+            floor=cfg.floor if cfg is not None else None,
+            verifier=_resolve_verifier(ladder, cfg),
+            infra_repair=cfg.infra_repair if cfg is not None else None,
             max_failed_epochs_per_phase=_resolve_failed_epoch_cap(cfg),
             local_max_task_files=_resolve_task_file_bounds(cfg)[0],
             senior_max_task_files=_resolve_task_file_bounds(cfg)[1],
@@ -479,6 +499,9 @@ def _cmd_resume(
         vision_reviewer=_resolve_vision_reviewer(cfg),
         final_polish=_resolve_final_polish(cfg),
         prepare=cfg.prepare if cfg is not None else None,
+        floor=cfg.floor if cfg is not None else None,
+        verifier=_resolve_verifier(ladder, cfg),
+        infra_repair=cfg.infra_repair if cfg is not None else None,
         max_failed_epochs_per_phase=_resolve_failed_epoch_cap(cfg),
         local_max_task_files=_resolve_task_file_bounds(cfg)[0],
         senior_max_task_files=_resolve_task_file_bounds(cfg)[1],

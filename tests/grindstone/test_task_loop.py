@@ -225,6 +225,49 @@ def test_invalid_relocated_handoff_is_deleted(
     assert not run_dir.resolve(f"{FQ}/handoff.json").exists()
 
 
+class _OversizeHandoffWorker:
+    """Writes an absurdly large handoff.json (over the DoS guard) plus the deliverable.
+
+    Models a pathological/corrupt handoff: the size backstop must REJECT it (fail-safe)
+    before reading it, while never truncating real content."""
+
+    def run(self, request: WorkerRequest) -> None:
+        from grindstone.task_loop import HANDOFF_FILE_MAX_BYTES
+
+        (request.scratch / "review.md").write_text("reviewed\n", encoding="utf-8")
+        (request.scratch / OUT_FILE).write_text(OUT_CONTENT, encoding="utf-8")
+        # A syntactically valid JSON object whose size blows past the guard.
+        blob = "z" * (HANDOFF_FILE_MAX_BYTES + 4096)
+        (request.scratch / "handoff.json").write_text(
+            json.dumps({"junk": blob}), encoding="utf-8"
+        )
+
+
+def test_oversized_handoff_is_rejected_by_dos_guard(
+    git_repo: Path, run_dir: RunDir, toy_task: ImplementTask
+) -> None:
+    """Item F: a handoff.json above the megabyte-scale DoS guard is REJECTED (fail-safe,
+    a failed attempt), not truncated, and never relocated."""
+
+    outcome = _run_impl(
+        git_repo, run_dir, toy_task, _ladder(_OversizeHandoffWorker()), tier0_attempts=1
+    )
+    assert outcome.tasks[0].status == "failed"
+    assert "DoS guard" in (outcome.tasks[0].failure_reason or "")
+    assert not run_dir.resolve(f"{FQ}/handoff.json").exists()
+
+
+def test_normal_large_handoff_reads_fine(
+    git_repo: Path, run_dir: RunDir, toy_task: ImplementTask
+) -> None:
+    """The guard only fires on absurd files: a normal handoff (well under the guard) is
+    read in full and accepted (no truncation of real content)."""
+
+    outcome = _run_impl(git_repo, run_dir, toy_task, _ladder(make_ok_worker()), tier0_attempts=1)
+    assert outcome.tasks[0].status == "done"
+    assert run_dir.resolve(f"{FQ}/handoff.json").is_file()
+
+
 # --- grounding spot-check ------------------------------------------------------
 
 
@@ -252,10 +295,20 @@ def test_citation_line_beyond_file_rejected(
 
 
 def test_done_when_re_run_overrides_worker_claim(
-    git_repo: Path, run_dir: RunDir, toy_task: ImplementTask
+    git_repo: Path, run_dir: RunDir
 ) -> None:
-    worker = MockWorker(script=["ok"], artifacts={OUT_FILE: "WRONG\n"})
-    outcome = _run_impl(git_repo, run_dir, toy_task, _ladder(worker), tier0_attempts=1)
+    # The worker claims "ok" but writes the file to the WRONG path; the structural
+    # done_when (the expected file must exist) is RE-RUN on return and fails,
+    # overriding the lying claim. (Checks are structural facts only; content
+    # acceptance is `criteria`, judged by the agentic pass, not a done_when grep.)
+    task = ImplementTask(
+        id="T1",
+        goal=f"create {OUT_FILE}",
+        done_when=[CmdCheck(cmd=f"test -f {OUT_FILE}")],
+        file_ownership=[OUT_FILE, "decoy.txt"],
+    )
+    worker = MockWorker(script=["ok"], artifacts={"decoy.txt": OUT_CONTENT})
+    outcome = _run_impl(git_repo, run_dir, task, _ladder(worker), tier0_attempts=1)
     assert outcome.tasks[0].status == "failed"
     assert "done_when" in (outcome.tasks[0].failure_reason or "")
 
@@ -302,6 +355,44 @@ def test_out_of_scope_write_is_rejected_and_retried(
     assert outcome.tasks[0].attempts == 2
     rejected = [e for e in read_events(run_dir.events_path) if e.event == "handoff_rejected"]
     assert any("out-of-scope" in e.reason for e in rejected)
+
+
+# --- floor core invariant: work must actually be committed (gate-rebalance G2) --
+
+
+def test_zero_diff_done_handoff_is_rejected(git_repo: Path, run_dir: RunDir) -> None:
+    """An implement task that hands off DONE but lands a ZERO-DIFF branch (the
+    worker wrote nothing to its owned files) is rejected: a DONE claim that
+    committed no work is a structural gap the floor catches, the handoff
+    re-validation + a trivially-true done_when would otherwise pass it."""
+
+    # done_when is trivially true and grounding cites only base files, so the
+    # ONLY thing that can reject this attempt is the committed-diff invariant.
+    task = ImplementTask(
+        id="T1",
+        goal="claim done while writing nothing",
+        done_when=[CmdCheck(cmd="true")],
+        file_ownership=[OUT_FILE],
+    )
+    # The worker writes ONLY metadata (review.md + handoff), no owned file -> the
+    # commit is zero-diff after the metadata is stripped pre-commit.
+    worker = HandoffWorker(
+        handoff_payload(citations=[{"file": "README.md"}]), files={}
+    )
+    outcome = _run_impl(git_repo, run_dir, task, _ladder(worker), tier0_attempts=1)
+    assert outcome.tasks[0].status == "failed"
+    assert "no committed work" in (outcome.tasks[0].failure_reason or "")
+
+
+def test_real_committed_work_passes_the_invariant(
+    git_repo: Path, run_dir: RunDir, toy_task: ImplementTask
+) -> None:
+    """The good case: a task that actually writes its owned file lands a
+    non-empty diff and passes the committed-diff invariant cleanly."""
+
+    outcome = _run_impl(git_repo, run_dir, toy_task, _ladder(make_ok_worker()))
+    assert outcome.tasks[0].status == "done"
+    assert OUT_FILE in tracked_files(git_repo, outcome.integration.branch or "HEAD")
 
 
 # --- status mapping ------------------------------------------------------------
@@ -857,3 +948,176 @@ def test_running_state_snapshot_during_attempt(
     assert seen["status"] == "running"
     assert seen["attempt"] == 1
     assert seen["scratch"] is not None
+
+
+# --- PART C: bounded rejection reasons (no list/reason can balloon a prompt) ---
+# RCA: a worker materialized node_modules, the scope check rejected every path,
+# producing a ~1.8M-char reason. That reason was replayed into the next attempt's
+# worker prompt and, passed as an argv string by the request scripts, overflowed
+# the kernel argv limit so the CLI never launched. The reason and the failure
+# context fed into the prompt must both be bounded.
+
+from grindstone.task_loop import (  # noqa: E402
+    _MAX_NAMED_SCOPE_VIOLATIONS,
+    _MAX_FAILURE_CONTEXT_BYTES,
+    _bound_reason,
+    _format_scope_violations,
+)
+
+
+def test_format_scope_violations_caps_named_paths() -> None:
+    paths = [f"node_modules/.bin/tool-{i:04d}" for i in range(5000)]
+    reason = _format_scope_violations(paths)
+    # At most N paths are named, the rest summed as "... and K more".
+    named = reason.split("out-of-scope writes: ", 1)[1].split(", ... and ", 1)[0]
+    assert len(named.split(", ")) == _MAX_NAMED_SCOPE_VIOLATIONS
+    assert f"... and {5000 - _MAX_NAMED_SCOPE_VIOLATIONS} more" in reason
+    # The whole reason is small (kilobytes), never megabytes.
+    assert len(reason) < 4096
+
+
+def test_format_scope_violations_small_list_has_no_more_suffix() -> None:
+    reason = _format_scope_violations(["b/z.py", "a/x.py"])
+    # Sorted, fully named, no truncation marker.
+    assert reason == "out-of-scope writes: a/x.py, b/z.py"
+    assert "more" not in reason
+
+
+def test_bound_reason_truncates_oversized_with_marker() -> None:
+    huge = "x" * (2 * _MAX_FAILURE_CONTEXT_BYTES)
+    bounded = _bound_reason(huge)
+    assert len(bounded.encode("utf-8")) <= _MAX_FAILURE_CONTEXT_BYTES + 64
+    assert "reason truncated" in bounded
+    assert str(len(huge.encode("utf-8"))) in bounded
+
+
+def test_bound_reason_passes_through_small_text() -> None:
+    small = "out-of-scope writes: a/x.py"
+    assert _bound_reason(small) == small
+
+
+# --- PART D: reference-not-embed prior-failure feedback ------------------------
+# The worker's prior-failure feedback is a SHORT summary + PATHS to the full detail
+# on disk, never the embedded bulk. The full detail must EXIST at the referenced
+# path; the inline summary stays tiny regardless of how large the failure was.
+
+from grindstone.task_loop import (  # noqa: E402
+    _MAX_SUMMARY_CHARS,
+    _full_scope_violations,
+    _summarize_reason,
+)
+
+
+def test_summarize_reason_keeps_first_line_short() -> None:
+    reason = "done_when failed: test -f src/design-system/theme.ts"
+    assert _summarize_reason(reason) == reason
+
+
+def test_summarize_reason_clips_oversized_to_one_short_line() -> None:
+    huge = "out-of-scope writes: " + ", ".join(f"node_modules/p{i}" for i in range(500))
+    summary = _summarize_reason(huge)
+    assert len(summary) <= _MAX_SUMMARY_CHARS
+    assert "\n" not in summary
+    assert summary.startswith("out-of-scope writes:")
+
+
+def test_full_scope_violations_lists_every_path() -> None:
+    paths = [f"node_modules/.bin/tool-{i:04d}" for i in range(5000)]
+    full = _full_scope_violations(paths)
+    assert "5000 paths" in full
+    assert full.count("\n") == 5000  # header line + one line per path
+
+
+def test_scope_rejection_feedback_is_summary_plus_path_not_bulk(
+    git_repo: Path, run_dir: RunDir, toy_task: ImplementTask
+) -> None:
+    """A worker that writes a HUGE out-of-scope set is rejected; the NEXT attempt's
+    failure_context carries a short summary + a PATH, the full path list lives at
+    that path on disk, and the inline entry stays tiny (never the bulk)."""
+
+    evil = {f"junk/file-{i:04d}.txt": "x\n" for i in range(300)}
+    bad = HandoffWorker(handoff_payload(), files={OUT_FILE: OUT_CONTENT, **evil})
+
+    seen: list[list[str]] = []
+
+    class _Probe:
+        """Second attempt: record the failure_context it received, then succeed."""
+
+        def run(self, request: WorkerRequest) -> None:
+            seen.append(list(request.failure_context))
+            make_ok_worker().run(request)
+
+    class _Switch:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(self, request: WorkerRequest) -> None:
+            self.calls += 1
+            (bad if self.calls == 1 else _Probe()).run(request)
+
+    outcome = _run_impl(git_repo, run_dir, toy_task, _ladder(_Switch()))
+    assert outcome.tasks[0].status == "done"
+    assert outcome.tasks[0].attempts == 2
+
+    # The second attempt saw exactly one prior-failure entry.
+    assert len(seen) == 1 and len(seen[0]) == 1
+    entry = seen[0][0]
+    # SHORT: the inline entry is a summary + path, never the 300-path bulk.
+    assert len(entry) < 2048
+    assert "out-of-scope writes" in entry
+    assert "full detail:" in entry
+    # The 300 junk paths are NOT all embedded inline.
+    assert entry.count("junk/file-") < 300
+    # The referenced detail PATH exists on disk and contains the FULL list.
+    path_str = entry.split("full detail: ", 1)[1].split("]", 1)[0].split(";", 1)[0].strip()
+    detail = Path(path_str)
+    assert detail.is_file()
+    body = detail.read_text(encoding="utf-8")
+    assert "300 paths" in body
+    assert body.count("junk/file-") == 300
+
+
+def test_done_when_failure_feedback_references_persisted_detail(
+    git_repo: Path, run_dir: RunDir
+) -> None:
+    """A done_when rejection records a summary + path; the rejected handoff.json is
+    copied alongside the detail and referenced, and the worker still learns what
+    failed (the failure category survives in the summary)."""
+
+    task = ImplementTask(
+        id="T1",
+        goal="create out.txt but fail the gate",
+        done_when=[CmdCheck(cmd="test -f never_made.txt")],
+        file_ownership=[OUT_FILE, "never_made.txt"],
+    )
+    # Worker writes the handoff + a real owned file (so it is not a zero-diff/empty
+    # attempt) but never makes never_made.txt, so done_when fails.
+    bad = HandoffWorker(
+        handoff_payload(out_file=OUT_FILE), files={OUT_FILE: OUT_CONTENT}
+    )
+
+    seen: list[list[str]] = []
+
+    class _Probe:
+        def run(self, request: WorkerRequest) -> None:
+            seen.append(list(request.failure_context))
+            # second attempt also fails the same way -> drives to FAILED quickly
+            bad.run(request)
+
+    class _Switch:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(self, request: WorkerRequest) -> None:
+            self.calls += 1
+            (bad if self.calls == 1 else _Probe()).run(request)
+
+    _run_impl(git_repo, run_dir, task, _ladder(_Switch()), tier0_attempts=2)
+
+    assert seen and seen[0]
+    entry = seen[0][0]
+    assert "done_when failed" in entry  # worker still learns WHAT failed
+    assert "full detail:" in entry
+    assert "rejected handoff:" in entry  # the handoff was copied + referenced
+    handoff_str = entry.split("rejected handoff: ", 1)[1].split("]", 1)[0].strip()
+    assert Path(handoff_str).is_file()  # the rejected handoff exists on disk

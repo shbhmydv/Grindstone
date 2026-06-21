@@ -168,6 +168,68 @@ def test_watch_terminal_run_exits_zero(git_repo: Path) -> None:
     assert main(["watch", str(run_dir)]) == 0
 
 
+# --- resume: the G4 verifier is wired exactly like `run` (P0 repro) ------------
+
+
+def test_resume_passes_verifier_like_run(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P0: `grindstone resume` must build + pass the G4 verifier to ``resume_grind``
+    exactly as `run` does for ``run_grind``. The scaffolded config has ``verify_epochs``
+    on + a local tier, so a NON-None verifier must reach ``resume_grind``; before the
+    fix it passed ``None`` and silently lost semantic verification for the whole
+    remainder of any resumed run."""
+
+    main(["init", "--repo", str(git_repo)])
+    job = git_repo / "job.md"
+    job.write_text("x\n", encoding="utf-8")
+    main(
+        ["run", str(job), "--repo", str(git_repo), "--run-id", "rv"],
+        planner=MockPlanner(script=[two_phase_skeleton(), complete_decision(check_cmd("true"))]),
+        ladder=_ladder(),
+    )
+
+    captured: dict[str, object] = {}
+    real = cli.resume_grind
+
+    def _spy(run_dir: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return real(run_dir, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cli, "resume_grind", _spy)
+    main(["resume", "rv", "--repo", str(git_repo)], planner=MockPlanner(script=[]), ladder=_ladder())
+    assert captured["verifier"] is not None
+
+
+def test_resume_no_verifier_when_verify_epochs_off(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With ``verify_epochs: false`` in the config the resume path stays verifier-less
+    (a clean skip, the no-verifier case must keep behaving as today)."""
+
+    main(["init", "--repo", str(git_repo)])
+    cfg = git_repo / ".grindstone" / "config.yaml"
+    cfg.write_text(cfg.read_text(encoding="utf-8") + "\nverify_epochs: false\n", encoding="utf-8")
+    job = git_repo / "job.md"
+    job.write_text("x\n", encoding="utf-8")
+    main(
+        ["run", str(job), "--repo", str(git_repo), "--run-id", "rnv"],
+        planner=MockPlanner(script=[two_phase_skeleton(), complete_decision(check_cmd("true"))]),
+        ladder=_ladder(),
+    )
+
+    captured: dict[str, object] = {}
+    real = cli.resume_grind
+
+    def _spy(run_dir: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return real(run_dir, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cli, "resume_grind", _spy)
+    main(["resume", "rnv", "--repo", str(git_repo)], planner=MockPlanner(script=[]), ladder=_ladder())
+    assert captured["verifier"] is None
+
+
 # --- resume: terminal run is idempotent through main ---------------------------
 
 

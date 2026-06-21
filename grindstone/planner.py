@@ -30,18 +30,22 @@ Input construction is a PURE function over durable state (ruling 3):
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal, Protocol
 
 from grindstone.contracts.gate import decision_schema_errors
 from grindstone.contracts.models import (
+    ArtifactEpochArgs,
     EpochDecision,
     ImplementDecision,
+    ImplementEpochArgs,
     Phase,
     parse_decision,
     parse_handoff,
 )
 from grindstone.contracts.semantics import (
+    content_grep_check_violations,
     epoch_decision_violations,
     implement_task_size_violations,
 )
@@ -73,6 +77,7 @@ __all__ = [
     "TOOL_NAMES",
     "TransportError",
     "WorkerTimeout",
+    "WorkspaceInfo",
     "backoff_delay",
     "build_planner_input",
     "classify_failure",
@@ -177,9 +182,23 @@ Rules:
 - The first decision of a run MUST be propose_skeleton. After that, every call
   is an epoch boundary: choose one of implement / research / review / artifact
   (1-8 independent fan-out tasks), revise_phases, escalate_run, or complete_run.
-- You define exit criteria and done_when as DETERMINISTIC checks (a command with
-  an expected exit code, or a required artifact log key). The state machine
-  evaluates them; you never claim a phase or task is done.
+- You define exit criteria and done_when as DETERMINISTIC STRUCTURAL checks (a
+  command with an expected exit code, or a required artifact log key). They are
+  for structural facts ONLY: the project's own build / test / type-check
+  commands, and file existence (`test -f`). The state machine evaluates them; you
+  never claim a phase or task is done.
+- Do NOT author CONTENT-GREP checks. A check that greps a file's CONTENT for a
+  token (`rg`/`grep`/`egrep`/`fgrep`/`ag`/`ack` for a string or pattern) is a
+  brittle proxy that fails for environmental reasons and is REJECTED by the gate.
+  Express content or semantic acceptance ("the plan maps every ramp to an RN
+  equivalent", "the report cites the source for each claim") as natural-language
+  `criteria` on the task instead, an agentic pass judges those; a shell command
+  never does. `criteria` is an optional list of prose acceptance statements; use
+  it whenever the real bar is semantic rather than structural.
+- Do NOT restate the verification FLOOR. The clean worktree, a valid handoff,
+  committed work, and the repo's own build/test are owned by the repo config and
+  the core and run on every gate automatically; your `checks`/`done_when` add
+  task-specific STRUCTURAL facts on top, never a copy of the floor.
 - References, not payloads. A task's `inputs` are log keys that already EXIST in
   the keyed-log index below; never invent a key. Resulting artifacts are named
   by their log key, never inlined. An accepted artifact task's `artifact_out`
@@ -256,6 +275,31 @@ Rules:
   reason naming the suspected env/gate problem) over ordering yet another
   identical code repair, repeated identical repairs against a structurally
   unpassable gate is the failure mode this decision exists to stop.
+- The last epoch's verification VERDICT (when one ran) is in the `<workspace>`
+  manifest as a `.../verdict.json` path. It holds the verifier's per-criterion
+  judgement, the unmet `gaps`, and a DESCRIPTIVE steering `digest` (what the epoch
+  produced, what is incomplete or risky). READ that file to inform your NEXT decision.
+  It is steering, NOT a gate: the pass/fail came from the deterministic floor and the
+  criteria, never from this text. It is delivered BY REFERENCE (the full content lives
+  on disk; you read what you need) rather than embedded, so nothing is truncated.
+- READ-CAPABLE PLANNING. You run as a read-capable agent in the target repo: you
+  MAY (and when the last-epoch rows or the phase checks are not enough to decide
+  well, you SHOULD) grep and read on disk before deciding. The
+  `<workspace>` block below gives you ABSOLUTE paths you may read: the
+  integration-tip tree (a checkout of the CURRENT integration tip, the exact code
+  the gate evaluates), the keyed-log root, and a manifest mapping each live log key
+  (handoffs, the verdicts, relocated artifacts, the captured check output) to its
+  absolute path. The `<workspace>` `repo_map` path, when present, is a ranked
+  structural map of the current integration tip on disk (most-referenced
+  files/symbols first); READ it when doing STRUCTURAL planning (deciding what to
+  build, where things live, what already exists). It is large, so it is referenced
+  by path, not inlined; on a focused failed-epoch disposition you can skip it. Use
+  these handles to inspect the ACTUAL code, diffs, handoffs and artifacts rather
+  than steering blind on the digest alone. This is for STEERING ONLY: the
+  deterministic floor and the task criteria still DISPOSE of every gate, reading the
+  tree never changes what passes, and reading is your OWN internal step. Whatever
+  you read, your turn STILL ends with EXACTLY ONE epoch_decision tool call and
+  nothing else.
 - escalate_run only when you genuinely cannot proceed. complete_run only when
   the whole job is done; its `evidence` checks are re-run deterministically and
   rejected if they fail.
@@ -350,17 +394,17 @@ A check is {"cmd":..,"expect_exit"?:int} or {"artifact_exists":"<log key>"} or
 {"vision_review":{"screenshot":"<eval-worktree-relative path>","criteria":..}}
 (taste gate, phase exit criteria only, after a cmd check renders the shot).
 
-Example first decision (note: TWO phases minimum):
+Example first decision (note: TWO phases minimum; checks are STRUCTURAL only):
   {"schema_version":"1","tool":"propose_skeleton","args":{"phases":[
     {"id":"P1","title":"Build","exit_criterion":[{"cmd":"test -f out.txt","expect_exit":0}],"epoch_budget":2},
-    {"id":"P2","title":"Verify","exit_criterion":[{"cmd":"grep -q DONE out.txt","expect_exit":0}],"epoch_budget":1}]}}
+    {"id":"P2","title":"Verify","exit_criterion":[{"cmd":"npm test --silent","expect_exit":0}],"epoch_budget":1}]}}
 
 Example implement decision (two GENUINELY INDEPENDENT files, so two tasks with
-pairwise-DISJOINT file_ownership; each done_when is machine-checkable; each goal
-quotes the spec VERBATIM):
+pairwise-DISJOINT file_ownership; each done_when is a STRUCTURAL check, content
+acceptance rides `criteria`; each goal quotes the spec VERBATIM):
   {"schema_version":"1","tool":"implement","args":{"epoch_title":"Write greeting and version files","rationale":"two independent files, no shared state","tasks":[
-    {"id":"T1","goal":"Create greeting.txt. Spec verbatim: 'greeting.txt MUST contain exactly the line HELLO'.","done_when":[{"cmd":"grep -qx HELLO greeting.txt"}],"file_ownership":["greeting.txt"]},
-    {"id":"T2","goal":"Create version.txt. Spec verbatim: 'version.txt MUST contain exactly the line 1.0.0'.","done_when":[{"cmd":"grep -qx 1.0.0 version.txt"}],"file_ownership":["version.txt"]}]}}
+    {"id":"T1","goal":"Create greeting.txt. Spec verbatim: 'greeting.txt MUST contain exactly the line HELLO'.","done_when":[{"cmd":"test -f greeting.txt"}],"criteria":["greeting.txt contains exactly the line HELLO"],"file_ownership":["greeting.txt"]},
+    {"id":"T2","goal":"Create version.txt. Spec verbatim: 'version.txt MUST contain exactly the line 1.0.0'.","done_when":[{"cmd":"test -f version.txt"}],"criteria":["version.txt contains exactly the line 1.0.0"],"file_ownership":["version.txt"]}]}}
 """
 
 
@@ -407,9 +451,15 @@ def stable_head(job: str, skeleton: list[Phase] | None, repo_memory: str | None 
 def flatten_last_epoch(run_dir: RunDir, outcome: EpochOutcome) -> list[dict[str, object]]:
     """Flatten an EpochOutcome into compact per-task rows for ``<last_epoch>``.
 
-    DONE tasks contribute their handoff ``resulting_state`` + ``downstream_needs``
-    (read from the keyed log, references, never bodies); FAILED tasks contribute
-    their last failure reason. Pure over durable state (the relocated handoffs).
+    DONE tasks contribute their handoff ``resulting_state`` + ``downstream_needs`` PLUS
+    ``what_changed`` (each as ``kind:ref``) and ``not_done`` (G10), read from the keyed
+    log, references, never bodies; FAILED tasks contribute their last failure reason.
+    Pure over durable state (the relocated handoffs). The handoff's own schema already
+    bounds these worker-written fields legitimately (``what_changed.ref`` / ``not_done``
+    are <=256), so the rows carry them IN FULL: the extra embedding-truncation was a
+    band-aid (silent information loss), and the whole handoff is referenceable by path via
+    the ``<workspace>`` manifest. No diffs/file content here (the planner reads those from
+    the workspace handles when it needs them).
     """
 
     rows: list[dict[str, object]] = []
@@ -429,6 +479,10 @@ def flatten_last_epoch(run_dir: RunDir, outcome: EpochOutcome) -> list[dict[str,
             else:
                 row["resulting_state"] = handoff.resulting_state
                 row["downstream_needs"] = list(handoff.downstream_needs)
+                row["what_changed"] = [
+                    f"{wc.kind}:{wc.ref}" for wc in handoff.what_changed
+                ]
+                row["not_done"] = list(handoff.not_done)
         elif task.status == "failed":
             row["failure_reason"] = task.failure_reason
         rows.append(row)
@@ -473,6 +527,84 @@ class FailedEpochInfo:
     passing_handoffs: list[tuple[str, str]]
     disposed_count: int
     cap: int
+    #: Concrete unmet-criterion gaps from the end-of-epoch agentic verification pass
+    #: (G4): the epoch cleared its deterministic floor but a natural-language
+    #: acceptance criterion was judged UNMET. Empty for a task-failure / gate-failure
+    #: epoch; non-empty when the semantic verification pass is what failed the epoch.
+    verification_gaps: list[str] = field(default_factory=list)
+
+
+#: Cap on the manifest rows surfaced in the `<workspace>` block: a bounded
+#: reference (key -> absolute path), not a payload. The full keyed-log COUNT is
+#: always reported alongside; the planner resolves any further key itself via the
+#: keyed-log root + the `<state>` index. Mirrors the integration-tip listing cap.
+WORKSPACE_MANIFEST_CAP = 200
+
+
+@dataclass(frozen=True)
+class WorkspaceInfo:
+    """The read-capable workspace surfaced to the planner (its pull-access handles).
+
+    Built deterministically from the run-dir layout + the integration tip. The
+    planner runs as a read-capable agent (codex read-only ``-C repo`` / claude
+    Read+Grep with cwd=repo), so these ABSOLUTE paths, all inside ``$repo`` and thus
+    inside each rig's read sandbox, let it grep/read the actual code, handoffs,
+    diffs and artifacts for STEERING. Reading is purely the planner's own internal
+    step: the deterministic floor + criteria still dispose of every gate.
+
+    ``integration_tip`` is a checked-out tree of the CURRENT integration tip (the
+    exact code the gate evaluates), or ``None`` when no tip exists yet (the run has
+    not produced an integration branch). ``keyed_log_root`` is the run dir's keyed-log
+    root. ``manifest`` maps each live log key to its absolute path (handoffs, the
+    verdicts, relocated artifacts, captured check output), already resolved + bounded
+    by the caller; an empty manifest renders cleanly.
+
+    ``repo_map_path`` is the on-disk PageRank-ranked structural map of the current
+    integration tip, written once per boundary by the caller to a stable file under
+    the run dir; the planner reads it for structural planning. The map is delivered BY
+    REFERENCE (this path) rather than inlined into the prompt, so the prompt does not
+    pay the per-boundary token tax for the whole map. ``None`` below the size threshold
+    (first epoch / tiny repo): no file is written and the entry is omitted cleanly.
+    """
+
+    integration_tip: Path | None
+    keyed_log_root: Path
+    manifest: list[tuple[str, Path]]
+    repo_map_path: Path | None = None
+
+
+def _workspace_block(ws: WorkspaceInfo) -> str:
+    tip_line = (
+        f"integration_tip (checkout of the current integration tip, the exact code "
+        f"the gate evaluates): {ws.integration_tip.resolve()}\n"
+        if ws.integration_tip is not None
+        else "integration_tip: (none yet, no integration branch has been built)\n"
+    )
+    shown = ws.manifest[:WORKSPACE_MANIFEST_CAP]
+    more = "" if len(shown) >= len(ws.manifest) else f" (showing {len(shown)})"
+    manifest_lines = (
+        "\n".join(f"  - {key} -> {path}" for key, path in shown) or "  (empty)"
+    )
+    repo_map_line = (
+        f"repo_map (PageRank-ranked structural map of the current integration tip, "
+        f"most-referenced files/symbols first; READ it for structural planning, it is "
+        f"large so it is referenced not inlined): {ws.repo_map_path.resolve()}\n"
+        if ws.repo_map_path is not None
+        else ""
+    )
+    return (
+        "<workspace>\n"
+        "Read-capable handles (ABSOLUTE paths you MAY grep/read for STEERING; the "
+        "deterministic floor + criteria still dispose, reading never changes a "
+        "verdict).\n"
+        f"{tip_line}"
+        f"keyed_log_root (the run dir's keyed log; every log key resolves under it): "
+        f"{ws.keyed_log_root.resolve()}\n"
+        f"{repo_map_line}"
+        f"log_manifest (live log keys -> absolute paths{more}):\n"
+        f"{manifest_lines}\n"
+        "</workspace>\n"
+    )
 
 
 def _failed_epoch_block(info: FailedEpochInfo) -> str:
@@ -481,6 +613,15 @@ def _failed_epoch_block(info: FailedEpochInfo) -> str:
         or "  (none, the phase gate failed though every task passed)"
     )
     checks = "\n".join(f"  - {label}" for label in info.failed_checks) or "  (none)"
+    gaps_block = ""
+    if info.verification_gaps:
+        gaps = "\n".join(f"  - {g}" for g in info.verification_gaps)
+        gaps_block = (
+            "semantic_gaps (the agentic verification pass judged these acceptance "
+            "criteria UNMET by the actual artifacts, the deterministic floor passed "
+            "but the work is incomplete, retry with these as corrective feedback):\n"
+            f"{gaps}\n"
+        )
     handoffs = (
         "\n".join(f"  - {tid}: {state}" for tid, state in info.passing_handoffs)
         or "  (none)"
@@ -496,6 +637,7 @@ def _failed_epoch_block(info: FailedEpochInfo) -> str:
         "failing_phase_checks (deterministic, WITH captured output, env-vs-code "
         "evidence):\n"
         f"{checks}\n"
+        f"{gaps_block}"
         "worker handoffs that claimed an HONEST pass (weigh these against the "
         "still-failing gate, a passing worker + a failing gate that repeats the "
         "SAME way points at the gate/environment, prefer halt over another "
@@ -549,17 +691,23 @@ def volatile_tail(
     last_epoch_rows: list[dict[str, object]] | None,
     reask_errors: list[str],
     phase: PhaseTailInfo | None = None,
-    repo_map: str | None = None,
     failed_epoch: FailedEpochInfo | None = None,
+    workspace: "WorkspaceInfo | None" = None,
 ) -> str:
     """The per-call suffix: running state, phase status, last-epoch report,
     re-ask feedback, request. Never byte-stable, it carries everything that
     moves (S4 adds the phase-status + integration-tip surfacing, ruling 3).
 
-    The optional ``<repo_map>`` (a PageRank-ranked structural map of the target
-    repo's CURRENT tip) rides HERE, in the volatile tail, never the byte-stable
-    head: it is rebuilt per call as the repo changes during implement epochs.
-    Empty/None omits the section entirely (no empty tags)."""
+    The PageRank-ranked structural map of the target repo's CURRENT tip is no longer
+    inlined here; it is delivered BY REFERENCE via the ``<workspace>`` ``repo_map``
+    path (the planner reads the on-disk file for structural planning), so the prompt
+    does not pay the per-boundary token tax for the whole map.
+
+    The verifier's descriptive steering digest (G10) is likewise no longer embedded
+    here: the full ``verdict.json`` (digest + per-criterion evidence + gaps) is
+    persisted on disk and surfaced in the ``<workspace>`` manifest, so the planner reads
+    it by reference (nothing truncated) rather than from an inlined ``<epoch_digest>``
+    block."""
 
     log_lines = "\n".join(f"  - {k}" for k in log_index) or "  (empty)"
     state = (
@@ -574,13 +722,7 @@ def volatile_tail(
     failed_epoch_block = (
         _failed_epoch_block(failed_epoch) if failed_epoch is not None else ""
     )
-    repo_map_block = (
-        "<repo_map>\nStructural map of the target repo at the current integration "
-        "tip (most-referenced files/symbols first). A navigation aid, not "
-        f"exhaustive.\n{repo_map}\n</repo_map>\n"
-        if repo_map
-        else ""
-    )
+    workspace_block = _workspace_block(workspace) if workspace is not None else ""
     if last_epoch_rows is None:
         last = "<last_epoch>\n  (none, this is the first decision)\n</last_epoch>\n"
     else:
@@ -599,7 +741,8 @@ def volatile_tail(
         "</request>\n"
     )
     return (
-        state + phase_status + failed_epoch_block + repo_map_block + last + errors + request
+        state + phase_status + failed_epoch_block + workspace_block
+        + last + errors + request
     )
 
 
@@ -614,13 +757,15 @@ def build_planner_input(
     reask_errors: list[str],
     phase: PhaseTailInfo | None = None,
     repo_memory: str | None = None,
-    repo_map: str | None = None,
     failed_epoch: FailedEpochInfo | None = None,
+    workspace: "WorkspaceInfo | None" = None,
 ) -> str:
     """Full constructed input: ``stable_head`` + ``volatile_tail`` (ruling 3).
 
-    ``repo_map`` (when present) is injected into the volatile tail only; the
-    stable head stays byte-identical across a run regardless of it."""
+    ``workspace`` (when present) is injected into the volatile tail only; the stable
+    head stays byte-identical across a run regardless of it. The structural repo-map and
+    the verifier's verdict (digest + evidence + gaps) are delivered BY REFERENCE through
+    the ``workspace`` manifest (``repo_map`` + the ``verdict.json`` path), not inlined."""
 
     return stable_head(job, skeleton, repo_memory) + volatile_tail(
         phase_id=phase_id,
@@ -629,8 +774,8 @@ def build_planner_input(
         last_epoch_rows=last_epoch_rows,
         reask_errors=reask_errors,
         phase=phase,
-        repo_map=repo_map,
         failed_epoch=failed_epoch,
+        workspace=workspace,
     )
 
 
@@ -850,6 +995,23 @@ def _size_gate_violations(
     return implement_task_size_violations(list(decision.args.tasks), max_files=bound)
 
 
+def _content_grep_violations(decision: EpochDecision) -> list[str]:
+    """Reject a task ``done_when`` check that is a content-grep (gate rebalance).
+
+    Mirrors ``_size_gate_violations`` as a deterministic per-task gate, but with a
+    DIFFERENT scope: a content-grep is forbidden on every task-carrying decision
+    (implement / research / review / artifact) and is NOT exempted on the
+    failed-epoch-repair path, a content-grep check is brittle regardless of who
+    authored it or when. The rejection steers the planner to express that
+    acceptance as natural-language ``criteria`` instead of a shell command.
+    """
+
+    args = decision.args
+    if isinstance(args, (ImplementEpochArgs, ArtifactEpochArgs)):
+        return content_grep_check_violations(list(args.tasks))
+    return []
+
+
 def validate_decision(
     json_text: str | None,
     *,
@@ -871,7 +1033,10 @@ def validate_decision(
 
     The size gate (``_size_gate_violations``) additionally REJECTS a fresh
     implement decision whose tasks are not decomposed: a task over its tier's
-    file-count bound, or one claiming whole-repo ownership. A rejection is
+    file-count bound, or one claiming whole-repo ownership. The content-grep gate
+    (``_content_grep_violations``) REJECTS a task ``done_when`` check built on a
+    content-grep (``rg`` / ``grep`` for a token), steering the planner to express
+    that acceptance as natural-language ``criteria``. A rejection is
     indistinguishable from any other gate failure to the caller, so it rides the
     SAME invalid-decision re-ask ladder (the re-ask names the offending task).
     """
@@ -909,6 +1074,7 @@ def validate_decision(
         local_max_task_files=local_max_task_files,
         senior_max_task_files=senior_max_task_files,
     )
+    errors += _content_grep_violations(decision)
     if errors:
         return GateResult(None, errors)
     return GateResult(decision, [])

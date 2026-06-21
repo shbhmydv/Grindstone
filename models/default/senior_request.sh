@@ -72,13 +72,16 @@ build_timeout_prefix "$timeout"
 # headless run that never blocks on a permission prompt.
 sys_append="You are the SENIOR escalation worker for a grindstone task. Investigate thoroughly: use web search when researching, and INDEPENDENTLY re-derive the claims you judge rather than merely confirm expected sections exist. Work only inside this worktree (your CWD), run the done_when checks, and write handoff.json exactly as the task instructs."
 
+# The prompt is fed to claude on STDIN (`claude -p` reads the prompt from stdin),
+# never as an argv string: a large prior-failure context could otherwise exceed
+# the kernel's MAX_ARG_STRLEN (~128KB) and the CLI dies before launching
+# ("Argument list too long"). Stdin makes the prompt size irrelevant.
 set +e
 "${timeout_prefix[@]}" claude -p \
   --model "$model" \
   --dangerously-skip-permissions \
   --append-system-prompt "$sys_append" \
-  "$prompt_text" \
-  < /dev/null > "$log_out" 2> "$log_err"
+  < "$prompt" > "$log_out" 2> "$log_err"
 rc=$?
 set -e
 

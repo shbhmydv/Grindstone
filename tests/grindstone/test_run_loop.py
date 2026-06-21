@@ -128,6 +128,212 @@ def test_no_repo_memory_leaves_slot_empty(git_repo: Path, run_dir: RunDir) -> No
     assert all("<repo_memory>\n</repo_memory>" in p for p in planner.prompts)
 
 
+# --- read-capable <workspace>: tip tree + keyed-log manifest -------------------
+
+
+def test_planner_workspace_exposes_tip_tree_and_resolvable_manifest(
+    git_repo: Path, run_dir: RunDir
+) -> None:
+    """After an implement epoch the planner boundary must surface a `<workspace>`
+    block: a checked-out integration-tip tree (INSIDE the run dir, hence inside the
+    repo so both planner rigs can read it) and a manifest resolving each live log
+    key to a real file. The tip worktree is materialized for the boundary and torn
+    down after (no leak)."""
+
+    planner = _Recording(
+        MockPlanner(
+            script=[
+                two_phase_skeleton(),
+                implement_decision(impl_task("T1", "f1.txt")),
+                complete_decision(check_cmd("test -f f1.txt")),
+            ]
+        )
+    )
+    outcome = run_grind(
+        run_dir, job_path="job.md", planner=planner, ladder=_ladder(), repo=git_repo
+    )
+    assert outcome.status == "completed"
+    # The complete_run boundary (the 3rd call) ran AFTER an epoch produced an
+    # integration tip + a handoff log key, so its prompt carries the full workspace.
+    final_prompt = planner.prompts[-1]
+    assert "<workspace>" in final_prompt
+    assert "keyed_log_root" in final_prompt
+    # The keyed-log root is the run dir, INSIDE the target repo (codex -C repo and
+    # claude cwd=repo both reach it); never a /tmp path outside the sandbox.
+    run_root = run_dir.root.resolve()
+    assert str(run_root) in final_prompt
+    assert str(run_root).startswith(str(git_repo.resolve()))
+    # The integration-tip tree is a real checked-out dir under the run dir.
+    assert "integration_tip" in final_prompt
+    import re
+
+    m = re.search(r"integration_tip[^:]*: (\S+)", final_prompt)
+    assert m is not None
+    tip_path = Path(m.group(1))
+    assert str(tip_path).startswith(str(run_root))  # inside the run dir / repo
+    # The manifest resolves the handoff log key to an absolute path that EXISTS.
+    handoff_keys = [k for k in run_dir.log_index() if k.endswith("handoff.json")]
+    assert handoff_keys, "the implement epoch must have produced a handoff log key"
+    handoff_key = handoff_keys[0]
+    assert handoff_key in final_prompt
+    assert str(run_dir.resolve(handoff_key)) in final_prompt
+    assert run_dir.resolve(handoff_key).is_file()
+    # No tip-tree worktree leaked after the run (lifecycle cleaned up).
+    leftover = list((run_dir.root / "worktrees").glob("_planner_tip*"))
+    assert leftover == []
+
+
+def test_first_planner_call_has_no_tip_but_still_exposes_keyed_log(
+    git_repo: Path, run_dir: RunDir
+) -> None:
+    """The FIRST call (propose_skeleton) has no integration branch yet: the
+    workspace omits the tip path cleanly (no literal None) while still exposing the
+    keyed-log root."""
+
+    planner = _Recording(
+        MockPlanner(script=[two_phase_skeleton(), complete_decision(check_cmd("true"))])
+    )
+    run_grind(run_dir, job_path="job.md", planner=planner, ladder=_ladder(), repo=git_repo)
+    first = planner.prompts[0]
+    assert "<workspace>" in first
+    assert "none yet" in first  # no integration branch built yet
+    assert "integration_tip: None" not in first
+
+
+# --- repo-map source: the integration TIP, not the stale operator tree ---------
+
+
+def test_planner_repo_map_reads_integration_tip_not_operator_tree(
+    git_repo: Path, run_dir: RunDir, monkeypatch
+) -> None:
+    """The planner's structural repo-map must reflect what the epochs have BUILT,
+    not the repo as it stood at run start. The operator working tree is never
+    advanced to the integration tip (it stays out of bounds); the tip lives only as
+    a branch ref. So the boundary must build the map from the tip CHECKOUT.
+
+    Drives one implement epoch that integrates ``f1.txt`` onto the tip (a file that
+    never appears in the operator tree), then asserts the post-epoch boundary builds
+    its map from a checkout that CONTAINS ``f1.txt`` (the tip), and that that source
+    is NOT the operator tree (which still lacks ``f1.txt``)."""
+
+    import grindstone.run_loop as rl
+
+    seen: list[Path] = []
+    real = rl.build_repo_map
+
+    def _spy(repo_root, **kw):
+        seen.append(Path(repo_root))
+        return real(repo_root, **kw)
+
+    monkeypatch.setattr(rl, "build_repo_map", _spy)
+
+    planner = MockPlanner(
+        script=[
+            two_phase_skeleton(),
+            implement_decision(impl_task("T1", "f1.txt")),
+            complete_decision(check_cmd("test -f f1.txt")),
+        ]
+    )
+    outcome = run_grind(
+        run_dir, job_path="job.md", planner=planner, ladder=_ladder(), repo=git_repo
+    )
+    assert outcome.status == "completed"
+
+    # The operator tree was never advanced: f1.txt lives only on the tip branch.
+    assert not (git_repo / "f1.txt").exists()
+    assert outcome.final_branch is not None
+    assert "f1.txt" in tracked_files(git_repo, outcome.final_branch)
+
+    # The first boundary (propose_skeleton) had no tip -> map source = operator tree.
+    assert seen, "build_repo_map must be called at every boundary"
+    assert seen[0] == git_repo.resolve() or seen[0] == git_repo
+
+    # A LATER boundary ran after the epoch integrated f1.txt onto the tip. Its map
+    # source must be a checkout that CONTAINS f1.txt (the tip), and must NOT be the
+    # operator tree (which still lacks f1.txt). The tip checkout is torn down after
+    # the boundary, so we assert via the recorded path's relation, not its survival.
+    tip_sources = [p for p in seen if p != git_repo and p != git_repo.resolve()]
+    assert tip_sources, (
+        "a post-epoch boundary must build the map from the tip checkout, not the "
+        "operator tree"
+    )
+    # Each tip source is the dedicated _planner_tip worktree under the run dir,
+    # never the operator tree.
+    for src in tip_sources:
+        assert "_planner_tip" in str(src)
+        assert str(src).startswith(str(run_dir.root.resolve()))
+
+
+def test_repo_map_written_to_run_dir_and_referenced_in_workspace(
+    git_repo: Path, run_dir: RunDir, monkeypatch
+) -> None:
+    """The structural map is delivered BY REFERENCE: when a map is built (>=
+    MIN_FILES_FOR_MAP on the tip), the boundary WRITES it to a stable file under the
+    run dir ROOT (it must survive the _planner_tip worktree teardown) and the
+    <workspace> block points the planner at that path, never inlining the map text.
+
+    The map source is stubbed to a fixed non-None string so the test does not need a
+    50-file fixture; the file-write + manifest-reference wiring is what is asserted."""
+
+    import grindstone.run_loop as rl
+
+    monkeypatch.setattr(rl, "build_repo_map", lambda *a, **k: "util.py:\n  def helper():")
+
+    planner = _Recording(
+        MockPlanner(
+            script=[
+                two_phase_skeleton(),
+                implement_decision(impl_task("T1", "f1.txt")),
+                complete_decision(check_cmd("test -f f1.txt")),
+            ]
+        )
+    )
+    outcome = run_grind(
+        run_dir, job_path="job.md", planner=planner, ladder=_ladder(), repo=git_repo
+    )
+    assert outcome.status == "completed"
+
+    map_file = run_dir.root / "planner_repo_map.txt"
+    assert map_file.is_file(), "the map must be written under the run dir root"
+    assert "def helper():" in map_file.read_text()
+    # The map file lives at the run dir root, NOT inside the torn-down tip worktree.
+    assert "_planner_tip" not in str(map_file)
+    assert not list((run_dir.root / "worktrees").glob("_planner_tip*"))
+
+    final_prompt = planner.prompts[-1]
+    assert "<workspace>" in final_prompt
+    # The labeled workspace entry + the PATH to the on-disk map are surfaced; the map
+    # TEXT is not inlined and no inline <repo_map> block exists.
+    assert "repo_map (" in final_prompt
+    assert str(map_file.resolve()) in final_prompt
+    assert "<repo_map>" not in final_prompt
+    assert "def helper():" not in final_prompt
+
+
+def test_repo_map_below_threshold_writes_no_file_and_omits_entry(
+    git_repo: Path, run_dir: RunDir, monkeypatch
+) -> None:
+    """Below threshold / first epoch the map is None -> no file is written and the
+    <workspace> omits the repo_map entry cleanly (no stale file, no dangling path)."""
+
+    import grindstone.run_loop as rl
+
+    monkeypatch.setattr(rl, "build_repo_map", lambda *a, **k: None)
+
+    planner = _Recording(
+        MockPlanner(script=[two_phase_skeleton(), complete_decision(check_cmd("true"))])
+    )
+    run_grind(run_dir, job_path="job.md", planner=planner, ladder=_ladder(), repo=git_repo)
+
+    assert not (run_dir.root / "planner_repo_map.txt").exists()
+    # No repo_map manifest entry and no inline map block in any prompt. (Guard against
+    # the run-dir path itself containing "repo_map" via the tmp test-name directory:
+    # assert on the labeled line / the path to the map FILE, not a bare substring.)
+    for prompt in planner.prompts:
+        assert "planner_repo_map.txt" not in prompt
+        assert "<repo_map>" not in prompt
+
+
 # --- happy path: skeleton -> 2 implement epochs -> complete --------------------
 
 

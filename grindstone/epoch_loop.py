@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 import threading
-from typing import Literal, Sequence
+from typing import Literal, Sequence, cast
 
 from pydantic import BaseModel, ConfigDict
 
@@ -207,6 +207,40 @@ class EpochOutcome:
                 "conflict": self.integration.conflict,
             },
         }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, object]) -> "EpochOutcome":
+        """Rebuild an outcome from its persisted ``outcome.json`` (resume seam).
+
+        Inverse of ``to_dict``. Used on resume to re-run the G4 verification pass
+        over a completed-but-unverified epoch (the outcome feeds the verifier brief),
+        so a kill cannot let a completed epoch skip its semantic gate."""
+
+        tasks_raw = cast(list[dict[str, object]], raw["tasks"])
+        integ = cast(dict[str, object], raw["integration"])
+        return cls(
+            phase_id=cast(str, raw["phase_id"]),
+            epoch_id=cast(str, raw["epoch_id"]),
+            status=cast(Literal["completed", "integration_conflict"], raw["status"]),
+            tasks=[
+                TaskResult(
+                    task_id=cast(str, t["task_id"]),
+                    fq_task_id=cast(str, t["fq_task_id"]),
+                    status=cast(Literal["done", "failed"], t["status"]),
+                    attempts=cast(int, t["attempts"]),
+                    tier=cast(str, t["tier"]),
+                    handoff_key=cast("str | None", t["handoff_key"]),
+                    failure_reason=cast("str | None", t["failure_reason"]),
+                )
+                for t in tasks_raw
+            ],
+            integration=IntegrationOutcome(
+                status=cast(Literal["completed", "conflict", "skipped"], integ["status"]),
+                branch=cast("str | None", integ["branch"]),
+                merged=cast("list[str]", integ["merged"]),
+                conflict=cast("str | None", integ["conflict"]),
+            ),
+        )
 
 
 def _result_from_outcome(outcome: TaskOutcome) -> TaskResult:

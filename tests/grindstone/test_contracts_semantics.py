@@ -14,6 +14,10 @@ from grindstone.contracts import (
     parse_decision,
 )
 from grindstone.contracts.models import Handoff, ImplementTask
+from grindstone.contracts.semantics import (
+    command_is_content_grep,
+    content_grep_check_violations,
+)
 
 from tests.grindstone.conftest import phase_dict, revise_decision, skeleton_decision
 
@@ -40,6 +44,57 @@ def test_inputs_must_exist_in_keyed_log() -> None:
         completed_phase_ids=EMPTY,
     )
     assert good == []
+
+
+# --- content-grep detector (gate rebalance G1) ---------------------------------
+
+
+def test_command_is_content_grep_flags_grep_family() -> None:
+    # A bare content-grep program (any of the rg/grep/egrep/fgrep/ag/ack family).
+    for prog in ("rg", "grep", "egrep", "fgrep", "ag", "ack"):
+        assert command_is_content_grep(f'{prog} -q PAT file.md'), prog
+    # A full path to the binary still resolves to its basename.
+    assert command_is_content_grep("/usr/bin/grep -q PAT file.md")
+    # Leading env-assignments are skipped to find the real program token.
+    assert command_is_content_grep("LC_ALL=C grep -q PAT file.md")
+    # A content-grep anywhere in a pipeline / sequence is flagged (each segment's
+    # first word is checked across | && || ;).
+    assert command_is_content_grep("cat file.md | grep -q PAT")
+    assert command_is_content_grep("test -f a && rg -q PAT b")
+    assert command_is_content_grep("true; egrep PAT c")
+
+
+def test_command_is_content_grep_allows_structural_checks() -> None:
+    # Structural / build / test / existence checks are NOT content-greps.
+    for cmd in (
+        "test -f package-lock.json",
+        "npx tsc --noEmit",
+        "npm test --silent",
+        "pytest tests/tokenizer",
+        "true",
+        "node shot.js ui/screen.png",
+    ):
+        assert not command_is_content_grep(cmd), cmd
+    # A filename merely CONTAINING "grep" is not a content-grep (no false positive).
+    assert not command_is_content_grep("test -f grep_results.txt")
+    assert not command_is_content_grep("./grepper --version")
+    assert not command_is_content_grep("cat mygrep.log")
+
+
+def test_content_grep_corpus_fixture_is_rejected() -> None:
+    # Schema/pydantic-valid (it parses), yet the content-grep gate rejects its
+    # done_when and steers to `criteria`.
+    decision = _decision("implement_content_grep.json")
+    bad = content_grep_check_violations(list(decision.args.tasks))
+    assert any("T1" in v and "criteria" in v for v in bad)
+
+
+def test_criteria_corpus_fixture_passes_content_grep_gate() -> None:
+    # A task that expresses semantic acceptance as `criteria` (and keeps a
+    # STRUCTURAL done_when) clears the content-grep gate.
+    decision = _decision("implement_criteria.json")
+    assert content_grep_check_violations(list(decision.args.tasks)) == []
+    assert decision.args.tasks[0].criteria  # the field round-trips non-empty
 
 
 def test_overlapping_file_ownership_rejected() -> None:

@@ -12,8 +12,11 @@ import sys
 import time
 from pathlib import Path
 
+from grindstone import worktree as wt
 from grindstone.contracts.models import Phase
+from grindstone.epoch_loop import EpochState, IntegrationState
 from grindstone.events import (
+    EpochStarted,
     JournalWriter,
     PhaseRef,
     PhaseStarted,
@@ -21,23 +24,29 @@ from grindstone.events import (
     PlannerCallSucceeded,
     RunStarted,
     SkeletonProposed,
+    TaskDispatched,
+    TaskRef,
     read_events,
     replay,
 )
 from grindstone.mock_planner import MockPlanner
 from grindstone.rundir import RunDir
 from grindstone.run_loop import RunState, resume_grind
+from grindstone.task_loop import TaskCursorState, TaskIdentity
+from grindstone.verify import WorkerEpochVerifier
 
 from tests.grindstone.conftest import (
     OwnershipWorker,
     check_cmd,
     complete_decision,
+    handle_failed_epoch_halt,
     impl_task,
     implement_decision,
     phase_dict,
     reap_kill_target,
     tracked_files,
 )
+from tests.grindstone.test_epoch_verification import _VerifierWorker
 
 _KILL_TARGET = Path(__file__).resolve().parent / "_kill_planner_target.py"
 _KILL_PHASE_TARGET = Path(__file__).resolve().parent / "_kill_phase_target.py"
@@ -104,6 +113,73 @@ def test_resume_of_terminal_run_is_idempotent(git_repo: Path, run_dir: RunDir) -
         run_dir, planner=MockPlanner(script=[]), ladder=_ladder(), repo=git_repo
     )
     assert again.status == "completed"
+
+
+# --- running_epoch resume re-verifies the finished in-flight epoch (hole #2) ---
+
+
+def _craft_running_epoch(repo: Path, run_dir: RunDir) -> dict[str, object]:
+    """A run killed with status=running_epoch: the epoch-level state has T1 in flight
+    and the run-level state holds the pending implement decision (carrying criteria).
+    Returns the decision dict so the test can assert it drives the resume re-verify."""
+
+    decision = implement_decision(
+        {"id": "T1", "goal": "create f1.txt",
+         "done_when": [check_cmd("test -f f1.txt")],
+         "criteria": ["f1.txt is correct"], "file_ownership": ["f1.txt"]}
+    )
+    ident = TaskIdentity("P1", "E1", "T1")
+    with JournalWriter(run_dir.events_path) as journal:
+        journal.append(RunStarted(seq=0, ts=TS, run_id="r", job_path="job.md"))
+        journal.append(SkeletonProposed(seq=1, ts=TS, phases=[PhaseRef(id="P1", title="build")]))
+        journal.append(PhaseStarted(seq=2, ts=TS, phase_id="P1"))
+        journal.append(
+            EpochStarted(seq=3, ts=TS, phase_id="P1", epoch_id="E1", title="impl",
+                         tasks=[TaskRef(id="T1", mode="implement")])
+        )
+        journal.append(TaskDispatched(seq=4, ts=TS, epoch_id="E1", task_id="T1"))
+    cursor = TaskCursorState(
+        fq_task_id="P1/E1/T1", task_id="T1", mode="implement", status="running",
+        tier_index=0, tier_name="local", tier_attempt=1, attempt=1,
+        scratch=str(run_dir.root / "worktrees" / "T1" / "attempt-1"),
+        branch=ident.attempt_branch(1), failure_context=[], reason=None,
+    )
+    epoch_state = EpochState(
+        phase_id="P1", epoch_id="E1", title="impl", mode="implement", is_implement=True,
+        base=wt.head_commit(repo),
+        integration=IntegrationState(
+            branch="grind/P1/E1/_integration", status="pending", merged=[], conflict=None
+        ),
+        tasks={"T1": cursor},
+    )
+    run_dir.state_path.write_text(epoch_state.model_dump_json(), encoding="utf-8")
+    run_state = RunState(
+        run_id="r", job_path="job.md", job_text="toy", status="running_epoch",
+        skeleton=[Phase.model_validate(phase_dict("P1"))], current_phase_id="P1",
+        epoch_counter=0, planner_call_count=2, rate_limit_waits=0,
+        last_integration_branch=None, pending_decision=decision, terminal_reason=None,
+    )
+    run_dir.run_state_path.write_text(run_state.model_dump_json(), encoding="utf-8")
+    return decision
+
+
+def test_resume_running_epoch_verifies_inflight_epoch(git_repo: Path, run_dir: RunDir) -> None:
+    """Hole #2 (running_epoch branch): an epoch finished by resume_epoch OUTSIDE the
+    drive loop must still have its criteria verified. Here the resume finishes the
+    in-flight epoch, then the G4 pass runs and a FAIL verdict routes the gap through
+    handle_failed_epoch (before the fix the in-flight epoch's criteria were never judged)."""
+
+    _craft_running_epoch(git_repo, run_dir)
+    gaps = ["f1.txt is wrong"]
+    planner = MockPlanner(script=[handle_failed_epoch_halt("unverified gap")])
+    outcome = resume_grind(
+        run_dir, planner=planner, ladder=[("local", OwnershipWorker())], repo=git_repo,
+        verifier=WorkerEpochVerifier(_VerifierWorker(passed=False, gaps=gaps)),
+    )
+    assert outcome.status == "escalated"
+    kinds = [e.event for e in read_events(run_dir.events_path)]
+    assert "epoch_verification_started" in kinds  # the in-flight epoch WAS verified
+    assert "epoch_verification_failed" in kinds
 
 
 # --- signature test: SIGKILL mid-planner-call, then resume ---------------------

@@ -38,14 +38,15 @@ from __future__ import annotations
 import json
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Literal, Sequence
+from typing import Any, Callable, Literal, Sequence, cast
 
 from pydantic import BaseModel, ConfigDict
 
 from grindstone import worktree as wt
-from grindstone.config import PrepareConfig
+from grindstone.config import FloorConfig, InfraRepairConfig, PrepareConfig
+from grindstone.infra import InfraClassification, classify_check_failure
 from grindstone.prepare import PrepareError, materialize_env
 from grindstone.planner import extract_decision_json
 from grindstone.contracts.models import (
@@ -55,10 +56,12 @@ from grindstone.contracts.models import (
     CmdCheck,
     CompleteRunDecision,
     EpochDecision,
+    EpochVerdict,
     EscalateRunDecision,
     HaltFailedEpochArgs,
     HandleFailedEpochDecision,
     ImplementEpochArgs,
+    ImplementTask,
     Phase,
     ProposeSkeletonDecision,
     RetryFailedEpochArgs,
@@ -68,15 +71,23 @@ from grindstone.contracts.models import (
 )
 from grindstone.script_polish import Polisher
 from grindstone.script_vision import VisionReviewError, VisionReviewer
+from grindstone.verify import EpochVerifier, VerificationError
 from grindstone.contracts.semantics import HandoffMode
 from grindstone.epoch_loop import EpochArgs, EpochOutcome, resume_epoch, run_epoch
 from grindstone.journal import reap_sibling_journals, write_journal
 from grindstone.memory import load_digest
 from grindstone.events import (
     EpochFailed,
+    EpochVerificationFailed,
+    EpochVerificationPassed,
+    EpochVerificationStarted,
     FailedEpochHandled,
     FinalPolishApplied,
     FinalPolishSkipped,
+    InfraCheckDetected,
+    InfraRepairDispatched,
+    InfraRepairExhausted,
+    InfraRepairResolved,
     JournalWriter,
     PhaseEscalated,
     PhasePassed,
@@ -103,6 +114,7 @@ from grindstone.planner import (
     FailedEpochInfo,
     PhaseTailInfo,
     PlannerTransport,
+    WorkspaceInfo,
     backoff_delay,
     build_planner_input,
     classify_failure,
@@ -112,7 +124,12 @@ from grindstone.planner import (
 from grindstone.repomap import build_repo_map
 from grindstone.rundir import RunDir, atomic_write_json
 from grindstone.task_loop import TIER0_ATTEMPTS
-from grindstone.worker import WorkerTransport
+from grindstone.worker import (
+    InfraRepairBrief,
+    VerificationBrief,
+    WorkerRequest,
+    WorkerTransport,
+)
 
 RunStatus = Literal["awaiting_planner", "running_epoch", "completed", "escalated", "failed"]
 SleepFn = Callable[[float], None]
@@ -186,6 +203,17 @@ class RunState(BaseModel):
     #: FAILED epochs disposed of within the CURRENT phase (the deterministic
     #: spin-loop cap, Part C); resets on phase advance AND revise.
     phase_failed_epochs: int = 0
+    #: The DURABLE marker that a just-completed epoch carrying ``criteria`` still owes
+    #: the G4 agentic verification pass (the originating ``decision`` + ``epoch_id``).
+    #: Set when ``_record_epoch`` flips the epoch to ``awaiting_planner``; CLEARED only
+    #: once verification reaches a terminal classification (a Passed/Failed event, an
+    #: infra-failure, or no criteria to judge). On resume, a set marker WITHOUT a
+    #: terminal verification event in the journal means a kill landed AFTER the epoch
+    #: persisted but BEFORE the gate finished -> the pass is RE-RUN before the next
+    #: planner boundary, so verification can never be skipped by loop position. A
+    #: verdict already produced + recorded (terminal event present) is reused, never
+    #: regenerated. ``None`` = nothing owes verification. Defaulted so older states load.
+    pending_verification: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -262,13 +290,6 @@ class _Boundary:
 # --- deterministic check evaluation (evidence + phase exit criteria) -----------
 
 
-#: How much of a failed command's combined stdout/stderr to keep (gate
-#: observability, Part A): the planner sees WHY a check failed, env-vs-code,
-#: instead of a bare exit code. Bounded so a chatty build cannot bloat the
-#: planner input; the TAIL is kept (errors land last).
-CHECK_OUTPUT_TAIL_BYTES = 3072
-
-
 def _check_label(check: Check) -> str:
     if isinstance(check, CmdCheck):
         return f"cmd `{check.cmd}`"
@@ -277,13 +298,14 @@ def _check_label(check: Check) -> str:
     return f"vision_review:{check.vision_review.screenshot}"
 
 
-def _safe_output_tail(stdout: str, stderr: str) -> str:
-    """The text-safe, length-bounded tail of a failed command's combined output.
+def _safe_output(stdout: str, stderr: str) -> str:
+    """The text-safe combined output of a failed command, in FULL (no byte cap).
 
-    Joins stdout + stderr, keeps the LAST ``CHECK_OUTPUT_TAIL_BYTES`` bytes
-    (errors land last), and scrubs the result text-safe: control bytes other than
-    tab/newline are stripped so an odd-byte build log can never corrupt the
-    planner input or the persisted record. Empty when the command said nothing.
+    Joins stdout + stderr and scrubs the result text-safe: control bytes other than
+    tab/newline are stripped so an odd-byte build log can never corrupt the persisted
+    record. The FULL output is kept (the principle: agent inputs are delivered by
+    reference on disk, never truncated-and-embedded). Empty when the command said
+    nothing.
     """
 
     parts = [p for p in (stdout, stderr) if p]
@@ -291,34 +313,29 @@ def _safe_output_tail(stdout: str, stderr: str) -> str:
     if not combined:
         return ""
     raw = combined.encode("utf-8", errors="replace")
-    if len(raw) > CHECK_OUTPUT_TAIL_BYTES:
-        raw = b"...(truncated)...\n" + raw[-CHECK_OUTPUT_TAIL_BYTES:]
     text = raw.decode("utf-8", errors="replace")
     return "".join(c for c in text if c in "\t\n" or c >= " ")
 
 
-def _indent(text: str, prefix: str = "        ") -> str:
-    return "\n".join(prefix + line for line in text.splitlines())
-
-
 def _persist_check_output(
-    run_dir: RunDir, scratch_name: str, index: int, cmd: str, tail: str
-) -> None:
-    """Durably record a failed check's captured output under the run dir.
+    run_dir: RunDir, scratch_name: str, index: int, cmd: str, output: str
+) -> Path | None:
+    """Durably record a failed check's FULL captured output under the run dir.
 
-    A flat text file per (eval scratch, check index) so the failure trail
-    survives the run and is auditable alongside the journal; best-effort, a
-    persist failure never breaks check evaluation (the label still carries the
-    same tail to the planner)."""
+    A flat text file per (eval scratch, check index) so the failure trail survives the
+    run, is auditable alongside the journal, and is delivered to the planner BY
+    REFERENCE (the label carries this path; the planner reads the file for the full
+    failing output). Best-effort: a persist failure returns ``None`` (no path to
+    surface) and never breaks check evaluation."""
 
     try:
         out_dir = run_dir.root / "check_output" / scratch_name
         out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / f"c{index}.txt").write_text(
-            f"$ {cmd}\n{tail}\n", encoding="utf-8"
-        )
+        path = out_dir / f"c{index}.txt"
+        path.write_text(f"$ {cmd}\n{output}\n", encoding="utf-8")
+        return path
     except OSError:
-        pass
+        return None
 
 
 def _vision_result(
@@ -368,7 +385,23 @@ def _vision_result(
     return (f"{label} FAILED: {reasons}", False)
 
 
-def evaluate_checks(
+@dataclass(frozen=True)
+class CheckResult:
+    """One deterministic check's verdict, with infra detail on a cmd FAILURE.
+
+    ``label`` / ``ok`` are the legacy gate tuple; ``cmd`` is the source command
+    string for a FAILED ``CmdCheck`` (else ``None``); ``infra`` is the shared
+    classifier's verdict for that failure (``None`` when the check passed or is not
+    a command). The infra-repair loop reads ``cmd`` + ``infra`` to decide whether
+    a failure is environmental; every other caller folds to ``(label, ok)``."""
+
+    label: str
+    ok: bool
+    cmd: str | None = None
+    infra: InfraClassification | None = None
+
+
+def _evaluate_checks_detailed(
     checks: Sequence[Check],
     *,
     repo: Path | None,
@@ -377,18 +410,17 @@ def evaluate_checks(
     scratch_name: str,
     vision_reviewer: VisionReviewer | None = None,
     prepare: PrepareConfig | None = None,
-) -> list[tuple[str, bool]]:
-    """Run a list of deterministic checks; return ``(label, passed)`` IN ORDER.
+    floor: FloorConfig | None = None,
+) -> list[CheckResult]:
+    """Run the checks and return ``CheckResult`` rows (the infra-aware evaluator).
 
-    Command checks run against a throwaway worktree of ``ref`` (the integration
-    tip / final branch) when a repo exists, else the run dir; artifact checks
-    resolve against the keyed log; ``vision_review`` (B3 taste gate) renders its
-    verdict through ``vision_reviewer`` against a screenshot a PRIOR cmd check
-    produced in the same worktree. This is the one evaluator behind both
-    ``complete_run`` evidence (ARCHITECTURE.md) and phase exit criteria (S4 ruling 1):
-    a deterministic verdict computed in a tip worktree, never a planner claim.
-    """
+    Identical worktree/prepare/floor semantics to ``evaluate_checks`` (its thin
+    wrapper), but a FAILED ``CmdCheck`` additionally carries the source command and
+    the shared infra classification (``infra.classify_check_failure``) so the gate
+    can tell an environmental fault from a genuine assertion failure."""
 
+    if floor is not None:
+        checks = [*checks, *(CmdCheck(cmd=cmd) for cmd in floor.checks)]
     needs_worktree = any(
         isinstance(c, (CmdCheck, VisionReviewCheck)) for c in checks
     )
@@ -417,47 +449,104 @@ def evaluate_checks(
                 worktree_error = str(exc)
     cwd = worktree if worktree is not None else run_dir.root
     try:
-        results: list[tuple[str, bool]] = []
+        results: list[CheckResult] = []
         for index, check in enumerate(checks):
             if isinstance(check, ArtifactExistsCheck):
                 ok = run_dir.find_artifact(check.artifact_exists) is not None
-                results.append((_check_label(check), ok))
+                results.append(CheckResult(_check_label(check), ok))
             elif worktree_error is not None:
                 # A cmd/vision check that needs the worktree we could not create.
-                results.append((f"{_check_label(check)} [{worktree_error}]", False))
-            elif isinstance(check, VisionReviewCheck):
                 results.append(
-                    _vision_result(
-                        check,
-                        cwd=cwd,
-                        run_dir=run_dir,
-                        scratch_name=scratch_name,
-                        index=index,
-                        reviewer=vision_reviewer,
-                    )
+                    CheckResult(f"{_check_label(check)} [{worktree_error}]", False)
                 )
+            elif isinstance(check, VisionReviewCheck):
+                vlabel, vok = _vision_result(
+                    check,
+                    cwd=cwd,
+                    run_dir=run_dir,
+                    scratch_name=scratch_name,
+                    index=index,
+                    reviewer=vision_reviewer,
+                )
+                results.append(CheckResult(vlabel, vok))
             else:
                 proc = subprocess.run(
                     check.cmd, shell=True, cwd=str(cwd), capture_output=True, text=True
                 )
                 ok = proc.returncode == check.expect_exit
                 label = _check_label(check)
+                infra: InfraClassification | None = None
                 if not ok:
-                    # Gate observability (Part A): a FAILED cmd check keeps its
-                    # output so the planner can tell env-vs-code, the dogfood
-                    # spin-loop blind spot. Persist the full-ish tail under the
-                    # run dir AND fold a short tail into the label that flows to
-                    # the planner's next decision input.
-                    tail = _safe_output_tail(proc.stdout, proc.stderr)
+                    # Gate observability (Part A): a FAILED cmd check surfaces WHY it
+                    # failed so the planner can tell env-vs-code (the dogfood spin-loop
+                    # blind spot). The FULL output is persisted under the run dir and
+                    # delivered BY REFERENCE: the label carries the PATH (the planner
+                    # reads the file for the complete failing output), never an embedded
+                    # truncated tail.
+                    output = _safe_output(proc.stdout, proc.stderr)
                     label = f"{label} (exit {proc.returncode})"
-                    if tail:
-                        _persist_check_output(run_dir, scratch_name, index, check.cmd, tail)
-                        label += "\n      output:\n" + _indent(tail)
-                results.append((label, ok))
+                    if output:
+                        out_path = _persist_check_output(
+                            run_dir, scratch_name, index, check.cmd, output
+                        )
+                        if out_path is not None:
+                            label += f"\n      output_file: {out_path}"
+                    # Classify the failure (G3): environmental vs genuine, so the
+                    # gate can route an infra fault to senior repair, not a charge.
+                    infra = classify_check_failure(
+                        returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr
+                    )
+                results.append(
+                    CheckResult(label, ok, cmd=check.cmd if not ok else None, infra=infra)
+                )
         return results
     finally:
         if worktree is not None and repo is not None:
             wt.remove_worktree(repo, worktree)
+
+
+def evaluate_checks(
+    checks: Sequence[Check],
+    *,
+    repo: Path | None,
+    ref: str | None,
+    run_dir: RunDir,
+    scratch_name: str,
+    vision_reviewer: VisionReviewer | None = None,
+    prepare: PrepareConfig | None = None,
+    floor: FloorConfig | None = None,
+) -> list[tuple[str, bool]]:
+    """Run a list of deterministic checks; return ``(label, passed)`` IN ORDER.
+
+    Command checks run against a throwaway worktree of ``ref`` (the integration
+    tip / final branch) when a repo exists, else the run dir; artifact checks
+    resolve against the keyed log; ``vision_review`` (B3 taste gate) renders its
+    verdict through ``vision_reviewer`` against a screenshot a PRIOR cmd check
+    produced in the same worktree. This is the one evaluator behind both
+    ``complete_run`` evidence (ARCHITECTURE.md) and phase exit criteria (S4 ruling 1):
+    a deterministic verdict computed in a tip worktree, never a planner claim.
+
+    ``floor`` (the gate-rebalance deterministic floor) appends the repo-owned
+    canonical verification commands AFTER the supplied checks, so they run in the
+    SAME ``prepare``-materialized worktree with identical cmd-check semantics (exit
+    0 == pass, captured output on failure). The floor is core-owned, not authored
+    by the planner; a floor-check failure fails the gate exactly like a failed
+    ``done_when``. A thin ``(label, ok)`` projection of ``_evaluate_checks_detailed``.
+    """
+
+    return [
+        (r.label, r.ok)
+        for r in _evaluate_checks_detailed(
+            checks,
+            repo=repo,
+            ref=ref,
+            run_dir=run_dir,
+            scratch_name=scratch_name,
+            vision_reviewer=vision_reviewer,
+            prepare=prepare,
+            floor=floor,
+        )
+    ]
 
 
 def recheck_evidence(
@@ -468,11 +557,13 @@ def recheck_evidence(
     run_dir: RunDir,
     vision_reviewer: VisionReviewer | None = None,
     prepare: PrepareConfig | None = None,
+    floor: FloorConfig | None = None,
 ) -> list[str]:
     """Deterministically re-run a ``complete_run``'s evidence; return the failing
     labels (empty = the run's certificate holds). Command checks run against the
     final branch worktree, artifact checks against the keyed log (ARCHITECTURE.md),
-    vision_review checks through ``vision_reviewer``."""
+    vision_review checks through ``vision_reviewer``. The deterministic ``floor``
+    runs against the final branch too, so a run cannot complete past it."""
 
     return [
         label
@@ -484,6 +575,7 @@ def recheck_evidence(
             scratch_name="_evidence",
             vision_reviewer=vision_reviewer,
             prepare=prepare,
+            floor=floor,
         )
         if not ok
     ]
@@ -540,6 +632,7 @@ def _advance_phases(
     started: set[str],
     vision_reviewer: VisionReviewer | None,
     prepare: PrepareConfig | None,
+    floor: FloorConfig | None,
 ) -> list[tuple[str, bool]]:
     """Evaluate the current phase and advance through every satisfied one.
 
@@ -568,8 +661,17 @@ def _advance_phases(
             scratch_name="_phase_eval",
             vision_reviewer=vision_reviewer,
             prepare=prepare,
+            floor=floor,
         )
         if not all(ok for _, ok in results):
+            return results
+        # A pending failed epoch (a B6 task/gate failure OR a G4 semantic-verification
+        # failure) MUST be disposed of by the planner before the phase advances. The
+        # deterministic gate can pass while a semantic criterion is still unmet, so
+        # advancing here would CLEAR the pending disposition (counters reset below)
+        # and let an incomplete epoch slip the phase. Hold at the current phase, do
+        # not emit phase_passed, and let the failed-epoch boundary run first.
+        if store.state.pending_failed_epoch is not None:
             return results
         if phase.id not in passed:
             journal.emit(lambda s: PhasePassed(seq=s, ts=_now(), phase_id=phase.id))
@@ -601,12 +703,13 @@ def _phase_preamble(
     started: set[str],
     vision_reviewer: VisionReviewer | None,
     prepare: PrepareConfig | None,
+    floor: FloorConfig | None,
 ) -> _PhaseContext:
     """Advance phases, fire a one-shot ``phase_escalated`` on budget exhaustion,
     and assemble the cumulative-state tail context (rulings 1-3)."""
 
     results = _advance_phases(
-        journal, store, run_dir, repo, passed, started, vision_reviewer, prepare
+        journal, store, run_dir, repo, passed, started, vision_reviewer, prepare, floor
     )
     skeleton = store.state.skeleton
     assert skeleton is not None
@@ -686,6 +789,94 @@ def _transport_call(
             raise _Escalate(f"hard planner failure: {type(exc).__name__}: {exc}") from exc
 
 
+#: The boundary's checked-out tree of the CURRENT integration tip, materialized
+#: INSIDE the run dir (hence inside ``$repo``) so the read-capable planner can grep
+#: it. A single fixed name per boundary, torn down after; never collides with the
+#: eval/verify worktrees (those carry their own scratch names).
+_PLANNER_TIP_WORKTREE = "_planner_tip"
+#: Stable file (run dir ROOT, outside the ephemeral tip worktree) holding the
+#: structural repo-map handed to the planner BY REFERENCE. Rebuilt/overwritten each
+#: boundary; it persists through the boundary's tip-worktree teardown so the planner
+#: can read it within its single call.
+_PLANNER_REPO_MAP_FILE = "planner_repo_map.txt"
+
+
+def _build_workspace(store: _RunStateStore, run_dir: RunDir, repo: Path | None) -> WorkspaceInfo | None:
+    """Materialize the read-capable workspace handles for one planner boundary.
+
+    Checks out the CURRENT integration tip (``last_integration_branch``, else nothing
+    when no branch exists yet) into ``<run_dir>/worktrees/_planner_tip`` so the
+    read-capable planner can grep the exact code the gate evaluates, and resolves
+    every live keyed-log key (handoffs, verdicts, relocated artifacts) PLUS the G9
+    captured check-output files to its absolute path. All paths live under the run
+    dir, which is inside ``$repo``, so both planner rigs (codex read-only ``-C repo``,
+    claude Read+Grep cwd=repo) can read them.
+
+    ``None`` only when there is no repo (artifact-only runs have no tree + the keyed
+    log alone is already in ``<state>``). The tip checkout is best-effort: an unborn
+    HEAD / unresolvable ref leaves ``integration_tip=None`` and the manifest still
+    surfaces. Pure-deterministic from the run-dir layout + the tip; re-derives
+    identical content on resume (same tip)."""
+
+    if repo is None:
+        return None
+    tip_dir: Path | None = None
+    ref = store.state.last_integration_branch
+    if ref is not None:
+        candidate = run_dir.root / "worktrees" / _PLANNER_TIP_WORKTREE
+        try:
+            wt.add_worktree_detached(repo, candidate, ref=ref)
+        except wt.GitError:
+            tip_dir = None  # unresolvable tip: the manifest still helps the planner
+        else:
+            tip_dir = candidate
+    manifest: list[tuple[str, Path]] = [
+        (key, run_dir.resolve(key)) for key in run_dir.log_index()
+    ]
+    # G9 captured check-output files live OUTSIDE the P*/ keyed log; surface them too
+    # so the planner can read the exact failing-command output that steered the gate.
+    check_root = run_dir.root / "check_output"
+    if check_root.is_dir():
+        for path in sorted(check_root.rglob("*")):
+            if path.is_file():
+                manifest.append((path.relative_to(run_dir.root).as_posix(), path))
+    return WorkspaceInfo(
+        integration_tip=tip_dir, keyed_log_root=run_dir.root, manifest=manifest
+    )
+
+
+def _attach_repo_map(
+    workspace: WorkspaceInfo | None, run_dir: RunDir, repo_map: str | None
+) -> WorkspaceInfo | None:
+    """Persist the structural map to a stable file under the run dir ROOT and point
+    the workspace at it (delivered to the planner BY REFERENCE, not inlined).
+
+    The file lives at the run dir root, NOT inside the ``_planner_tip`` worktree the
+    boundary tears down in its ``finally``, so it survives for the planner's single
+    read. Rebuilt/overwritten each boundary (it reflects the current tip). A None map
+    (below threshold / no tip / build failure) writes NO file and leaves the
+    workspace's ``repo_map_path`` unset (the entry is omitted cleanly). The write is
+    best-effort: a write error leaves the map unreferenced but never crashes the run.
+    Pure-deterministic from the tip; identical content on resume (same tip)."""
+
+    if workspace is None or repo_map is None:
+        return workspace
+    path = run_dir.root / _PLANNER_REPO_MAP_FILE
+    try:
+        path.write_text(repo_map, encoding="utf-8")
+    except OSError:
+        return workspace
+    return replace(workspace, repo_map_path=path)
+
+
+def _teardown_workspace(workspace: WorkspaceInfo | None, run_dir: RunDir, repo: Path | None) -> None:
+    """Tear down the boundary's tip checkout (no leak), idempotently."""
+
+    if workspace is None or workspace.integration_tip is None or repo is None:
+        return
+    wt.remove_worktree(repo, workspace.integration_tip)
+
+
 def _plan_boundary(
     journal: JournalWriter,
     store: _RunStateStore,
@@ -699,6 +890,7 @@ def _plan_boundary(
     completed_phase_ids: frozenset[str],
     vision_reviewer: VisionReviewer | None,
     prepare: PrepareConfig | None,
+    floor: FloorConfig | None,
     failed_epoch: FailedEpochInfo | None,
     has_senior: bool,
     local_max_task_files: int,
@@ -720,10 +912,68 @@ def _plan_boundary(
 
     reasks = 0
     reask_errors: list[str] = []
-    # Whole-repo map of the CURRENT integration tip (volatile-tail context). Built
-    # once per boundary (the tip does not move across this boundary's re-asks);
-    # None below threshold / on any failure, the run is unaffected either way.
-    repo_map = build_repo_map(repo) if repo is not None else None
+    # Read-capable workspace: a checked-out tip tree + a resolvable keyed-log
+    # manifest, INSIDE the run dir so both planner rigs can grep it. Built once per
+    # boundary (the tip is stable across this boundary's re-asks) and torn down after.
+    # Built FIRST so the repo-map below can read the tip checkout it materializes.
+    workspace = _build_workspace(store, run_dir, repo)
+    try:
+        # Whole-repo structural map, delivered to the planner BY REFERENCE (a file
+        # path in the <workspace> manifest), never inlined into the prompt. Built from
+        # the integration-tip CHECKOUT when one exists (the exact code the epochs have
+        # built; the operator tree is deliberately never advanced to the tip), else
+        # from the operator tree (first epoch / no tip yet). Reuses the workspace's
+        # _planner_tip worktree, so no second checkout is created. Built once per
+        # boundary (the tip is stable across this boundary's re-asks); None below
+        # threshold / on any failure, the run is unaffected either way.
+        if repo is None:
+            repo_map = None
+        elif workspace is not None and workspace.integration_tip is not None:
+            repo_map = build_repo_map(workspace.integration_tip)
+        else:
+            repo_map = build_repo_map(repo)
+        # Persist the map under the run dir ROOT (NOT the ephemeral _planner_tip
+        # worktree, which the finally below tears down before the planner reads it),
+        # then hand the planner the PATH via the workspace. Rebuilt/overwritten each
+        # boundary so it reflects the current tip. None map => no file, no entry.
+        workspace = _attach_repo_map(workspace, run_dir, repo_map)
+        return _plan_boundary_loop(
+            journal, store, run_dir, planner, sleep_fn, repo, last_epoch_rows,
+            max_planner_calls, phase_ctx, completed_phase_ids, vision_reviewer,
+            prepare, floor, failed_epoch, has_senior, local_max_task_files,
+            senior_max_task_files, workspace=workspace,
+            reasks=reasks, reask_errors=reask_errors,
+        )
+    finally:
+        _teardown_workspace(workspace, run_dir, repo)
+
+
+def _plan_boundary_loop(
+    journal: JournalWriter,
+    store: _RunStateStore,
+    run_dir: RunDir,
+    planner: PlannerTransport,
+    sleep_fn: SleepFn,
+    repo: Path | None,
+    last_epoch_rows: list[dict[str, Any]] | None,
+    max_planner_calls: int | None,
+    phase_ctx: _PhaseContext | None,
+    completed_phase_ids: frozenset[str],
+    vision_reviewer: VisionReviewer | None,
+    prepare: PrepareConfig | None,
+    floor: FloorConfig | None,
+    failed_epoch: FailedEpochInfo | None,
+    has_senior: bool,
+    local_max_task_files: int,
+    senior_max_task_files: int,
+    *,
+    workspace: WorkspaceInfo | None,
+    reasks: int,
+    reask_errors: list[str],
+) -> _Boundary:
+    """The re-ask loop body of ``_plan_boundary`` (the workspace tip checkout is
+    materialized + torn down by the caller, so this stays a pure control loop)."""
+
     while True:
         prompt = build_planner_input(
             job=store.state.job_text,
@@ -735,8 +985,8 @@ def _plan_boundary(
             reask_errors=reask_errors,
             phase=phase_ctx.info if phase_ctx is not None else None,
             repo_memory=store.state.repo_memory,
-            repo_map=repo_map,
             failed_epoch=failed_epoch,
+            workspace=workspace,
         )
         try:
             raw = _transport_call(journal, store, planner, sleep_fn, prompt, max_planner_calls)
@@ -781,6 +1031,7 @@ def _plan_boundary(
                 run_dir=run_dir,
                 vision_reviewer=vision_reviewer,
                 prepare=prepare,
+                floor=floor,
             )
             if failures:
                 if reasks >= MAX_REASKS:
@@ -914,7 +1165,7 @@ def _dispatch_epoch(
         epoch_hint=epoch_hint,
         force_senior=force_senior,
     )
-    _record_epoch(store, outcome)
+    _record_epoch(store, outcome, decision)
     return outcome
 
 
@@ -928,8 +1179,21 @@ def _epoch_args(decision: EpochDecision) -> EpochArgs:
     return args
 
 
-def _record_epoch(store: _RunStateStore, outcome: EpochOutcome) -> None:
+def _record_epoch(
+    store: _RunStateStore, outcome: EpochOutcome, decision: EpochDecision
+) -> None:
+    """Persist a completed epoch as ``awaiting_planner`` (the resume cursor).
+
+    An epoch that carries ``criteria`` AND did not fail its floor still owes the G4
+    agentic verification pass; record that as the DURABLE ``pending_verification``
+    marker (the originating decision + epoch id) so a kill in the window between this
+    persist and the verifier finishing cannot let the epoch skip its semantic gate.
+    The marker is cleared by ``_verify_epoch`` once the pass reaches a terminal
+    classification. An epoch with no criteria, or one whose floor failed (the
+    failed-epoch path owns it), owes no verification -> the marker is left clear."""
+
     new_branch = outcome.integration.branch or store.state.last_integration_branch
+    owes_verification = bool(_epoch_criteria(decision)) and not _epoch_failed(outcome)
     store.update(
         status="awaiting_planner",
         epoch_counter=store.state.epoch_counter + 1,
@@ -937,6 +1201,15 @@ def _record_epoch(store: _RunStateStore, outcome: EpochOutcome) -> None:
         phase_budget_used=store.state.phase_budget_used + 1,
         last_integration_branch=new_branch,
         pending_decision=None,
+        pending_verification=(
+            {
+                "decision": decision.model_dump(mode="json"),
+                "phase_id": outcome.phase_id,
+                "epoch_id": outcome.epoch_id,
+            }
+            if owes_verification
+            else None
+        ),
     )
 
 
@@ -957,6 +1230,7 @@ def _build_failed_epoch_info(
     phase_check_results: list[tuple[str, bool]],
     disposed_count: int,
     cap: int,
+    verification_gaps: list[str] | None = None,
 ) -> FailedEpochInfo:
     """Assemble the focused context a ``handle_failed_epoch`` decision needs.
 
@@ -989,6 +1263,252 @@ def _build_failed_epoch_info(
         passing_handoffs=passing,
         disposed_count=disposed_count,
         cap=cap,
+        verification_gaps=list(verification_gaps or []),
+    )
+
+
+def _epoch_criteria(decision: EpochDecision) -> list[str]:
+    """Every task's natural-language ``criteria`` for an epoch, aggregated + deduped
+    (G4). Empty => the verification pass is SKIPPED entirely."""
+
+    if not isinstance(decision.args, (ImplementEpochArgs, ArtifactEpochArgs)):
+        return []
+    seen: dict[str, None] = {}
+    for task in decision.args.tasks:
+        for c in task.criteria:
+            seen.setdefault(c, None)
+    return list(seen)
+
+
+def _artifact_out_keys(decision: EpochDecision) -> dict[str, str]:
+    """Map each task id to its ``artifact_out`` log key for an artifact-mode epoch.
+
+    Empty for an implement epoch (its deliverable is the committed diff the verifier
+    already sees); empty when the decision is not an epoch tool."""
+
+    if not isinstance(decision.args, ArtifactEpochArgs):
+        return {}
+    return {t.id: t.artifact_out for t in decision.args.tasks}
+
+
+def _epoch_artifacts_summary(
+    outcome: EpochOutcome, run_dir: RunDir, decision: EpochDecision
+) -> list[str]:
+    """What the epoch produced, fed to the adversarial verifier (its only handle).
+
+    Each DONE task contributes its handoff ``resulting_state`` (a one-line pointer)
+    AND, when the task is an artifact-mode task, the relocated ``artifact_out``
+    deliverable's PATH (the absolute run-dir location ``artifact_exists`` resolves via
+    ``find_artifact``). The verifier runs in a fresh worktree of the committed
+    integration tip, so a research/artifact deliverable (which is NOT committed) is
+    invisible in the diff there: handing it the PATH (and telling it to READ the file)
+    lets it judge the real deliverable WITHOUT the content being byte-capped-and-embedded
+    into the prompt (the principle: agent inputs travel by reference, full content stays
+    on disk). The verifier worktree is under the run dir, so the absolute path is
+    readable from its cwd (same access argument as the failure files). A deliverable
+    ``artifact_exists`` just confirmed present resolves here too, so it is never reported
+    missing. An implement task's deliverable is the committed diff the verifier already
+    reads, so it contributes only the pointer.
+    """
+
+    out_keys = _artifact_out_keys(decision)
+    out: list[str] = []
+    for t in outcome.tasks:
+        if t.status != "done" or not t.handoff_key:
+            continue
+        try:
+            payload = json.loads(run_dir.resolve(t.handoff_key).read_text(encoding="utf-8"))
+            state = str(payload.get("resulting_state", "")).strip()
+        except (ValueError, OSError):
+            state = ""
+        out.append(f"{t.task_id}: {state or '(no state recorded)'}")
+        artifact_out = out_keys.get(t.task_id)
+        if artifact_out is None:
+            continue
+        path = run_dir.find_artifact(artifact_out)
+        if path is None:
+            out.append(
+                f"{t.task_id} artifact `{artifact_out}`: (relocated but unresolvable)"
+            )
+        else:
+            out.append(
+                f"{t.task_id} artifact `{artifact_out}` (relocated deliverable, READ "
+                f"its full content at this path): {path}"
+            )
+    return out
+
+
+#: Bounded verifier re-runs for a STRUCTURALLY-invalid verdict (G6 Part B). A verdict
+#: the verifier model cannot emit validly (bad JSON / missing field / still invalid
+#: after advisory truncation) is a verification-INFRASTRUCTURE problem, not a worker
+#: semantic gap, so the core re-runs the verifier this many times (the model may emit
+#: valid output on a retry) before escalating. A genuine well-formed ``pass=false``
+#: verdict is NEVER retried here: it is a semantic gap and routes through the
+#: failed-epoch machinery on the first verdict, exactly as before.
+VERIFIER_MAX_ATTEMPTS = 2
+
+
+@dataclass(frozen=True)
+class _VerificationInfraFailure:
+    """A verification-INFRASTRUCTURE failure (G6 Part B): the deterministic floor and
+    the worker handoff were honest, but the verification TOOLING could not produce a
+    valid verdict after the bounded re-runs (or the eval environment could not be set
+    up). Distinct from a semantic gap: the core escalates the run with this clear
+    message instead of mis-blaming the worker via ``handle_failed_epoch``."""
+
+    message: str
+
+
+def _verify_epoch(
+    journal: JournalWriter,
+    store: _RunStateStore,
+    run_dir: RunDir,
+    repo: Path | None,
+    decision: EpochDecision,
+    outcome: EpochOutcome,
+    *,
+    verifier: EpochVerifier | None,
+    prepare: PrepareConfig | None,
+) -> list[str] | _VerificationInfraFailure | None:
+    """Run the end-of-epoch agentic verification pass (G4); classify the outcome.
+
+    SKIPPED (returns ``None``, no event) when the epoch carries no ``criteria`` or
+    there is no verifier (no local tier) or no repo. Otherwise: build a worktree of
+    the epoch's integration tip with deps materialized, dispatch the adversarial
+    verification pass on the local tier, relocate + re-validate ``verdict.json``.
+
+    Three classified returns:
+    - ``[]`` on a clean pass (every criterion met).
+    - a non-empty gap list on a well-formed ``pass=false`` verdict (a SEMANTIC gap,
+      routed through ``handle_failed_epoch`` unchanged).
+    - a ``_VerificationInfraFailure`` when the verifier could not produce a valid
+      verdict after ``VERIFIER_MAX_ATTEMPTS`` re-runs, or the eval environment could
+      not be set up (a verification-INFRASTRUCTURE failure: the floor passed, the
+      worker is honest, the TOOLING failed). The caller escalates, never charging it
+      to the worker as a semantic gap (G6 Part B).
+
+    The deterministic floor already cleared (no task failed), so this pass can only
+    fail the epoch, never rubber-stamp it."""
+
+    criteria = _epoch_criteria(decision)
+    if verifier is None or repo is None or not criteria:
+        # No verification ran for this epoch (criteria-less / artifact-only / no local
+        # tier): clear the pending-verification marker (this epoch owes no pass) so resume
+        # does not try to re-verify a criteria-less epoch. There is no digest to clear:
+        # the digest now lives in the persisted verdict.json (read by reference), so an
+        # unverified epoch simply produces no verdict file.
+        store.update(pending_verification=None)
+        return None
+    args = _epoch_args(decision)  # non-empty criteria => an epoch tool (narrows type)
+    phase_id = store.state.current_phase_id or "P1"
+    journal.emit(
+        lambda s: EpochVerificationStarted(
+            seq=s, ts=_now(), phase_id=phase_id, epoch_id=outcome.epoch_id,
+            criteria=len(criteria),
+        )
+    )
+    ref = store.state.last_integration_branch or "HEAD"
+    worktree = run_dir.root / "worktrees" / f"_verify_{outcome.epoch_id}"
+    brief = VerificationBrief(
+        epoch_goal=f"{args.epoch_title}: {args.rationale}".strip(": "),
+        criteria=criteria,
+        artifacts=_epoch_artifacts_summary(outcome, run_dir, decision),
+    )
+    try:
+        wt.add_worktree_detached(repo, worktree, ref=ref)
+    except wt.GitError:
+        # No tip to verify against (unborn HEAD / unresolvable ref). The environment
+        # could not be set up: an infrastructure failure, not a worker semantic gap.
+        return _VerificationInfraFailure(
+            f"verification could not check out the integration tip ({ref!r}); "
+            f"the deterministic floor passed, the eval environment could not be built"
+        )
+    try:
+        try:
+            materialize_env(repo, worktree, prepare)
+        except PrepareError as exc:
+            # Materializing the eval deps failed: infrastructure, not a semantic gap.
+            return _VerificationInfraFailure(
+                f"verification environment could not be prepared: {exc}; "
+                f"the deterministic floor passed, the eval environment could not be built"
+            )
+        verdict = _verify_with_retries(
+            verifier, worktree, brief, phase_id, outcome, run_dir
+        )
+    finally:
+        wt.remove_worktree(repo, worktree)
+    if isinstance(verdict, _VerificationInfraFailure):
+        return verdict
+    # The full verdict (digest + per-criterion evidence + gaps) was relocated to its
+    # stable keyed-log path by the verifier adapter; it reaches the NEXT planner boundary
+    # BY REFERENCE via the <workspace> manifest (the planner reads verdict.json), so
+    # nothing is held in run state or embedded in a prompt. The relocated file is the
+    # durable record (re-read on resume, never regenerated); construction stays pure.
+    if verdict.passed:
+        journal.emit(
+            lambda s: EpochVerificationPassed(
+                seq=s, ts=_now(), phase_id=phase_id, epoch_id=outcome.epoch_id
+            )
+        )
+        # The Passed event is the DURABLE terminal record: clear the pending marker so
+        # resume reuses this verdict (sees the event) instead of re-verifying.
+        store.update(pending_verification=None)
+        return []
+    # A well-formed passed=false verdict is a SEMANTIC gap; synthesize a reason from
+    # the unmet criteria so the planner always sees WHAT was unmet.
+    gaps = list(verdict.gaps) or [
+        f"criterion not met: {j.criterion}"
+        for j in verdict.per_criterion
+        if not j.met
+    ] or ["the verification pass marked the epoch not done (no specific gap given)"]
+    return gaps
+
+
+def _verdict_log_key(phase_id: str, epoch_id: str) -> str:
+    """The keyed-log path the epoch's relocated ``verdict.json`` lands at.
+
+    A ``P*/E*/...`` key so the relocated verdict shows up in ``log_index()`` and thus in
+    the ``<workspace>`` manifest, where the planner reads it BY REFERENCE."""
+
+    return f"{phase_id}/{epoch_id}/verdict.json"
+
+
+def _verify_with_retries(
+    verifier: EpochVerifier,
+    worktree: Path,
+    brief: VerificationBrief,
+    phase_id: str,
+    outcome: EpochOutcome,
+    run_dir: RunDir,
+) -> EpochVerdict | _VerificationInfraFailure:
+    """Dispatch the verifier, re-running it on a STRUCTURAL failure (G6 Part B).
+
+    A ``VerificationError`` means the verifier model produced output that cannot be
+    parsed into a valid verdict (bad JSON / missing field / over the DoS size guard).
+    The model may emit valid output on a retry, so re-run it up to
+    ``VERIFIER_MAX_ATTEMPTS`` times. If a valid verdict still cannot be obtained, return
+    a ``_VerificationInfraFailure`` (the caller escalates) rather than charging the epoch
+    as a semantic gap. A well-formed verdict (pass true OR false) returns on the first
+    valid parse, after the adapter relocates the full ``verdict.json`` to its stable
+    keyed-log path (so the planner reads it by reference)."""
+
+    verdict_dest = run_dir.resolve(_verdict_log_key(phase_id, outcome.epoch_id))
+    last_error = ""
+    for _attempt in range(VERIFIER_MAX_ATTEMPTS):
+        try:
+            return verifier.verify(
+                worktree=worktree,
+                brief=brief,
+                task_id=f"{phase_id}/{outcome.epoch_id}/verify",
+                verdict_dest=verdict_dest,
+            )
+        except VerificationError as exc:
+            last_error = str(exc)
+    return _VerificationInfraFailure(
+        f"the verification pass could not produce a valid verdict after "
+        f"{VERIFIER_MAX_ATTEMPTS} attempts ({last_error}); the deterministic floor "
+        f"passed and the worker handoff was honest, so this is a verification-tooling "
+        f"failure, not a gap in the work"
     )
 
 
@@ -1000,30 +1520,45 @@ def _maybe_open_failed_epoch(
     outcome: EpochOutcome,
     phase_ctx: _PhaseContext | None,
     cap: int,
+    *,
+    verification_gaps: list[str] | None = None,
 ) -> RunOutcome | None:
     """If the just-run epoch FAILED, open a focused failed-epoch disposition.
 
-    Increments the per-phase failed-epoch counter and, at the deterministic cap,
-    FORCES a halt-to-human regardless of the planner (Part C, the spin-loop
-    backstop). Below the cap it records the originating decision + the failure
-    context in run state so the NEXT boundary is constrained to handle_failed_epoch
-    (Part B). Returns a terminal RunOutcome when the cap halts, else ``None``."""
+    An epoch fails one of two ways: a task exhausted its retry ladder (the B6 path),
+    or it cleared its deterministic floor but the G4 agentic verification pass found a
+    semantic ``verification_gaps`` (an unmet acceptance criterion). EITHER routes
+    through the SAME machinery: increment the per-phase failed-epoch counter and, at
+    the deterministic cap, FORCE a halt-to-human regardless of the planner (Part C,
+    the spin-loop backstop); below the cap record the originating decision + the
+    failure context (incl. the gaps) in run state so the NEXT boundary is constrained
+    to handle_failed_epoch (Part B). Returns a terminal RunOutcome when the cap halts,
+    else ``None``."""
 
-    if not _epoch_failed(outcome):
+    gaps = verification_gaps or []
+    if not _epoch_failed(outcome) and not gaps:
         return None
     disposed = store.state.phase_failed_epochs + 1
     phase_id = store.state.current_phase_id or "P1"
-    failed_ids = [t.task_id for t in outcome.tasks if t.status == "failed"]
-    journal.emit(
-        lambda s: EpochFailed(
-            seq=s, ts=_now(), phase_id=phase_id, epoch_id=outcome.epoch_id,
-            failed_tasks=failed_ids,
+    if gaps:
+        journal.emit(
+            lambda s: EpochVerificationFailed(
+                seq=s, ts=_now(), phase_id=phase_id, epoch_id=outcome.epoch_id,
+                gaps=gaps,
+            )
         )
-    )
+    else:
+        failed_ids = [t.task_id for t in outcome.tasks if t.status == "failed"]
+        journal.emit(
+            lambda s: EpochFailed(
+                seq=s, ts=_now(), phase_id=phase_id, epoch_id=outcome.epoch_id,
+                failed_tasks=failed_ids,
+            )
+        )
     phase_checks = phase_ctx.info.check_results if phase_ctx is not None else []
     info = _build_failed_epoch_info(
         outcome, run_dir, phase_check_results=phase_checks,
-        disposed_count=disposed, cap=cap,
+        disposed_count=disposed, cap=cap, verification_gaps=gaps,
     )
     if disposed >= cap:
         reason = (
@@ -1037,7 +1572,10 @@ def _maybe_open_failed_epoch(
                 action="cap_halt", detail=reason,
             )
         )
-        store.update(phase_failed_epochs=disposed, pending_failed_epoch=None)
+        store.update(
+            phase_failed_epochs=disposed, pending_failed_epoch=None,
+            pending_verification=None,
+        )
         return _escalate(journal, store, reason)
     store.update(
         phase_failed_epochs=disposed,
@@ -1046,20 +1584,30 @@ def _maybe_open_failed_epoch(
             "epoch_id": info.epoch_id,
             "failed_tasks": info.failed_tasks,
             "passing_handoffs": info.passing_handoffs,
+            "verification_gaps": info.verification_gaps,
         },
+        # The EpochVerificationFailed event (above, for the gap path) + the durable
+        # pending_failed_epoch are now the terminal record: clear the pending-
+        # verification marker so resume does not re-verify an already-disposed gap.
+        pending_verification=None,
     )
     return None
 
 
 def _pending_failed_epoch_info(
-    store: _RunStateStore, phase_ctx: _PhaseContext | None
+    store: _RunStateStore, phase_ctx: _PhaseContext | None, cap: int
 ) -> FailedEpochInfo | None:
     """Rebuild the pending failed-epoch context from run state (resume-safe).
 
     The originating decision + the failed-task / passing-handoff snapshot are
     durable in run state; the failing-check labels (with the latest captured
     output, Part A) are refreshed from THIS pass's phase evaluation so the planner
-    always sees the current gate output. ``None`` when nothing is pending."""
+    always sees the current gate output. ``None`` when nothing is pending.
+
+    A#5 fix: ``cap`` is the REAL ``max_failed_epochs_per_phase`` (the remaining-budget
+    denominator), threaded through so the planner sees the true budget (e.g.
+    ``disposed=1/3``) instead of the old ``disposed=N/N`` that always rendered at-cap
+    (a false 'halting now' signal) by passing the disposed count as its own cap."""
 
     pending = store.state.pending_failed_epoch
     if pending is None:
@@ -1075,7 +1623,8 @@ def _pending_failed_epoch_info(
         failed_checks=failed_checks,
         passing_handoffs=[(h[0], h[1]) for h in pending["passing_handoffs"]],
         disposed_count=store.state.phase_failed_epochs,
-        cap=store.state.phase_failed_epochs,  # display only; cap re-applied on action
+        cap=cap,
+        verification_gaps=[str(g) for g in pending.get("verification_gaps", [])],
     )
 
 
@@ -1090,6 +1639,7 @@ def _apply_failed_epoch_decision(
     tier0_attempts: int,
     prepare: PrepareConfig | None,
     cap: int,
+    verifier: EpochVerifier | None,
 ) -> tuple[RunOutcome | None, EpochOutcome | None]:
     """Dispatch a handle_failed_epoch decision; clear the pending failure.
 
@@ -1146,11 +1696,268 @@ def _apply_failed_epoch_decision(
             journal, store, f"integration conflict in {outcome.epoch_id} (structural bug)"
         ), None
     # A re-dispatched epoch can itself fail; re-open the disposition (counter keeps
-    # climbing toward the cap, so a retry-loop terminates deterministically).
+    # climbing toward the cap, so a retry-loop terminates deterministically). The
+    # re-dispatch is re-verified the same way (a retry that satisfies the floor but
+    # still leaves a semantic gap re-opens the disposition with the fresh gaps).
+    verification = (
+        _verify_epoch(
+            journal, store, run_dir, repo, epoch_decision, outcome,
+            verifier=verifier, prepare=prepare,
+        )
+        if not _epoch_failed(outcome)
+        else None
+    )
+    if isinstance(verification, _VerificationInfraFailure):
+        # The verification TOOLING failed (not a semantic gap): escalate with the
+        # clear message rather than mis-blaming the worker via handle_failed_epoch.
+        return _escalate(journal, store, verification.message), None
     result = _maybe_open_failed_epoch(
-        journal, store, run_dir, epoch_decision, outcome, None, cap
+        journal, store, run_dir, epoch_decision, outcome, None, cap,
+        verification_gaps=verification,
     )
     return result, outcome
+
+
+# --- G3 automatic senior infra-repair: detect -> repair -> re-run -> cap --------
+
+#: The ladder tier name the infra-repair dispatches on (the senior/cloud tier).
+_SENIOR_TIER_NAME = "senior"
+
+
+def _senior_transport(ladder: Ladder) -> WorkerTransport | None:
+    """The ladder's ``senior`` tier transport (the infra-repair runs there)."""
+
+    for name, transport in ladder:
+        if name == _SENIOR_TIER_NAME:
+            return transport
+    return None
+
+
+def _infra_failures(results: Sequence[CheckResult]) -> list[CheckResult]:
+    """The cmd-check rows that failed for an ENVIRONMENTAL reason (G3 classifier)."""
+
+    return [r for r in results if not r.ok and r.infra is not None and r.infra.is_infra]
+
+
+def _run_one_infra_repair(
+    journal: JournalWriter,
+    store: _RunStateStore,
+    run_dir: RunDir,
+    repo: Path,
+    senior: WorkerTransport,
+    *,
+    phase_id: str,
+    exit_criterion: Sequence[Check],
+    failing: Sequence[CheckResult],
+    prepare: PrepareConfig | None,
+    floor: FloorConfig | None,
+    cfg: InfraRepairConfig,
+    attempt: int,
+) -> bool:
+    """Dispatch ONE senior infra-repair against the gate tip; adopt it if it sticks.
+
+    A worktree of the current tip is materialized, the senior is dispatched with a
+    focused ``InfraRepairBrief`` (the failing commands + their output + the host
+    guard) and edits the environment IN that worktree; the core commits the edits
+    (models never run git) and re-runs the FULL phase exit criterion (plus floor)
+    against the repair commit. Pass -> the repair commit is adopted as the new
+    integration tip (a real branch, force-moved), so the ordinary phase gate that
+    follows now passes; ``True``. No commit / any check still failing -> the repair
+    branch is discarded, ``False``. We re-run the WHOLE gate, not only the named
+    failing commands, so a repair that fixes its target but REGRESSES an unrelated
+    check in the same exit criterion is NOT adopted (A#7).
+
+    A senior transport raise, OR a ``PrepareError`` materializing deps into the
+    eval/repair worktree (the exact scenario this feature targets: deps that cannot
+    install), is a clean ``False`` (the repair simply did not land), never a run
+    crash, letting the cap/escalate path fire (A#1).
+    """
+
+    tip = store.state.last_integration_branch or "HEAD"
+    base_commit = wt.resolve_commit(repo, tip)
+    worktree = run_dir.root / "worktrees" / f"_infra_repair_{attempt}"
+    branch = f"grind/infra-repair-{attempt}"
+    failing_cmds = [r.cmd for r in failing if r.cmd is not None]
+    output_tail = "\n\n".join(r.label for r in failing)
+    journal.emit(
+        lambda s: InfraRepairDispatched(
+            seq=s, ts=_now(), phase_id=phase_id,
+            command=", ".join(failing_cmds), attempt=attempt, cap=cfg.attempts,
+        )
+    )
+    wt.add_worktree(repo, worktree, branch=branch, base=base_commit)
+    try:
+        try:
+            materialize_env(repo, worktree, prepare)
+        except PrepareError:
+            # Deps cannot materialize in the repair worktree (the very fault this
+            # feature targets). Treat as a repair that did not land so the cap /
+            # escalate path fires cleanly; never let it crash out of _drive.
+            return False
+        brief = InfraRepairBrief(
+            failing_commands=failing_cmds,
+            output_tail=output_tail,
+            reason="; ".join(
+                r.infra.reason for r in failing if r.infra is not None
+            ),
+            allow_host_commands=list(cfg.allow_host_commands),
+        )
+        request = WorkerRequest(
+            task=_infra_repair_task(failing_cmds),
+            task_id=f"{phase_id}/infra-repair-{attempt}",
+            inputs={},
+            scratch=worktree,
+            attempt=attempt,
+            failure_context=[],
+            mode="implement",
+            infra_repair=brief,
+        )
+        try:
+            senior.run(request)
+        except Exception:  # a senior raise is just a repair that did not land
+            return False
+        # Drop the worker's disk-contract metadata so it cannot enter the commit.
+        (worktree / "handoff.json").unlink(missing_ok=True)
+        if not wt.commit_all(worktree, f"grindstone: infra repair (attempt {attempt})"):
+            return False  # the senior changed nothing repo-local
+        repair_commit = wt.resolve_commit(worktree, "HEAD")
+    finally:
+        wt.remove_worktree(repo, worktree)
+    # Re-run the FULL phase exit criterion (plus floor) against the repair commit,
+    # the authoritative judge (not the senior's handoff, not just the named failing
+    # commands). A repair that fixes its target but regresses ANY other check in the
+    # same gate is NOT adopted (A#7). Still failing -> discard the repair branch.
+    recheck = _evaluate_checks_detailed(
+        exit_criterion,
+        repo=repo,
+        ref=repair_commit,
+        run_dir=run_dir,
+        scratch_name=f"_infra_recheck_{attempt}",
+        prepare=prepare,
+        floor=floor,
+    )
+    if not all(r.ok for r in recheck):
+        wt.delete_branch(repo, branch)
+        return False
+    # The repair sticks: adopt it as the integration tip so the phase gate passes.
+    store.update(last_integration_branch=branch)
+    return True
+
+
+def _infra_repair_task(failing_cmds: Sequence[str]) -> ImplementTask:
+    """The minimal placeholder ``ImplementTask`` an infra-repair request carries.
+
+    The real brief rides ``WorkerRequest.infra_repair``; the prompt builder branches
+    on it before ever reading this task. It exists only to satisfy the request's
+    typed ``task`` slot, repo-wide ownership (the repair may touch any manifest/
+    config) and a non-empty done_when."""
+
+    return ImplementTask(
+        id="T1",
+        goal="infra repair: make the failing gate command(s) satisfiable",
+        done_when=[CmdCheck(cmd=c) for c in failing_cmds] or [CmdCheck(cmd="true")],
+        file_ownership=["**"],
+    )
+
+
+def _maybe_repair_infra(
+    journal: JournalWriter,
+    store: _RunStateStore,
+    run_dir: RunDir,
+    repo: Path | None,
+    ladder: Ladder,
+    *,
+    prepare: PrepareConfig | None,
+    floor: FloorConfig | None,
+    infra_repair: InfraRepairConfig | None,
+) -> RunOutcome | None:
+    """Before each boundary: if the phase gate is INFRA-failing, auto-repair it.
+
+    The self-healing loop (G3). Evaluates the current phase's exit criterion (plus
+    the floor) infra-aware; if any cmd check failed ENVIRONMENTALLY and a senior
+    tier + an ``infra_repair`` policy exist, dispatch up to ``attempts`` senior
+    repairs, each making the gate satisfiable and re-running it. A repair that
+    sticks emits ``infra_repair_resolved`` and returns ``None`` (the run proceeds,
+    the now-passing gate advances normally). Exhausting the cap with the gate STILL
+    infra-failing escalates the run for a human, naming the unsatisfiable command
+    (``infra_repair_exhausted`` + a clear ``RunOutcome``). Returns a terminal
+    ``RunOutcome`` only on that escalation, else ``None`` (the common path)."""
+
+    if infra_repair is None or repo is None or store.state.skeleton is None:
+        return None
+    senior = _senior_transport(ladder)
+    if senior is None:
+        return None  # a rig with no senior tier cannot auto-repair
+    skeleton = store.state.skeleton
+    phase = skeleton[_phase_index(skeleton, store.state.current_phase_id)]
+    phase_id = phase.id
+    results = _evaluate_checks_detailed(
+        phase.exit_criterion,
+        repo=repo,
+        ref=_eval_ref(store, repo),
+        run_dir=run_dir,
+        scratch_name="_infra_detect",
+        prepare=prepare,
+        floor=floor,
+    )
+    failing = _infra_failures(results)
+    if not failing:
+        return None
+    def _emit_detected(cmd: str, reason: str) -> None:
+        journal.emit(
+            lambda s: InfraCheckDetected(
+                seq=s, ts=_now(), phase_id=phase_id, command=cmd, reason=reason
+            )
+        )
+
+    for r in failing:
+        assert r.infra is not None
+        _emit_detected(r.cmd or "(unknown)", r.infra.reason)
+    attempt = 0
+    while attempt < infra_repair.attempts:
+        attempt += 1
+        resolved = _run_one_infra_repair(
+            journal, store, run_dir, repo, senior,
+            phase_id=phase_id, exit_criterion=phase.exit_criterion,
+            failing=failing, prepare=prepare, floor=floor,
+            cfg=infra_repair, attempt=attempt,
+        )
+        if resolved:
+            done_attempt = attempt
+            journal.emit(
+                lambda s: InfraRepairResolved(
+                    seq=s, ts=_now(), phase_id=phase_id, attempt=done_attempt
+                )
+            )
+            return None
+        # Re-evaluate: a partial repair may have changed WHICH commands fail.
+        results = _evaluate_checks_detailed(
+            phase.exit_criterion,
+            repo=repo,
+            ref=_eval_ref(store, repo),
+            run_dir=run_dir,
+            scratch_name="_infra_detect",
+            prepare=prepare,
+            floor=floor,
+        )
+        failing = _infra_failures(results)
+        if not failing:
+            return None  # the gate cleared (e.g. a non-adopted but real fix)
+    # Cap reached and the gate is still infra-failing: escalate, naming the tool.
+    cmd = failing[0].cmd or "(unknown command)"
+    reason = failing[0].infra.reason if failing[0].infra is not None else "infra"
+    journal.emit(
+        lambda s: InfraRepairExhausted(
+            seq=s, ts=_now(), phase_id=phase_id, command=cmd, reason=reason
+        )
+    )
+    return _escalate(
+        journal,
+        store,
+        f"infra-repair exhausted after {infra_repair.attempts} attempt(s): the gate "
+        f"command `{cmd}` cannot be satisfied in this environment ({reason}); a human "
+        f"must fix the host environment or allowlist the needed command",
+    )
 
 
 # --- B5 final polish: gated, optional, never-fails post-completion pass ---------
@@ -1165,6 +1972,7 @@ def _final_polish(
     final_polish: FinalPolish | None,
     vision_reviewer: VisionReviewer | None,
     prepare: PrepareConfig | None,
+    floor: FloorConfig | None,
 ) -> None:
     """Optionally let codex polish the finished repo inline, model proposes, the
     state machine disposes. Runs only when configured AND a repo + final branch
@@ -1186,7 +1994,7 @@ def _final_polish(
     try:
         _run_final_polish(
             journal, store, run_dir, repo, branch, evidence, final_polish,
-            vision_reviewer, prepare,
+            vision_reviewer, prepare, floor,
         )
     except Exception as exc:  # broad: polish must never fail a completed run
         journal.emit(
@@ -1220,6 +2028,7 @@ def _run_final_polish(
     final_polish: FinalPolish,
     vision_reviewer: VisionReviewer | None,
     prepare: PrepareConfig | None,
+    floor: FloorConfig | None,
 ) -> None:
     """The polish body (caller guards every failure into a no-op).
 
@@ -1264,6 +2073,7 @@ def _run_final_polish(
             run_dir=run_dir,
             vision_reviewer=vision_reviewer,
             prepare=prepare,
+            floor=floor,
         )
         if failures:
             journal.emit(
@@ -1356,7 +2166,10 @@ def _drive(
     vision_reviewer: VisionReviewer | None,
     final_polish: FinalPolish | None,
     prepare: PrepareConfig | None,
+    floor: FloorConfig | None,
     max_failed_epochs_per_phase: int,
+    verifier: EpochVerifier | None = None,
+    infra_repair: InfraRepairConfig | None = None,
     local_max_task_files: int = DEFAULT_LOCAL_MAX_TASK_FILES,
     senior_max_task_files: int = DEFAULT_SENIOR_MAX_TASK_FILES,
 ) -> RunOutcome:
@@ -1369,6 +2182,24 @@ def _drive(
     while True:
         if max_epochs is not None and store.state.epoch_counter >= max_epochs:
             return _fail_valve(journal, store, f"safety valve: {max_epochs} epochs reached")
+
+        # G3 self-healing: before the boundary, if the current phase gate is failing
+        # for an ENVIRONMENTAL reason (a missing tool/dependency/install), auto-
+        # dispatch a bounded senior infra-repair and re-run the gate, instead of
+        # charging the worker or opening a semantic failed epoch. A repair that
+        # sticks lets the gate below pass normally; cap-exhaustion escalates here.
+        #
+        # SKIP while a failed epoch is awaiting disposition (A#10): the planner is
+        # constrained to handle_failed_epoch this iteration, and an infra-repair
+        # would mutate the integration tip BETWEEN the semantic failure and its
+        # disposition. The two repair mechanisms are mutually exclusive.
+        if store.state.pending_failed_epoch is None:
+            infra_result = _maybe_repair_infra(
+                journal, store, run_dir, repo, ladder,
+                prepare=prepare, floor=floor, infra_repair=infra_repair,
+            )
+            if infra_result is not None:
+                return infra_result
 
         # Phase machinery (rulings 1-3): once a skeleton exists, every loop pass
         # freshly evaluates the current phase against the integration tip, fires
@@ -1384,6 +2215,7 @@ def _drive(
                 started_phases,
                 vision_reviewer,
                 prepare,
+                floor,
             )
             if store.state.skeleton is not None
             else None
@@ -1393,7 +2225,9 @@ def _drive(
         # context (refreshing the phase-check output from this pass, Part A) and
         # constrain the next decision to handle_failed_epoch. Resume-safe: the
         # originating decision + raw context live in run state.
-        failed_epoch_info = _pending_failed_epoch_info(store, phase_ctx)
+        failed_epoch_info = _pending_failed_epoch_info(
+            store, phase_ctx, max_failed_epochs_per_phase
+        )
 
         boundary = _plan_boundary(
             journal,
@@ -1408,6 +2242,7 @@ def _drive(
             frozenset(passed_phases),
             vision_reviewer,
             prepare,
+            floor,
             failed_epoch_info,
             has_senior,
             local_max_task_files,
@@ -1430,7 +2265,7 @@ def _drive(
         if isinstance(decision, HandleFailedEpochDecision):
             result, outcome = _apply_failed_epoch_decision(
                 journal, run_dir, store, decision, repo, ladder, concurrency,
-                tier0_attempts, prepare, max_failed_epochs_per_phase,
+                tier0_attempts, prepare, max_failed_epochs_per_phase, verifier,
             )
             if result is not None:
                 return result
@@ -1443,7 +2278,7 @@ def _drive(
         if isinstance(decision, CompleteRunDecision):
             _final_polish(
                 journal, store, run_dir, repo, decision.args.evidence,
-                final_polish, vision_reviewer, prepare,
+                final_polish, vision_reviewer, prepare, floor,
             )
             return _complete(journal, store, decision.args.summary)
 
@@ -1458,9 +2293,27 @@ def _drive(
             return _escalate(
                 journal, store, f"integration conflict in {outcome.epoch_id} (structural bug)"
             )
+        # G4: the deterministic floor cleared (no task failed) -> run the agentic
+        # verification pass over the epoch's criteria; an unmet criterion fails the
+        # epoch through the SAME failed-epoch machinery. Skipped when a task already
+        # failed (the floor is what failed, not the semantics).
+        verification = (
+            _verify_epoch(
+                journal, store, run_dir, repo, decision, outcome,
+                verifier=verifier, prepare=prepare,
+            )
+            if not _epoch_failed(outcome)
+            else None
+        )
+        if isinstance(verification, _VerificationInfraFailure):
+            # The verification TOOLING could not produce a valid verdict (G6 Part B):
+            # the floor passed and the worker is honest, so this is a verification-
+            # infrastructure escalation, NOT a worker semantic gap. Do not route it
+            # through handle_failed_epoch (that mis-blames the worker).
+            return _escalate(journal, store, verification.message)
         result = _maybe_open_failed_epoch(
             journal, store, run_dir, decision, outcome, phase_ctx,
-            max_failed_epochs_per_phase,
+            max_failed_epochs_per_phase, verification_gaps=verification,
         )
         if result is not None:
             return result
@@ -1487,6 +2340,9 @@ def run_grind(
     vision_reviewer: VisionReviewer | None = None,
     final_polish: FinalPolish | None = None,
     prepare: PrepareConfig | None = None,
+    floor: FloorConfig | None = None,
+    verifier: EpochVerifier | None = None,
+    infra_repair: InfraRepairConfig | None = None,
     max_failed_epochs_per_phase: int = DEFAULT_MAX_FAILED_EPOCHS_PER_PHASE,
     local_max_task_files: int = DEFAULT_LOCAL_MAX_TASK_FILES,
     senior_max_task_files: int = DEFAULT_SENIOR_MAX_TASK_FILES,
@@ -1553,13 +2409,80 @@ def run_grind(
             vision_reviewer=vision_reviewer,
             final_polish=final_polish,
             prepare=prepare,
+            floor=floor,
             max_failed_epochs_per_phase=max_failed_epochs_per_phase,
+            verifier=verifier,
+            infra_repair=infra_repair,
             local_max_task_files=local_max_task_files,
             senior_max_task_files=senior_max_task_files,
         )
     # Events are fully flushed (writer closed): render the post-mortem journal.
     write_journal(run_dir)
     return outcome
+
+
+def _resume_pending_verification(
+    journal: JournalWriter,
+    store: _RunStateStore,
+    run_dir: RunDir,
+    repo: Path | None,
+    journal_events: Sequence[object],
+    *,
+    verifier: EpochVerifier | None,
+    prepare: PrepareConfig | None,
+    cap: int,
+) -> RunOutcome | None:
+    """Re-run the G4 verification pass for a completed epoch a kill left UNVERIFIED.
+
+    Closes the loop-position hole: an epoch that persisted ``awaiting_planner`` (or was
+    finished by ``resume_epoch``) carrying ``criteria`` but whose verification did not
+    reach a terminal event is treated as verified-pass by loop position alone. Here, on
+    resume, the DURABLE ``pending_verification`` marker plus the ABSENCE of a terminal
+    verification event (Passed/Failed) for that epoch means the gate never finished -> we
+    re-run it before the next planner boundary. A verdict already produced + recorded
+    (a terminal event present) clears the marker without a re-run, so a produced verdict
+    is reused, never regenerated. Returns a terminal ``RunOutcome`` when the pass fails
+    (infra-escalation, or a gap that trips the failed-epoch cap), else ``None``."""
+
+    pending = store.state.pending_verification
+    if pending is None or verifier is None or repo is None:
+        # Nothing owes verification, or the pass is disabled / has no repo: a clean
+        # skip. Clear a stale marker so the next boundary is not blocked by it.
+        if pending is not None:
+            store.update(pending_verification=None)
+        return None
+    epoch_id = str(pending["epoch_id"])
+    phase_id = str(pending["phase_id"])
+    terminal = any(
+        isinstance(e, (EpochVerificationPassed, EpochVerificationFailed))
+        and getattr(e, "epoch_id", None) == epoch_id
+        for e in journal_events
+    )
+    if terminal:
+        # The verdict was already produced + recorded before the kill: reuse it (the
+        # failed-epoch context, if any, is durable in pending_failed_epoch). Just clear
+        # the now-redundant marker.
+        store.update(pending_verification=None)
+        return None
+    outcome_path = run_dir.resolve(f"{phase_id}/{epoch_id}/outcome.json")
+    if not outcome_path.is_file():
+        # No persisted outcome to verify against (a partial write before the kill):
+        # clear the marker and proceed, the deterministic floor already gated the epoch.
+        store.update(pending_verification=None)
+        return None
+    decision = parse_decision(pending["decision"])
+    outcome = EpochOutcome.from_dict(
+        cast(dict[str, object], json.loads(outcome_path.read_text(encoding="utf-8")))
+    )
+    verification = _verify_epoch(
+        journal, store, run_dir, repo, decision, outcome, verifier=verifier, prepare=prepare,
+    )
+    if isinstance(verification, _VerificationInfraFailure):
+        return _escalate(journal, store, verification.message)
+    return _maybe_open_failed_epoch(
+        journal, store, run_dir, decision, outcome, None, cap,
+        verification_gaps=verification,
+    )
 
 
 def resume_grind(
@@ -1576,6 +2499,9 @@ def resume_grind(
     vision_reviewer: VisionReviewer | None = None,
     final_polish: FinalPolish | None = None,
     prepare: PrepareConfig | None = None,
+    floor: FloorConfig | None = None,
+    verifier: EpochVerifier | None = None,
+    infra_repair: InfraRepairConfig | None = None,
     max_failed_epochs_per_phase: int = DEFAULT_MAX_FAILED_EPOCHS_PER_PHASE,
     local_max_task_files: int = DEFAULT_LOCAL_MAX_TASK_FILES,
     senior_max_task_files: int = DEFAULT_SENIOR_MAX_TASK_FILES,
@@ -1630,13 +2556,25 @@ def resume_grind(
                 tier0_attempts=tier0_attempts,
                 prepare=prepare,
             )
-            _record_epoch(store, outcome)
+            _record_epoch(store, outcome, decision)
             if outcome.status == "integration_conflict":
                 result = _escalate(
                     journal, store, f"integration conflict in {outcome.epoch_id} (structural bug)"
                 )
             else:
                 last_epoch = outcome
+
+        # G4 resume guard: a completed epoch (this resume_epoch one, OR one persisted
+        # awaiting_planner before a kill) that carries criteria but never reached a
+        # terminal verification event is RE-VERIFIED now, so a kill can never let the
+        # semantic gate be skipped. A produced verdict (terminal event present) is reused.
+        if result is None:
+            result = _resume_pending_verification(
+                journal, store, run_dir, repo, journal_events,
+                verifier=verifier, prepare=prepare, cap=max_failed_epochs_per_phase,
+            )
+            # A re-verified epoch with a fresh semantic gap may set last_epoch's verdict
+            # in run state; the drive loop below picks the pending-failed-epoch up.
 
         if result is None:
             result = _drive(
@@ -1657,7 +2595,10 @@ def resume_grind(
                 vision_reviewer=vision_reviewer,
                 final_polish=final_polish,
                 prepare=prepare,
+                floor=floor,
                 max_failed_epochs_per_phase=max_failed_epochs_per_phase,
+                verifier=verifier,
+                infra_repair=infra_repair,
                 local_max_task_files=local_max_task_files,
                 senior_max_task_files=senior_max_task_files,
             )

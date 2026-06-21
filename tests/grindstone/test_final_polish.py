@@ -201,7 +201,7 @@ def test_final_polish_is_idempotent_on_reentry(git_repo: Path, run_dir: RunDir) 
     with JournalWriter(run_dir.events_path) as journal:
         _final_polish(
             journal, store, run_dir, git_repo,
-            [CmdCheck(cmd="test -f f1.txt")], fp, None, None,
+            [CmdCheck(cmd="test -f f1.txt")], fp, None, None, None,
         )
     applied2 = [e for e in read_events(run_dir.events_path) if isinstance(e, FinalPolishApplied)]
     assert len(applied2) == 1  # NOT re-applied

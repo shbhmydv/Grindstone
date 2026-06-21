@@ -88,6 +88,59 @@ class WorkerRequest:
     #: files (a navigation aid for large repos). ``None`` below threshold / on any
     #: failure / for tasks with no seed files; rendered only when present.
     repo_map: str | None = None
+    #: An INFRA-REPAIR brief (gate-rebalance G3): when set, the dispatch is not a
+    #: feature task but a focused senior repair of a structurally-broken gate
+    #: ENVIRONMENT. Carrying it on the request keeps the transport unchanged, the
+    #: prompt builder branches to ``build_infra_repair_prompt``. ``None`` for every
+    #: ordinary task.
+    infra_repair: "InfraRepairBrief | None" = None
+    #: A VERIFICATION brief (gate-rebalance G4): when set, the dispatch is not a
+    #: feature task but the end-of-epoch adversarial verification pass that judges
+    #: the epoch's natural-language ``criteria`` against the produced artifacts and
+    #: writes ``verdict.json`` (NOT a handoff). Carrying it on the request keeps the
+    #: transport unchanged, the prompt builder branches to
+    #: ``build_verification_prompt``. ``None`` for every ordinary task.
+    verification: "VerificationBrief | None" = None
+
+
+@dataclass(frozen=True)
+class InfraRepairBrief:
+    """The focused brief a senior infra-repair worker is dispatched with (G3).
+
+    ``failing_commands`` are the gate commands that failed environmentally;
+    ``output_tail`` is their captured stderr/stdout (so the repair knows WHY);
+    ``reason`` is the classifier's matched signature. ``allow_host_commands`` is
+    the host-command guard's allowlist (default empty): repo-local fixes are
+    automatic, host-level actions are reported, not run, unless allowlisted.
+    """
+
+    failing_commands: list[str]
+    output_tail: str
+    reason: str
+    allow_host_commands: list[str]
+
+
+#: The verdict file the verification pass writes (re-read disk contract, NOT a
+#: handoff). The core relocates + Pydantic-re-validates it; stdout is never parsed.
+VERDICT_FILENAME = "verdict.json"
+
+
+@dataclass(frozen=True)
+class VerificationBrief:
+    """The focused brief the end-of-epoch verification pass is dispatched with (G4).
+
+    ``epoch_goal`` is the epoch title/rationale; ``criteria`` is each task's
+    natural-language acceptance statement (aggregated across the epoch); ``artifacts``
+    is a per-task pointer to what was produced (the handoff state PLUS, for an
+    artifact-mode task, the absolute PATH to the relocated deliverable the verifier must
+    READ), so the verifier judges the REAL artifacts on disk, never a byte-capped
+    paraphrase embedded in the prompt. The verifier is adversarial, hunts for gaps,
+    defaults to FAIL on uncertainty, and writes ``verdict.json`` only.
+    """
+
+    epoch_goal: str
+    criteria: list[str]
+    artifacts: list[str]
 
 
 class WorkerTransport(Protocol):
@@ -256,6 +309,10 @@ def build_worker_prompt(request: WorkerRequest) -> str:
     verify theater. We own the model-facing format (§7: XML-tagged sections).
     """
 
+    if request.infra_repair is not None:
+        return build_infra_repair_prompt(request, request.infra_repair)
+    if request.verification is not None:
+        return build_verification_prompt(request, request.verification)
     task = request.task
     artifact_line = ""
     if isinstance(task, ArtifactTask):
@@ -282,8 +339,11 @@ def build_worker_prompt(request: WorkerRequest) -> str:
     if request.failure_context:
         joined = "\n".join(f"  - {c}" for c in request.failure_context)
         context_block = (
-            "\n<prior_failures>\nEarlier attempts failed for these reasons; "
-            f"fix them:\n{joined}\n</prior_failures>\n"
+            "\n<prior_failures>\nEarlier attempts failed for these reasons; fix "
+            "them. Each line is a SHORT summary followed by absolute PATH(s) to the "
+            "full detail on disk (the complete failure text and, where present, that "
+            "attempt's rejected handoff.json). You MAY read those paths for the full "
+            f"detail if the summary is not enough:\n{joined}\n</prior_failures>\n"
         )
     repo_map_block = ""
     if request.repo_map:
@@ -344,4 +404,164 @@ After writing handoff.json, run `python3 check_handoff.py` (it is in your CWD
 and in done_when) and fix every violation it prints until it exits 0. It can
 only pass once handoff.json exists, earlier check runs cannot cover it.
 </handoff>
+"""
+
+
+def _render_host_guard(brief: "InfraRepairBrief") -> str:
+    """The host-command guard clause: repo-local automatic, host-level reported.
+
+    Repo-local / in-worktree fixes (installing a dep into package.json/lockfile,
+    editing config inside the repo) are fully automatic. Host-level / privileged
+    actions (``sudo``, ``apt``, system-wide installs, writes outside the repo) are
+    DENY by default: the worker must REPORT "needs host command X" in the handoff
+    rather than run it, UNLESS X is on the allowlist below. The allowlist is the
+    operator's explicit opt-in for a trusted box; empty means nothing host-level.
+    """
+
+    if brief.allow_host_commands:
+        allowed = ", ".join(f"`{c}`" for c in brief.allow_host_commands)
+        host_line = (
+            f"The operator has ALLOWLISTED these host-level commands, you may run "
+            f"them: {allowed}. Any OTHER host-level / privileged action (sudo, apt, "
+            f"system-wide install, a write outside this repo) is still forbidden."
+        )
+    else:
+        host_line = (
+            "NO host-level commands are allowlisted. Every fix must be repo-local "
+            "(stay inside this worktree). Do NOT run sudo, apt, a system-wide "
+            "install, or write outside the repo."
+        )
+    return (
+        "<host_guard>\n"
+        "Make ONLY repo-local fixes that land in committed repo files (e.g. install a\n"
+        "missing dependency so it is recorded in package.json / requirements / the\n"
+        "lockfile, add a config file, fix a path inside the repo). " + host_line + "\n"
+        "If the gate genuinely cannot be made satisfiable without a forbidden\n"
+        "host-level action, do NOT run it: write a FAILED handoff whose not_done\n"
+        "names the exact host command needed (\"needs host command: <cmd>\") so the\n"
+        "operator can allowlist it. Never silently run a forbidden command.\n"
+        "</host_guard>"
+    )
+
+
+def build_infra_repair_prompt(
+    request: WorkerRequest, brief: "InfraRepairBrief"
+) -> str:
+    """The senior infra-repair prompt (pure function, no transport, no I/O).
+
+    A FOCUSED brief, distinct from a feature task: the gate's deterministic checks
+    failed for an ENVIRONMENTAL reason (a missing tool / dependency / a broken
+    install), not because the application logic is wrong. The senior's job is to
+    make the gate environment satisfiable WITHOUT rewriting application logic, then
+    leave the worktree so the SAME commands pass. The failing commands + their
+    captured output tell it exactly what broke; the host guard bounds what it may
+    do; the disk contract (a handoff in the CWD) is the only result channel, but
+    the authoritative judge is the core RE-RUNNING the gate, never this handoff.
+    """
+
+    commands = "\n".join(f"  - `{c}`" for c in brief.failing_commands)
+    output = brief.output_tail.strip() or "(no output captured)"
+    return f"""<infra_repair id="{request.task_id}">
+A deterministic GATE check failed for an ENVIRONMENTAL reason ({brief.reason}), not
+because the code is wrong. Your job: make the gate environment satisfiable so the
+failing command(s) below pass, WITHOUT rewriting application logic.
+</infra_repair>
+
+<failing_gate_commands>
+These commands are run by the gate in this worktree and currently fail
+environmentally. After your repair they MUST pass (exit 0):
+{commands}
+</failing_gate_commands>
+
+<captured_output>
+{output}
+</captured_output>
+
+<skill>
+This is an INFRA REPAIR, not a feature. Diagnose WHY the command cannot run, then
+fix only the environment: install the missing dependency (so it is recorded in the
+repo's manifest/lockfile), restore a missing config file, or correct a path INSIDE
+the repo. Do not change application behavior, do not edit feature code to make a
+test pass, do not delete or weaken the failing check. When done, run the failing
+command(s) yourself and confirm they exit 0.
+</skill>
+
+{_render_host_guard(brief)}
+
+<handoff>
+Write `handoff.json` in your CWD as your final act (the only result channel; stdout
+is ignored). schema_version "1", task_id exactly "{request.task_id}", status "DONE"
+when the failing command(s) now pass else "FAILED"/"PARTIAL" with not_done filled
+in (name any needed host command there). The orchestrator RE-RUNS the gate to
+judge you, a false DONE is always caught.
+</handoff>
+"""
+
+
+def build_verification_prompt(
+    request: WorkerRequest, brief: "VerificationBrief"
+) -> str:
+    """The end-of-epoch verification prompt (pure function, no transport, no I/O).
+
+    An ADVERSARIAL acceptance pass, distinct from a feature task and from the worker
+    that produced the artifacts: a SEPARATE invocation given only the epoch goal,
+    the natural-language ``criteria``, and the produced artifacts, told to judge
+    whether EVERY criterion is met by the ACTUAL artifacts (read them, do not trust
+    a summary), hunt for gaps, and DEFAULT TO FAIL on any uncertainty. It makes NO
+    edits. Its only result channel is ``verdict.json`` (a re-read disk contract); the
+    core relocates + re-validates it. A pass here can never override a failing
+    deterministic floor, the floor ran first and already cleared.
+
+    Because this pass already READS every diff/handoff/artifact to judge the criteria,
+    it is ALSO asked to emit a descriptive ``digest`` (G10) in the same verdict: a
+    factual steering summary for the planner choosing the NEXT epoch. The digest is
+    purely descriptive and never affects the adversarial pass/fail.
+    """
+
+    criteria = "\n".join(f"  - {c}" for c in brief.criteria) or "  (none)"
+    artifacts = "\n".join(f"  - {a}" for a in brief.artifacts) or "  (none reported)"
+    return f"""<verification id="{request.task_id}">
+This is an ADVERSARIAL VERIFICATION pass, not a feature task. You did NOT write this
+work. Judge whether the epoch's acceptance criteria are met by the ACTUAL artifacts
+in this worktree. Do NOT edit anything. Read the real files; never trust a summary.
+</verification>
+
+<epoch_goal>
+{brief.epoch_goal}
+</epoch_goal>
+
+<criteria>
+Each statement below is an acceptance criterion. For EACH one, decide whether the
+artifacts in this worktree actually satisfy it:
+{criteria}
+</criteria>
+
+<produced_artifacts>
+What the epoch's tasks reported producing. Each entry is a POINTER, not the content:
+where a line gives an absolute PATH to a relocated deliverable, READ that file in full
+and judge its actual content. Never trust the one-line state; verify against the files:
+{artifacts}
+</produced_artifacts>
+
+<stance>
+Be adversarial. Hunt for gaps: a criterion only half-covered, a screen/case the work
+never maps, a claim with no artifact behind it. DEFAULT TO FAIL on any uncertainty,
+an unmet or unverifiable criterion means `pass` is false. Ground every judgement in a
+real file you read. A false pass is worse than a false fail (the deterministic floor
+already cleared; this pass exists only to CATCH semantic gaps that floor cannot).
+</stance>
+
+<verdict>
+Write a file named exactly `{VERDICT_FILENAME}` in your CWD as your only output
+(stdout is ignored). A JSON object:
+  - "pass": true ONLY if EVERY criterion is met by the actual artifacts, else false.
+  - "per_criterion": list of {{"criterion": <verbatim>, "met": <bool>, "evidence":
+    <the file/line or quote that proves your judgement>}}, one per criterion.
+  - "gaps": list of short strings, the concrete unmet-criterion gaps (empty when pass).
+  - "digest": a short FACTUAL summary (a few sentences, NOT a grade) for the planner
+    deciding the NEXT epoch: what this epoch actually produced (key files/structure/
+    decisions you saw) and what is notably incomplete or risky. Describe, do not judge,
+    the pass/fail above is the judgement; this digest is descriptive steering only.
+Write `{VERDICT_FILENAME}` and nothing else, then stop.
+</verdict>
 """

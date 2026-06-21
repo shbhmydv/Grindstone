@@ -211,24 +211,19 @@ def _planner_kwargs() -> dict[str, object]:
     )
 
 
-def test_planner_repo_map_rides_tail_head_unchanged() -> None:
-    head = stable_head(_JOB, _phases())
-    without = build_planner_input(**_planner_kwargs())  # type: ignore[arg-type]
-    with_map = build_planner_input(  # type: ignore[arg-type]
-        **_planner_kwargs(), repo_map="util.py:\n  def shared_helper():"
-    )
-    # The map appears, in the tail, and the byte-stable head is unaffected.
-    assert "<repo_map>" in with_map
-    assert "shared_helper" in with_map
-    assert "<repo_map>" not in without
-    assert with_map.startswith(head) and without.startswith(head)
-    # Everything before the map section is identical to the no-map input.
-    assert with_map[: with_map.index("<repo_map>")] == without[: with_map.index("<repo_map>")]
+def test_planner_input_has_no_inline_repo_map_block() -> None:
+    """The planner's structural map is now delivered BY REFERENCE (a file path in
+    the <workspace> manifest), never inlined in the prompt. So even a fully built
+    planner input carries NO <repo_map> block and NO inline map text, the prompt no
+    longer pays the per-boundary token tax for the whole map. (Was:
+    ``test_planner_repo_map_rides_tail_head_unchanged`` / ``..._empty_map_omits_section``,
+    which asserted the inline block existed; the inline block + its param are gone.)"""
 
-
-def test_planner_empty_map_omits_section() -> None:
-    out = build_planner_input(**_planner_kwargs(), repo_map=None)  # type: ignore[arg-type]
+    out = build_planner_input(**_planner_kwargs())  # type: ignore[arg-type]
     assert "<repo_map>" not in out
+    # The renderer + param are removed: build_planner_input no longer accepts repo_map.
+    with pytest.raises(TypeError):
+        build_planner_input(**_planner_kwargs(), repo_map="util.py:\n  x")  # type: ignore[call-arg]
 
 
 # --- worker integration --------------------------------------------------------

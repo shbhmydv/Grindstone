@@ -14,6 +14,7 @@ from typing import Literal
 from grindstone.contracts.models import (
     ArtifactEpochArgs,
     ArtifactTask,
+    CmdCheck,
     EpochDecision,
     Handoff,
     ImplementEpochArgs,
@@ -168,6 +169,78 @@ def implement_task_size_violations(
                 f"too big, split it into smaller tasks (or later epochs) so each "
                 f"owns at most {max_files}"
             )
+    return out
+
+
+#: Program names whose JOB is to grep file CONTENT for a token. A check built on
+#: one is a content-grep, a brittle proxy for semantic acceptance (it fails for
+#: environmental reasons, e.g. the binary missing, and the gate rebalance forbids
+#: it). Structural facts (build, test, type-check, file existence) are expressed
+#: with the project's own commands; content/semantic acceptance is `criteria`.
+_CONTENT_GREP_PROGRAMS: frozenset[str] = frozenset(
+    {"rg", "grep", "egrep", "fgrep", "ag", "ack"}
+)
+
+#: Shell separators that start a fresh simple-command, so each segment's first
+#: word (its program) is checked independently.
+_SHELL_SEPARATORS = ("|", "&&", "||", ";")
+
+
+def _segment_program(segment: str) -> str | None:
+    """The program token of one simple-command segment, or ``None`` if empty.
+
+    Leading ``NAME=value`` env-assignments are skipped (they precede the program
+    in a simple command), and a path is reduced to its basename so ``/usr/bin/grep``
+    resolves to ``grep``. Tokenization is whitespace-only (good enough to read the
+    program name; we never execute the parse).
+    """
+
+    for token in segment.split():
+        if "=" in token and not token.startswith("="):
+            head = token.split("=", 1)[0]
+            if head and all(c.isalnum() or c == "_" for c in head):
+                continue  # an env-assignment prefix, the program is later
+        return token.rsplit("/", 1)[-1]
+    return None
+
+
+def command_is_content_grep(cmd: str) -> bool:
+    """True when ``cmd`` runs a content-grep in ANY of its simple-command segments.
+
+    The command is split on the shell separators ``| && || ;``; each segment's
+    program (its first word, past any ``NAME=value`` prefix and any path) is
+    matched against the rg/grep/egrep/fgrep/ag/ack family. A filename that merely
+    CONTAINS "grep" is never matched (the token must be the program itself).
+    """
+
+    segments = [cmd]
+    for sep in _SHELL_SEPARATORS:
+        segments = [part for seg in segments for part in seg.split(sep)]
+    return any(
+        _segment_program(seg) in _CONTENT_GREP_PROGRAMS for seg in segments
+    )
+
+
+def content_grep_check_violations(tasks: list[_TaskBase]) -> list[str]:
+    """Reject any task ``done_when`` cmd check that is a content-grep.
+
+    Deterministic checks are for STRUCTURAL facts (build, test, type-check, file
+    existence); a content-grep (``rg`` / ``grep`` for a token) is a brittle proxy
+    for semantic acceptance that fails for environmental reasons. The rejection
+    steers the planner to express that acceptance as natural-language ``criteria``
+    instead. Non-cmd checks (artifact_exists / vision_review) are unaffected.
+    """
+
+    out: list[str] = []
+    for task in tasks:
+        for check in task.done_when:
+            if isinstance(check, CmdCheck) and command_is_content_grep(check.cmd):
+                out.append(
+                    f"task {task.id}: done_when check {check.cmd!r} is a content-grep; "
+                    f"deterministic checks are for structural facts (build, test, "
+                    f"type-check, file existence). Express content/semantic "
+                    f"acceptance as natural-language `criteria` instead."
+                )
     return out
 
 

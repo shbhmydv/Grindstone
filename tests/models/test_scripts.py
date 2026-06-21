@@ -671,6 +671,173 @@ def test_polish_missing_arg_errors(tmp_path: Path) -> None:
     assert "missing required" in res.stderr
 
 
+# --- prompt fed via STDIN, never argv (the >128KB MAX_ARG_STRLEN fix) ---------
+# RCA: a worker's prior-failure context ballooned to ~1.8MB; the scripts passed the
+# prompt to the model CLI as an argv string, which overflowed the kernel argv limit
+# ("Argument list too long") so the CLI never launched. Every request script now
+# feeds the prompt to its CLI on STDIN, making prompt size irrelevant. These tests
+# pin that: a uniquely-marked prompt body must appear on the CLI's STDIN and NOT in
+# its argv.
+
+_PROMPT_MARKER = "UNIQUE_PROMPT_BODY_MARKER_8f3a2"
+
+
+def _record_stdin_and_argv_stub(record: Path, *, then: str = "exit 0\n") -> str:
+    """A stub body that records its STDIN to ``record.stdin`` and argv to
+    ``record.argv`` (NUL-separated), then runs ``then``."""
+    return (
+        f'cat > "{record}.stdin"\n'
+        f'printf "%s\\0" "$@" > "{record}.argv"\n'
+        f"{then}"
+    )
+
+
+def _assert_prompt_on_stdin_not_argv(record: Path) -> None:
+    stdin = Path(f"{record}.stdin").read_text(encoding="utf-8")
+    argv = [
+        p.decode("utf-8", "replace")
+        for p in Path(f"{record}.argv").read_bytes().split(b"\0")
+        if p
+    ]
+    assert _PROMPT_MARKER in stdin, "prompt was not fed to the CLI on stdin"
+    assert not any(_PROMPT_MARKER in a for a in argv), (
+        f"prompt leaked into argv (MAX_ARG_STRLEN hazard): {argv}"
+    )
+
+
+def _run_worker_marked(
+    script: Path, tmp_path: Path, agent_name: str, agent_body: str
+) -> Path:
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir()
+    _make_stub(stub_dir, agent_name, agent_body)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text(f"task body {_PROMPT_MARKER} end", encoding="utf-8")
+    res = subprocess.run(
+        [
+            "bash", str(script),
+            "--worktree", str(worktree),
+            "--prompt", str(prompt),
+            "--log-dir", str(tmp_path / "logs"),
+            "--handle-out", str(tmp_path / "handle.txt"),
+            "--timeout", "30",
+        ],
+        env=_env_with_stub_path(stub_dir),
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0, res.stderr
+    return tmp_path
+
+
+def test_default_local_prompt_stdin_not_argv(tmp_path: Path) -> None:
+    record = tmp_path / "rec"
+    _run_worker_marked(
+        DEFAULT_LOCAL, tmp_path, "claude",
+        _record_stdin_and_argv_stub(
+            record, then='printf \'{"status":"DONE"}\' > "$PWD/handoff.json"\nexit 0\n'
+        ),
+    )
+    _assert_prompt_on_stdin_not_argv(record)
+
+
+def test_default_senior_prompt_stdin_not_argv(tmp_path: Path) -> None:
+    record = tmp_path / "rec"
+    _run_worker_marked(
+        DEFAULT_SENIOR, tmp_path, "claude",
+        _record_stdin_and_argv_stub(
+            record, then='printf \'{"status":"DONE"}\' > "$PWD/handoff.json"\nexit 0\n'
+        ),
+    )
+    _assert_prompt_on_stdin_not_argv(record)
+
+
+def test_override_local_prompt_stdin_not_argv(tmp_path: Path) -> None:
+    _require(LOCAL)
+    record = tmp_path / "rec"
+    _run_worker_marked(
+        LOCAL, tmp_path, "pi",
+        _record_stdin_and_argv_stub(
+            record, then='printf \'{"status":"DONE"}\' > "$PWD/handoff.json"\nexit 0\n'
+        ),
+    )
+    _assert_prompt_on_stdin_not_argv(record)
+
+
+def test_override_senior_prompt_stdin_not_argv(tmp_path: Path) -> None:
+    _require(SENIOR)
+    record = tmp_path / "rec"
+    _run_worker_marked(
+        SENIOR, tmp_path, "opencode",
+        _record_stdin_and_argv_stub(
+            record, then='printf \'{"status":"DONE"}\' > "$PWD/handoff.json"\nexit 0\n'
+        ),
+    )
+    _assert_prompt_on_stdin_not_argv(record)
+
+
+def _run_planner_marked(
+    script: Path, tmp_path: Path, agent_name: str, agent_body: str
+) -> Path:
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir()
+    _make_stub(stub_dir, agent_name, agent_body)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text(f"plan {_PROMPT_MARKER} now", encoding="utf-8")
+    res = subprocess.run(
+        [
+            "bash", str(script),
+            "--repo", str(repo),
+            "--prompt", str(prompt),
+            "--out", str(tmp_path / "decision.txt"),
+            "--handle-out", str(tmp_path / "handle.txt"),
+            "--timeout", "30",
+        ],
+        env=_env_with_stub_path(stub_dir),
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0, res.stderr
+    return tmp_path
+
+
+def test_default_planner_prompt_stdin_not_argv(tmp_path: Path) -> None:
+    record = tmp_path / "rec"
+    # claude's stdout is captured to --out by the script, so emit decision JSON
+    # on stdout AFTER recording stdin+argv.
+    _run_planner_marked(
+        DEFAULT_PLANNER, tmp_path, "claude",
+        _record_stdin_and_argv_stub(record, then='printf \'{"tool":"x"}\'\nexit 0\n'),
+    )
+    _assert_prompt_on_stdin_not_argv(record)
+
+
+def test_codex_planner_prompt_stdin_not_argv(tmp_path: Path) -> None:
+    record = tmp_path / "rec"
+    # The codex planner reads stdin (prompt positional is `-`) and writes -o.
+    _run_planner_marked(
+        PLANNER, tmp_path, "codex",
+        (
+            f'cat > "{record}.stdin"\n'
+            f'printf "%s\\0" "$@" > "{record}.argv"\n'
+            'out=""\n'
+            'while [[ $# -gt 0 ]]; do\n'
+            '  case "$1" in\n'
+            '    -o) out="$2"; shift 2 ;;\n'
+            '    *) shift ;;\n'
+            '  esac\n'
+            'done\n'
+            'printf \'{"tool":"emit_epoch"}\' > "$out"\n'
+            'exit 0\n'
+        ),
+    )
+    _assert_prompt_on_stdin_not_argv(record)
+
+
 # --- stop.sh -----------------------------------------------------------------
 
 

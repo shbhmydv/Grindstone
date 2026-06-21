@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "grindstone/epoch_verdict/v1",
+  "title": "Grindstone epoch-verification verdict (local-tier agentic gate output, a disk contract)",
+  "type": "object",
+  "required": ["pass", "per_criterion", "gaps"],
+  "additionalProperties": false,
+  "properties": {
+    "pass": {
+      "type": "boolean",
+      "description": "true ONLY if EVERY criterion is met by the actual artifacts."
+    },
+    "per_criterion": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "type": "object",
+        "required": ["criterion", "met", "evidence"],
+        "additionalProperties": false,
+        "properties": {
+          "criterion": { "type": "string" },
+          "met": { "type": "boolean" },
+          "evidence": { "type": "string" }
+        }
+      },
+      "description": "Per-criterion judgement with the artifact evidence behind it. The free-text criterion/evidence are unbounded: the whole verdict is persisted on disk and delivered to the planner by reference (it reads the file), never embedded byte-capped into a prompt."
+    },
+    "gaps": {
+      "type": "array",
+      "items": { "type": "string" },
+      "maxItems": 16,
+      "description": "Concrete unmet-criterion gaps surfaced to the planner on a fail (unbounded length; delivered by reference via the persisted verdict file)."
+    },
+    "digest": {
+      "type": "string",
+      "description": "Descriptive steering summary (NOT a grade): what the epoch actually produced, key structure/decisions, what is notably incomplete or risky, for the planner choosing the NEXT epoch. Never affects pass/fail; optional (defaults to empty). Unbounded length; the planner reads it from the persisted verdict file, never from an embedded prompt block."
+    }
+  }
+}

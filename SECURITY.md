@@ -39,6 +39,21 @@ runs, as the invoking user:
   scoping; the deterministic checks, not model claims, gate every phase and the run.
 - **The final-polish pass** cannot escape its worktree into your working tree, is
   evidence-gated, and is never auto-pushed.
+
+## Infra-repair host-command allowlist is advisory, not a sandbox
+
+The optional `infra_repair` policy lets a SENIOR agent fix an environmental gate
+failure (a missing tool / dependency / install) in a throwaway worktree, then
+re-runs the gate. Its `allow_host_commands` list is **advisory**: it is surfaced
+into the senior's repair prompt (repo-local-only fixes plus the exact allowlist),
+but the default senior adapter runs the agent with `--dangerously-skip-permissions`
+and full Bash, so the allowlist is **not** a kernel- or sandbox-enforced boundary.
+A confused or adversarial senior can run a host-mutating command despite an empty
+allowlist. This is bounded (the repair runs in a disposable worktree, `infra_repair`
+is OFF by default with an empty allowlist, and a false DONE is caught by the
+post-repair gate recheck) but it is not a hard sandbox. **Enable `infra_repair`
+only on a trusted host and on repos you trust**, or run it inside a disposable VM
+or container.
 - Credentials (codex / opencode / pi auth) live in those tools' own config outside
   this repo; Grindstone never reads or logs them.
 

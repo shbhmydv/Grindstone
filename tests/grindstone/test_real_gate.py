@@ -65,10 +65,8 @@ def _task(task_id: str, fname: str, content: str) -> ImplementTask:
             f"Create a file named {fname} in the current directory whose contents "
             f"are exactly the word {content}. Then write handoff.json citing {fname}."
         ),
-        done_when=[
-            CmdCheck(cmd=f"test -f {fname}"),
-            CmdCheck(cmd=f"grep -q {content} {fname}"),
-        ],
+        done_when=[CmdCheck(cmd=f"test -f {fname}")],
+        criteria=[f"{fname} contains exactly the word {content}"],
         file_ownership=[fname],
     )
 

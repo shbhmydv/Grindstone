@@ -53,6 +53,7 @@ from grindstone.contracts.models import (
     parse_handoff,
 )
 from grindstone.contracts.semantics import HandoffMode, handoff_violations
+from grindstone.infra import classify_check_failure
 from grindstone.events import (
     HandoffRejected,
     JournalWriter,
@@ -75,6 +76,13 @@ from grindstone.worker import (
 )
 
 TIER0_ATTEMPTS = 3
+
+#: DoS sanity backstop on the ``handoff.json`` disk read (the principle's item F): a
+#: generous megabyte-scale ceiling that REJECTS (fail-safe, never truncates) an
+#: absurd/corrupt handoff before it is read into memory. Distinct from the semantic
+#: ``HANDOFF_MAX_BYTES`` (8 KiB) the validator enforces on a VALID handoff: this only
+#: guards the read itself against a pathological file, far above any real handoff.
+HANDOFF_FILE_MAX_BYTES = 8 * 1024 * 1024
 
 
 # --- identity ------------------------------------------------------------------
@@ -168,11 +176,20 @@ CursorSink = Callable[[TaskCursorState], None]
 
 
 class _AttemptFailed(Exception):
-    """One attempt failed validation/checks; ``reason`` becomes failure context."""
+    """One attempt failed validation/checks; ``reason`` becomes failure context.
 
-    def __init__(self, reason: str) -> None:
+    ``reason`` is the SHORT, already-bounded diagnosis (the journal event + the
+    one-line summary the next worker sees). ``detail`` is the optional FULL,
+    unbounded text behind that reason (e.g. the complete out-of-scope path list):
+    it is persisted to a failure-detail file under the run dir and REFERENCED by
+    path, never embedded in the next prompt. ``None`` means the reason IS the full
+    detail (nothing larger to persist beyond the reason itself).
+    """
+
+    def __init__(self, reason: str, *, detail: str | None = None) -> None:
         super().__init__(reason)
         self.reason = reason
+        self.detail = detail
 
 
 @dataclass
@@ -195,6 +212,158 @@ def _now() -> str:
 #: model-agnostic, it emits a MODE; the core maps mode -> the starting tier.
 _SENIOR_FIRST_MODES: frozenset[HandoffMode] = frozenset({"research", "review"})
 _SENIOR_TIER = "senior"
+
+#: Max out-of-scope paths NAMED in a rejection reason before the rest are summed
+#: as ``... and <K> more``. A worker that materializes a dependency tree could
+#: otherwise produce a list of every file under it (dogfood: a 1.8M-char reason
+#: listing every node_modules/.bin/* path), which then gets fed back into the next
+#: attempt's prompt as failure context and blows past the CLI argv limit.
+_MAX_NAMED_SCOPE_VIOLATIONS = 20
+
+#: Per-failure-context-entry byte cap folded into the worker prompt (the G6/G7
+#: bounding discipline: prior-failure text must never explode the prompt). A single
+#: rejection reason kept under this stays well clear of any argv/stdin pressure even
+#: across several stacked attempts. With the reference-not-embed scheme below this is
+#: a BACKSTOP: the entry is already a one-line summary + paths, well under the cap.
+_MAX_FAILURE_CONTEXT_BYTES = 2048
+
+#: Hard cap on the one-line failure SUMMARY the next worker sees inline (the
+#: reference-not-embed primary mechanism: a worker carries a short category + brief
+#: reason, then a PATH to the full detail on disk it MAY read). Anything longer is
+#: head-clipped; the full text lives in the referenced failure-detail file.
+_MAX_SUMMARY_CHARS = 200
+
+#: Run-dir subdir, per task, holding one full failure-detail file per failed attempt
+#: (``<run>/<P/E/T>/failures/attempt-<n>.txt``) plus, when one was written, that
+#: attempt's rejected ``handoff.json``. The worker is referenced to these absolute
+#: paths; it reads them on demand instead of carrying the bulk inline.
+FAILURES_SUBDIR = "failures"
+
+
+def _bound_reason(text: str, max_bytes: int = _MAX_FAILURE_CONTEXT_BYTES) -> str:
+    """Bound one failure reason to ``max_bytes`` (head kept, a marker appended).
+
+    The HEAD is kept (a reason leads with its diagnosis); a truncated tail is
+    replaced by an explicit marker so the planner/worker sees the elision rather
+    than a silently-clipped string. Text-safe via the same encode/decode discipline
+    used for check-output tails.
+    """
+
+    raw = text.encode("utf-8", errors="replace")
+    if len(raw) <= max_bytes:
+        return text
+    head = raw[:max_bytes].decode("utf-8", errors="replace")
+    return f"{head}\n...[reason truncated, {len(raw)} bytes total]"
+
+
+def _format_scope_violations(out_of_scope: list[str]) -> str:
+    """A BOUNDED out-of-scope-writes rejection reason.
+
+    Names at most ``_MAX_NAMED_SCOPE_VIOLATIONS`` offending paths (sorted, stable),
+    then sums the remainder as ``... and <K> more``. A rejection reason must never
+    balloon to megabytes, the dogfood trigger that, fed back as prior-failure
+    context, overflowed the model CLI's argv limit and killed every later attempt.
+    The FULL, un-elided list is persisted separately (``_full_scope_violations``)
+    and referenced by path, so the worker can still see every offending path.
+    """
+
+    ordered = sorted(out_of_scope)
+    shown = ordered[:_MAX_NAMED_SCOPE_VIOLATIONS]
+    reason = "out-of-scope writes: " + ", ".join(shown)
+    extra = len(ordered) - len(shown)
+    if extra > 0:
+        reason += f", ... and {extra} more"
+    return reason
+
+
+def _full_scope_violations(out_of_scope: list[str]) -> str:
+    """The COMPLETE out-of-scope-writes detail: a count header + every path, one
+    per line (sorted, stable). Persisted to the failure-detail file and referenced
+    by path, this is the bulk that must NEVER be embedded inline."""
+
+    ordered = sorted(out_of_scope)
+    body = "\n".join(ordered)
+    return f"out-of-scope writes ({len(ordered)} paths):\n{body}"
+
+
+def _summarize_reason(reason: str) -> str:
+    """A SHORT one-line summary of a rejection reason for the next worker prompt.
+
+    The reference-not-embed primary mechanism: the worker sees the failure category
+    plus a brief reason (e.g. ``done_when failed: test -f src/theme.ts`` or
+    ``out-of-scope writes: a/x.py, ... and 46 more``), then a PATH to the full detail.
+    Reasons already lead with their category; we collapse to the first line and
+    head-clip to ``_MAX_SUMMARY_CHARS`` so the inline text stays tiny regardless of
+    how large the underlying failure was."""
+
+    first_line = reason.strip().splitlines()[0] if reason.strip() else reason
+    if len(first_line) <= _MAX_SUMMARY_CHARS:
+        return first_line
+    return first_line[: _MAX_SUMMARY_CHARS - 1].rstrip() + "…"
+
+
+def _persist_failure_detail(
+    run_dir: RunDir,
+    identity: TaskIdentity,
+    attempt: int,
+    detail: str,
+    *,
+    scratch: Path,
+) -> tuple[Path, Path | None]:
+    """Durably record one failed attempt's FULL detail under the run dir.
+
+    Writes ``<run>/<P/E/T>/failures/attempt-<n>.txt`` (the complete, text-safe
+    reason, however large) and, when the worker left a ``handoff.json`` in its
+    scratch, copies that rejected handoff alongside as ``attempt-<n>.handoff.json``
+    BEFORE the worktree is torn down. Returns ``(detail_path, handoff_path | None)``,
+    both absolute, so the next worker prompt can REFERENCE them instead of carrying
+    the bulk inline. Best-effort: a persist failure never breaks the grind, the
+    detail_path is still returned (the worker simply finds no file there).
+    """
+
+    fail_dir = run_dir.resolve(f"{identity.fq}/{FAILURES_SUBDIR}")
+    detail_path = fail_dir / f"attempt-{attempt}.txt"
+    handoff_copy: Path | None = None
+    try:
+        fail_dir.mkdir(parents=True, exist_ok=True)
+        safe = detail.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+        detail_path.write_text(safe, encoding="utf-8")
+        rejected = scratch / "handoff.json"
+        if rejected.is_file():
+            handoff_copy = fail_dir / f"attempt-{attempt}.handoff.json"
+            shutil.copyfile(rejected, handoff_copy)
+    except OSError:
+        pass
+    return detail_path.resolve(), handoff_copy.resolve() if handoff_copy else None
+
+
+def _failure_context_entry(
+    run_dir: RunDir,
+    identity: TaskIdentity,
+    attempt: int,
+    failure: "_AttemptFailed",
+    *,
+    scratch: Path,
+) -> str:
+    """Build ONE ``<prior_failures>`` entry: a short summary + PATHS, not bulk.
+
+    Persists the full detail (``failure.detail`` when the reason had larger text
+    behind it, else the reason itself) to disk, then returns a one-line entry of
+    the form ``attempt <n>: <summary> [full detail: <path>; rejected handoff:
+    <path>]``. The summary is genuinely short; the full text lives only at the
+    referenced path the worker may read. ``_bound_reason`` still wraps the result
+    as a backstop, but the entry is already tiny."""
+
+    full = failure.detail if failure.detail is not None else failure.reason
+    detail_path, handoff_path = _persist_failure_detail(
+        run_dir, identity, attempt, full, scratch=scratch
+    )
+    summary = _summarize_reason(failure.reason)
+    refs = [f"full detail: {detail_path}"]
+    if handoff_path is not None:
+        refs.append(f"rejected handoff: {handoff_path}")
+    entry = f"attempt {attempt}: {summary} [{'; '.join(refs)}]"
+    return _bound_reason(entry)
 
 
 def starting_tier(
@@ -285,14 +454,27 @@ def _grounding_violations(
 
 
 def _run_one_check(check: Check, scratch: Path, run_dir: RunDir) -> tuple[str, int]:
-    """Re-run one done_when check; return (label, exit). Exit 0 == pass."""
+    """Re-run one done_when check; return (label, exit). Exit 0 == pass.
+
+    Orthogonal robustness (gate-rebalance G3): a FAILED cmd check is classified
+    (the shared ``infra.classify_check_failure``) so an ENVIRONMENTAL fault (exit
+    127, a missing tool/dependency) is SURFACED in the label as ``[infra: ...]``,
+    distinct from a genuine assertion failure. The worker's failure context then
+    tells the planner (and the human reading the journal) that a missing gate tool,
+    not the code, broke the check, instead of looping a blind repair on it."""
 
     if isinstance(check, CmdCheck):
         proc = subprocess.run(
             check.cmd, shell=True, cwd=str(scratch), capture_output=True, text=True
         )
         passed = proc.returncode == check.expect_exit
-        return (check.cmd, 0 if passed else 1)
+        if passed:
+            return (check.cmd, 0)
+        infra = classify_check_failure(
+            returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr
+        )
+        label = f"{check.cmd} [infra: {infra.reason}]" if infra.is_infra else check.cmd
+        return (label, 1)
     if isinstance(check, ArtifactExistsCheck):
         exists = run_dir.find_artifact(check.artifact_exists) is not None
         return (f"artifact_exists:{check.artifact_exists}", 0 if exists else 1)
@@ -341,6 +523,18 @@ def _collect_handoff(
     src = scratch / "handoff.json"
     if not src.is_file():
         raise _AttemptFailed("no handoff.json written")
+    # DoS sanity backstop (the principle's item F): reject (never truncate) an absurdly
+    # large handoff before reading it into memory. A valid handoff serializes far under
+    # HANDOFF_MAX_BYTES; this generous megabyte-scale guard only ever fires on a
+    # pathological/corrupt file (fail-safe -> a failed attempt), never on real content.
+    try:
+        if src.stat().st_size > HANDOFF_FILE_MAX_BYTES:
+            raise _AttemptFailed(
+                f"handoff.json is over the {HANDOFF_FILE_MAX_BYTES}-byte DoS guard; "
+                f"rejecting (fail-safe), not truncating"
+            )
+    except OSError as exc:
+        raise _AttemptFailed(f"handoff.json unreadable: {exc}") from exc
     raw = src.read_text(encoding="utf-8")
     try:
         json.loads(raw)
@@ -536,15 +730,36 @@ def _dispatch_attempt(
         (scratch / CHECK_SCRIPT_NAME).unlink(missing_ok=True)
         (scratch / REVIEW_FILENAME).unlink(missing_ok=True)
         _strip_pi_settings(scratch)
-        wt.commit_all(scratch, f"grind({identity.fq}): {task.goal.splitlines()[0][:72]}")
+        committed = wt.commit_all(
+            scratch, f"grind({identity.fq}): {task.goal.splitlines()[0][:72]}"
+        )
+        # Floor core invariant (gate-rebalance): an implement task claiming DONE
+        # must actually LAND committed work on its branch. A zero-diff commit means
+        # the worker wrote nothing to the owned files (only metadata, or a no-op)
+        # yet handed off DONE, the handoff re-validation + a trivially-true
+        # done_when would otherwise pass it while the integration merges nothing.
+        # Reject it as a failed attempt so the planner sees the gap.
+        if not committed:
+            raise _AttemptFailed(
+                "no committed work: the implement task handed off DONE but left a "
+                "zero-diff branch (nothing changed in its file_ownership)"
+            )
         # Diff in the WORKTREE (its HEAD is the committed task tip; the main
         # checkout still sits at base).
+        # A worker that materializes deps (e.g. `npm install`) populates the
+        # declared env_dirs; with no effective .gitignore in the fresh worktree the
+        # core force-adds + commits them, so they would read as a wall of
+        # out-of-scope writes (dogfood: 1.8M-char rejection over node_modules/.bin/*).
+        # They are NOT authored work, so the declared dep dirs are exempt from the
+        # scope check; an undeclared write outside ownership is still a violation.
+        dep_dirs = list(prepare.env_dirs) if prepare is not None else None
         out_of_scope = wt.scope_violations(
-            wt.changed_paths(scratch, base), list(task.file_ownership)
+            wt.changed_paths(scratch, base), list(task.file_ownership), dep_dirs
         )
         if out_of_scope:
             raise _AttemptFailed(
-                "out-of-scope writes: " + ", ".join(sorted(out_of_scope))
+                _format_scope_violations(out_of_scope),
+                detail=_full_scope_violations(out_of_scope),
             )
     return handoff
 
@@ -653,7 +868,19 @@ def _grind(
                     prepare=prepare,
                 )
             except _AttemptFailed as failure:
-                cursor.failure_context.append(failure.reason)
+                # Reference-not-embed: the FULL failure detail is persisted to a
+                # file under the run dir and the NEXT attempt's worker prompt
+                # (build_worker_prompt's <prior_failures>) carries only a one-line
+                # summary + the PATH to that file (which the worker may read). This
+                # keeps the prompt tiny no matter how large the failure was (the
+                # dogfood 1.8M-char scope list that overflowed the model CLI). Persist
+                # BEFORE discarding the worktree so the rejected handoff can be copied
+                # out of the scratch first. _bound_reason still backstops the entry.
+                cursor.failure_context.append(
+                    _failure_context_entry(
+                        run_dir, identity, cursor.attempt, failure, scratch=scratch
+                    )
+                )
                 if implement and repo is not None and branch is not None:
                     wt.discard_attempt(repo, scratch, branch)
                 reason = failure.reason

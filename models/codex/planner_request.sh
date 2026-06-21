@@ -32,7 +32,6 @@ for req in repo prompt out handle_out; do
 done
 
 repo="$(cd "$repo" && pwd)"
-prompt_text="$(cat "$prompt")"
 mkdir -p "$(dirname "$out")"
 out="$(cd "$(dirname "$out")" && pwd)/$(basename "$out")"
 mkdir -p "$(dirname "$handle_out")"
@@ -48,6 +47,10 @@ err_tmp="$(mktemp)"
 trap 'rm -f "$err_tmp"' EXIT
 
 # The locked invocation (verified against grindstone/codex_planner.py @ cc05198).
+# The prompt is fed to codex on STDIN (`codex exec -` reads instructions from
+# stdin), never as an argv string: a large constructed planner input could
+# otherwise exceed the kernel's MAX_ARG_STRLEN (~128KB) and the CLI dies before
+# launching ("Argument list too long"). Stdin makes the prompt size irrelevant.
 set +e
 "${timeout_prefix[@]}" codex exec \
   --ephemeral \
@@ -55,8 +58,8 @@ set +e
   -s read-only \
   -C "$repo" \
   -o "$out" \
-  "$prompt_text" \
-  < /dev/null > /dev/null 2> "$err_tmp"
+  - \
+  < "$prompt" > /dev/null 2> "$err_tmp"
 rc=$?
 set -e
 

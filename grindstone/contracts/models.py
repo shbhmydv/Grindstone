@@ -112,6 +112,16 @@ class _TaskBase(_Frozen):
     goal: Annotated[str, StringConstraints(min_length=1, max_length=1024)]
     inputs: Annotated[list[LogKey], Field(max_length=12)] = Field(default_factory=list)
     done_when: Annotated[list[Check], Field(min_length=1, max_length=6)]
+    #: Natural-language semantic acceptance statements, judged later by an agentic
+    #: verification pass (gate rebalance), NOT by a shell command. Deterministic
+    #: ``done_when`` / ``checks`` cover structural facts (build, test, type-check,
+    #: file existence); content/semantic acceptance ("the plan maps every ramp to
+    #: an RN equivalent") belongs here. Optional, defaults to an empty list; each
+    #: entry is a non-empty prose statement (mirrors the schema's ``criteria``).
+    criteria: Annotated[
+        list[Annotated[str, StringConstraints(min_length=1, max_length=512)]],
+        Field(max_length=8),
+    ] = Field(default_factory=list)
     skills: Annotated[
         list[Annotated[str, StringConstraints(max_length=64)]], Field(max_length=6)
     ] = Field(default_factory=list)
@@ -383,3 +393,63 @@ def parse_vision_verdict(payload: object) -> VisionVerdict:
     """Parse untrusted JSON into the typed vision verdict (raises on invalid)."""
 
     return _VERDICT_ADAPTER.validate_python(payload)
+
+
+# --- epoch verdict (G4 agentic verification pass disk contract) ----------------
+
+
+class CriterionJudgement(_Frozen):
+    """One criterion's adversarial judgement, mirroring ``schemas/epoch_verdict.json``:
+    the verbatim ``criterion``, a strict ``met`` boolean (``StrictBool`` rejects a
+    stringy/numeric value), and the artifact ``evidence`` behind it.
+
+    The free-text ``criterion`` / ``evidence`` are UNBOUNDED in length: the verdict is
+    an agent INPUT delivered to the planner BY REFERENCE (the full ``verdict.json`` is
+    persisted on disk and the planner reads the file), never byte-capped-and-embedded
+    into a prompt, so a verbose verifier can never lose information or reject a verdict
+    on length alone (the old whole-verdict-rejection bug is impossible)."""
+
+    criterion: str
+    met: StrictBool
+    evidence: str
+
+
+class EpochVerdict(_Frozen):
+    """The local-tier verification pass's verdict for an epoch (G4), mirroring
+    ``schemas/epoch_verdict.json``: a strict ``pass`` boolean, the per-criterion
+    judgements, and the concrete ``gaps`` surfaced to the planner on a fail. Parsed
+    from the re-read ``verdict.json`` at the boundary (stdout is never parsed); the
+    field is aliased to ``pass`` (a Python keyword) but read as ``.passed``. The
+    agentic pass can only FAIL an epoch the deterministic floor already cleared, so
+    the core treats a missing/invalid verdict as a fail-safe (no rubber-stamp).
+
+    The free-text ``gaps`` and ``digest`` are UNBOUNDED in length: the whole verdict is
+    persisted on disk and delivered to the planner BY REFERENCE (it reads the file), so
+    nothing is byte-capped-and-embedded into a prompt and no length can reject it. The
+    structural validation (``pass`` is a bool, ``per_criterion`` is a list of the right
+    shape) is unchanged; only the length caps are gone."""
+
+    passed: StrictBool = Field(alias="pass")
+    per_criterion: Annotated[list[CriterionJudgement], Field(max_length=16)]
+    gaps: list[str]
+    #: A descriptive steering summary the verifier emits in the SAME pass (G10): what
+    #: the epoch actually produced, key structure/decisions, what is notably incomplete
+    #: or risky, written for the planner choosing the NEXT epoch. It is NOT a grade and
+    #: NEVER affects ``passed``; absent (older/malformed verdicts) defaults to "". It
+    #: travels to the planner by FILE (the persisted verdict), never embedded in a prompt.
+    digest: str = ""
+
+
+_EPOCH_VERDICT_ADAPTER: TypeAdapter[EpochVerdict] = TypeAdapter(EpochVerdict)
+
+
+def parse_epoch_verdict(payload: object) -> EpochVerdict:
+    """Parse untrusted JSON into the typed epoch verdict (raises on invalid).
+
+    STRUCTURAL validation only (``pass`` is a bool, ``per_criterion`` is a list of the
+    right shape, no unknown keys): a long ``evidence`` / ``criterion`` / ``gaps`` /
+    ``digest`` parses fine and is preserved IN FULL. The verdict is an agent input
+    delivered by reference (persisted on disk, the planner reads it), never embedded in
+    a prompt, so there is no length to cap and no truncation."""
+
+    return _EPOCH_VERDICT_ADAPTER.validate_python(payload)

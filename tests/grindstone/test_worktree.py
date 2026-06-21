@@ -52,6 +52,46 @@ def test_scope_violations_lists_only_out_of_scope() -> None:
     assert wt.scope_violations(changed, ["a/**", "b/**"]) == []
 
 
+def test_scope_violations_excludes_declared_dependency_dirs() -> None:
+    # A worker that materializes deps (npm install) populates node_modules; with no
+    # effective .gitignore in the fresh worktree the core commits it, so it lands in
+    # the diff. The DECLARED env_dirs are never out-of-scope writes (build artifacts,
+    # not authored work), so they are excluded before the ownership check.
+    changed = [
+        "src/app.ts",
+        "node_modules/left-pad/index.js",
+        "node_modules/.bin/tsc",
+        "node_modules",  # the dir entry itself
+    ]
+    assert wt.scope_violations(changed, ["src/**"], ["node_modules"]) == []
+
+
+def test_scope_violations_still_flags_undeclared_out_of_scope_with_dep_dirs() -> None:
+    # Only the DECLARED dep dirs are exempt. A genuine out-of-scope write outside both
+    # ownership AND the dep dirs must still be reported (a worker can't hide writes by
+    # the dep-dir carve-out).
+    changed = ["node_modules/x/i.js", "src/a.ts", "secret/leak.txt"]
+    assert wt.scope_violations(changed, ["src/**"], ["node_modules"]) == [
+        "secret/leak.txt"
+    ]
+
+
+def test_scope_violations_dep_dir_prefix_is_not_a_substring_match() -> None:
+    # `node_modules` must not exempt a sibling like `node_modules_backup/...`: the
+    # exclusion is dir-boundary aware (exact dir or `dir/` prefix), not a substring.
+    changed = ["node_modules_backup/x.js"]
+    assert wt.scope_violations(changed, ["src/**"], ["node_modules"]) == [
+        "node_modules_backup/x.js"
+    ]
+
+
+def test_scope_violations_no_dep_dirs_is_unchanged() -> None:
+    # The default (no dep dirs) preserves the prior behavior byte-for-byte.
+    changed = ["a/x.py", "b/z.py"]
+    assert wt.scope_violations(changed, ["a/**"]) == ["b/z.py"]
+    assert wt.scope_violations(changed, ["a/**"], None) == ["b/z.py"]
+
+
 # --- lifecycle -----------------------------------------------------------------
 
 

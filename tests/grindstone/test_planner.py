@@ -21,6 +21,7 @@ from grindstone.planner import (
     PlannerHardError,
     RateLimited,
     TransportError,
+    WorkspaceInfo,
     WorkerTimeout,
     backoff_delay,
     build_planner_input,
@@ -218,7 +219,9 @@ def test_flatten_last_epoch_reads_handoff_refs(tmp_path: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(
         '{"schema_version":"1","task_id":"P1/E1/T1","status":"DONE",'
+        '"what_changed":[{"kind":"file","ref":"f1.txt"}],'
         '"resulting_state":"created f1.txt","downstream_needs":["P1/E1/T1/handoff.json"],'
+        '"not_done":["theming"],'
         '"checks":[],"occupancy":{"compacted":false,"subagent_splits":0}}',
         encoding="utf-8",
     )
@@ -235,8 +238,216 @@ def test_flatten_last_epoch_reads_handoff_refs(tmp_path: Path) -> None:
     rows = flatten_last_epoch(run_dir, outcome)
     assert rows[0]["resulting_state"] == "created f1.txt"
     assert rows[0]["downstream_needs"] == ["P1/E1/T1/handoff.json"]
+    # G10: each DONE row now ALSO carries what_changed + not_done from its handoff.
+    assert rows[0]["what_changed"] == ["file:f1.txt"]
+    assert rows[0]["not_done"] == ["theming"]
     assert rows[1]["status"] == "failed"
     assert rows[1]["failure_reason"] == "no handoff.json written"
+
+
+def test_flatten_last_epoch_preserves_full_what_changed(tmp_path: Path) -> None:
+    """The handoff's own schema bounds the worker-written ``what_changed.ref`` /
+    ``not_done`` fields legitimately (<=256), so the planner row carries them IN FULL:
+    the extra embedding-truncation was a band-aid (silent information loss) and is gone.
+    The full handoff is referenceable via the workspace manifest if more is needed."""
+
+    run_dir = create_run_dir(tmp_path, "r")
+    key = "P1/E1/T1/handoff.json"
+    dest = run_dir.resolve(key)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    # The handoff's own 256-char ref bound is the legitimate limit; the row keeps it all.
+    long_ref = "x" * 256
+    dest.write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "task_id": "P1/E1/T1",
+                "status": "DONE",
+                "what_changed": [{"kind": "file", "ref": long_ref}],
+                "resulting_state": "ok",
+                "downstream_needs": [],
+                "not_done": [],
+                "checks": [],
+                "occupancy": {"compacted": False, "subagent_splits": 0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    outcome = EpochOutcome(
+        phase_id="P1", epoch_id="E1", status="completed",
+        tasks=[
+            TaskResult(task_id="T1", fq_task_id="P1/E1/T1", status="done", attempts=1,
+                       tier="local", handoff_key=key, failure_reason=None),
+        ],
+        integration=IntegrationOutcome(status="completed", branch="b", merged=["T1"], conflict=None),
+    )
+    rows = flatten_last_epoch(run_dir, outcome)
+    wc = rows[0]["what_changed"]
+    assert isinstance(wc, list)
+    assert wc[0] == f"file:{long_ref}"  # full, untruncated, no marker
+    assert "...[truncated]" not in wc[0]
+
+
+# --- the verdict (digest + evidence + gaps) travels by reference, not embedded -
+
+
+def test_volatile_tail_has_no_epoch_digest_block() -> None:
+    """The inlined ``<epoch_digest>`` block is gone: the digest now lives in the
+    persisted verdict.json (surfaced in the <workspace> manifest) and the planner reads
+    it by reference, so the prompt never embeds it."""
+
+    tail = volatile_tail(
+        phase_id="P1", epoch_counter=2, log_index=[], last_epoch_rows=[],
+        reask_errors=[],
+    )
+    assert "<epoch_digest>" not in tail
+
+
+def test_build_planner_input_has_no_epoch_digest_block() -> None:
+    sk = _phases("P1", "P2")
+    full = build_planner_input(
+        job=_JOB, skeleton=sk, phase_id="P1", epoch_counter=1, log_index=[],
+        last_epoch_rows=[], reask_errors=[],
+    )
+    assert "<epoch_digest>" not in full
+    # The stable head stays byte-identical (the verdict travels via the volatile tail's
+    # workspace manifest, never the head).
+    assert full.startswith(stable_head(_JOB, sk))
+
+
+# --- the read-capable <workspace> block (planner pull access) ------------------
+
+
+def test_preamble_invites_reading_the_workspace() -> None:
+    """The planner runs as a read-capable agent (codex read-only -C repo / claude
+    Read+Grep over the repo). The preamble must INVITE it to grep/read the exposed
+    paths for steering, while keeping the JSON-only contract + deterministic-floor
+    disposition intact."""
+
+    assert "<workspace>" in SYSTEM_PREAMBLE
+    # Read-capability is stated, and that it is for STEERING only (the floor disposes).
+    assert "read" in SYSTEM_PREAMBLE and "grep" in SYSTEM_PREAMBLE.lower()
+    assert "STEERING" in SYSTEM_PREAMBLE or "steering" in SYSTEM_PREAMBLE
+    # The JSON-only output contract is reaffirmed after the reading invitation.
+    assert "EXACTLY ONE" in SYSTEM_PREAMBLE
+
+
+def test_workspace_block_carries_absolute_paths(tmp_path: Path) -> None:
+    tip = tmp_path / "tip"
+    tip.mkdir()
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    ws = WorkspaceInfo(
+        integration_tip=tip,
+        keyed_log_root=run_root,
+        manifest=[
+            ("P1/E1/T1/handoff.json", run_root / "P1" / "E1" / "T1" / "handoff.json"),
+        ],
+    )
+    tail = volatile_tail(
+        phase_id="P1", epoch_counter=1, log_index=[], last_epoch_rows=[],
+        reask_errors=[], workspace=ws,
+    )
+    assert "<workspace>" in tail
+    # The two roots are exposed as ABSOLUTE paths the planner may grep/read.
+    assert str(tip.resolve()) in tail
+    assert str(run_root.resolve()) in tail
+    # The per-key manifest resolves each live log key to its absolute path.
+    assert "P1/E1/T1/handoff.json" in tail
+    assert str((run_root / "P1" / "E1" / "T1" / "handoff.json")) in tail
+
+
+def test_workspace_block_omitted_cleanly_when_absent() -> None:
+    tail = volatile_tail(
+        phase_id="P1", epoch_counter=1, log_index=[], last_epoch_rows=[],
+        reask_errors=[],
+    )
+    assert "<workspace>" not in tail
+
+
+def test_workspace_block_omits_missing_tip_and_empty_manifest(tmp_path: Path) -> None:
+    """A run with no integration tip yet (first implement epoch not run) and an
+    empty keyed log omits those sub-parts cleanly, no dangling None path."""
+
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    ws = WorkspaceInfo(
+        integration_tip=None, keyed_log_root=run_root, manifest=[]
+    )
+    tail = volatile_tail(
+        phase_id="P1", epoch_counter=0, log_index=[], last_epoch_rows=[],
+        reask_errors=[], workspace=ws,
+    )
+    assert "<workspace>" in tail  # the keyed-log root alone is still worth exposing
+    assert str(run_root.resolve()) in tail
+    assert "None" not in tail  # a missing tip never leaks a literal None
+
+
+def test_workspace_block_surfaces_repo_map_path_by_reference(tmp_path: Path) -> None:
+    """The structural repo-map is delivered BY REFERENCE: when present, the
+    <workspace> block carries a clearly-labeled ``repo_map`` entry pointing at the
+    on-disk map file (a ranked map of the current integration tip), not the inline
+    map text. The planner reads that path for structural planning."""
+
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    map_file = run_root / "planner_repo_map.txt"
+    map_file.write_text("util.py:\n  def shared_helper():\n")
+    ws = WorkspaceInfo(
+        integration_tip=None,
+        keyed_log_root=run_root,
+        manifest=[],
+        repo_map_path=map_file,
+    )
+    tail = volatile_tail(
+        phase_id="P1", epoch_counter=1, log_index=[], last_epoch_rows=[],
+        reask_errors=[], workspace=ws,
+    )
+    assert "<workspace>" in tail
+    assert "repo_map" in tail
+    # The absolute path to the on-disk map is surfaced; the map TEXT is not inlined.
+    assert str(map_file.resolve()) in tail
+    assert "shared_helper" not in tail
+
+
+def test_workspace_block_omits_repo_map_entry_when_absent(tmp_path: Path) -> None:
+    """Below threshold / first epoch the map is None -> no file is written and the
+    workspace omits the repo_map entry cleanly (no dangling path)."""
+
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    ws = WorkspaceInfo(
+        integration_tip=None, keyed_log_root=run_root, manifest=[], repo_map_path=None
+    )
+    tail = volatile_tail(
+        phase_id="P1", epoch_counter=0, log_index=[], last_epoch_rows=[],
+        reask_errors=[], workspace=ws,
+    )
+    assert "<workspace>" in tail
+    assert "repo_map" not in tail
+
+
+def test_preamble_points_planner_at_workspace_repo_map_path() -> None:
+    """SYSTEM_PREAMBLE must describe the repo-map as an on-disk file referenced from
+    the <workspace> (read it for structural planning), NOT as an inline prompt block.
+    The old inline-map wording is gone."""
+
+    assert "repo_map" in SYSTEM_PREAMBLE
+    assert "<repo_map>" not in SYSTEM_PREAMBLE
+
+
+def test_build_planner_input_threads_workspace_in_tail(tmp_path: Path) -> None:
+    sk = _phases("P1", "P2")
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    ws = WorkspaceInfo(integration_tip=tmp_path / "tip", keyed_log_root=run_root, manifest=[])
+    full = build_planner_input(
+        job=_JOB, skeleton=sk, phase_id="P1", epoch_counter=1, log_index=[],
+        last_epoch_rows=[], reask_errors=[], workspace=ws,
+    )
+    assert "<workspace>" in full
+    # The workspace rides the volatile tail; the stable head stays byte-identical.
+    assert full.startswith(stable_head(_JOB, sk))
 
 
 # --- validation pipeline -------------------------------------------------------
@@ -407,6 +618,60 @@ def test_gate_size_bound_is_tier_aware_for_visual_epochs() -> None:
     )
     assert no_senior.decision is None  # falls back to local bound (5) -> rejected
     assert any("T1" in e and "too big" in e for e in no_senior.errors)
+
+
+# --- content-grep forbiddance (gate rebalance G1) ------------------------------
+
+
+def _impl_task_check(tid: str, fname: str, cmd: str) -> dict[str, object]:
+    return {
+        "id": tid,
+        "goal": f"create {fname}",
+        "done_when": [{"cmd": cmd}],
+        "file_ownership": [fname],
+    }
+
+
+def test_gate_rejects_content_grep_check_with_steering_message() -> None:
+    import json
+
+    for cmd in ('rg -q "Honey|Sky" plan.md', "grep -q DONE out.txt"):
+        dec = implement_decision(_impl_task_check("T1", "f.txt", cmd))
+        res = validate_decision(
+            json.dumps(dec),
+            existing_log_keys=_EMPTY, completed_phase_ids=_EMPTY, skeleton_exists=True,
+        )
+        assert res.decision is None, cmd
+        # The rejection names the offending task and steers to `criteria`.
+        assert any("T1" in e and "criteria" in e for e in res.errors), cmd
+
+
+def test_gate_allows_structural_checks_in_done_when() -> None:
+    import json
+
+    # Structural checks (existence, type-check, test) remain legal.
+    for cmd in ("test -f greeting.txt", "npx tsc --noEmit", "npm test"):
+        dec = implement_decision(_impl_task_check("T1", "f.txt", cmd))
+        res = validate_decision(
+            json.dumps(dec),
+            existing_log_keys=_EMPTY, completed_phase_ids=_EMPTY, skeleton_exists=True,
+        )
+        assert res.decision is not None, cmd
+
+
+def test_preamble_forbids_content_greps_and_teaches_criteria() -> None:
+    # The preamble explicitly forbids content-grep checks and steers the planner
+    # to express semantic acceptance as natural-language `criteria` instead.
+    assert "CONTENT-GREP" in SYSTEM_PREAMBLE
+    assert "`criteria`" in SYSTEM_PREAMBLE
+    # The forbiddance names the grep family it rejects.
+    assert "grep" in SYSTEM_PREAMBLE
+    # checks/done_when are scoped to STRUCTURAL facts.
+    assert "STRUCTURAL" in SYSTEM_PREAMBLE
+    # The verification floor is owned by repo config + core, not restated.
+    assert "FLOOR" in SYSTEM_PREAMBLE
+    # The preamble's own examples must not author content-grep checks.
+    assert "grep -q" not in SYSTEM_PREAMBLE
 
 
 def test_preamble_teaches_three_level_skill_split() -> None:

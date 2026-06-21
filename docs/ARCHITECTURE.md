@@ -135,6 +135,114 @@ checks render a verdict (below). `complete_run` is never trusted on the planner'
 word; its `evidence` is re-run deterministically and the completion is rejected
 (and re-asked) if anything fails.
 
+## Gate rebalance: three verification sources
+
+Three consecutive dogfood failures were the same shape: a planner-authored
+`done_when` failed for an *environmental* reason while the work itself was
+correct (a build gate re-run with no `node_modules`, a `test -f package-lock.json`
+on a partial attempt, a `rg`-based content-grep returning exit 127 because
+ripgrep is not a host binary). The planner is a poor author of verification
+commands, so it stops authoring them. Verification now splits into three sources
+by *who owns each*, and a failure is classified before it is charged to anyone.
+
+1. **The deterministic floor** (repo config + core invariants). The floor is
+   owned by the repo and the core, never the planner. The **core invariants** run
+   on every gate: the worktree is clean (nothing written outside a task's
+   `file_ownership`), `handoff.json` is present and schema-valid, and the work is
+   actually committed on the task branch. The repo's own canonical commands live
+   in the `floor:` config block (below) and are re-run in the eval worktree
+   *after* `prepare` materializes dependencies, with the same pass/fail semantics
+   as a `done_when` (exit 0 == pass, captured output surfaced on failure). A
+   floor-check failure fails the gate exactly like a failed exit criterion. The
+   planner never restates the floor.
+2. **Structural `checks`** (per task, authored by the planner). Deterministic
+   *structural* facts only: a project build / test / type-check command's exit
+   code, or `test -f` file existence. A **content-grep** (`rg` / `grep` / `egrep`
+   / `fgrep` / `ag` / `ack` for a token, in any pipeline segment) is **rejected**
+   by the planner validator, the brittle proxy class is deleted at the source.
+3. **Natural-language `criteria`** (per task). Prose acceptance statements ("the
+   plan maps every Honey/Sky/Pink/Ink ramp to a React Native equivalent"). No
+   commands; these feed the agentic pass below.
+
+### The end-of-epoch agentic verification pass
+
+After every task in an epoch clears its deterministic floor and the epoch would
+otherwise complete, *if* the epoch carries any `criteria` and a local tier is
+wired, the core runs one **adversarial** verification pass on the **local** tier
+(`grindstone/verify.py`). It runs in a worktree of the epoch's integration tip
+with dependencies materialized, is a *separate* invocation from the worker (given
+only the epoch goal + criteria + the produced artifacts, told to find gaps and
+**default to FAIL** on uncertainty), and its only output is `verdict.json`, a
+re-read disk contract the core re-validates with Pydantic (`EpochVerdict`); stdout
+is never parsed, the same pattern as `vision_review`. The pass **can only fail an
+epoch the floor already cleared, never rubber-stamp past it**: a verdict that
+cannot be produced (the transport raised, no file, an invalid one) is itself a
+fail-safe FAIL. A `pass=false` verdict's `gaps` become a `FailedEpochInfo` and
+route through `handle_failed_epoch` (the same machinery as a task-failure epoch),
+so the planner sees the unmet criteria and disposes: `retry` with the gaps as
+feedback, `escalate_senior`, or `halt`. The pass is gated by `verify_epochs`
+(default on) and the senior `review` epoch stays the deeper phase/run-level pass;
+this local pass is the cheap per-epoch semantic filter.
+
+### The automatic infra-repair loop
+
+Before each boundary the core re-evaluates the current phase gate *infra-aware*.
+A failed `cmd` check is run through the shared classifier (`grindstone/infra.py`,
+the single source of truth used by both the gate evaluator and the task-loop
+`done_when` re-run, so the two can never drift), which is deliberately
+**conservative**: a check is INFRA only on exit 127 or a narrow environmental
+signature (`command not found`, `Cannot find module`, `ModuleNotFoundError`, an
+`npm`/`pip`/`cargo` install failure), and a plain `exit 1` carrying ordinary test
+output stays *semantic* so a real assertion failure is never mistaken for infra.
+
+When the gate is infra-failing and an `infra_repair:` policy + a senior tier
+exist, the core does **not** charge the worker or open a semantic failed epoch.
+It auto-dispatches a **senior** infra-repair against a worktree of the gate tip
+(a focused brief: the failing commands, their captured output, and the host
+guard), told to make the environment satisfiable *without* rewriting application
+logic. The core (never the model) commits the edits and re-runs only the failing
+commands against the repair commit, the authoritative judge, never the senior's
+handoff. A repair that sticks is adopted as the new integration tip so the
+ordinary gate that follows now passes; the run proceeds with no worker charged.
+The loop is bounded by `infra_repair.attempts`; on exhaustion the run escalates to
+a human, naming the unsatisfiable command. A **host-command guard**
+(`allow_host_commands`) keeps repo-local fixes (an `npm install` landing in
+`package.json`, editing config inside the repo) fully automatic while host-level /
+privileged actions (`sudo`, `apt`, writes outside the repo) are **deny by
+default**; the allowlist is carried into the repair dispatch and surfaced in the
+prompt.
+
+### The new config blocks
+
+All three are optional blocks in `.grindstone/config.yaml`; absent, every
+existing run is byte-unchanged.
+
+- **`floor:`** the repo's canonical verification commands.
+  ```yaml
+  floor:
+    checks:
+      - "npx tsc --noEmit"
+      - "npm test --silent"
+  ```
+  `checks` may be **empty** (a fresh project starts with a minimal floor and grows
+  it); an empty *command string* in the list is a config typo and is rejected.
+  Absent (`None`) means only the core invariants apply.
+- **`infra_repair:`** the automatic senior infra-repair policy.
+  ```yaml
+  infra_repair:
+    attempts: 2            # repair cycles per gate (>= 0; 0 disables auto-repair)
+    allow_host_commands:   # the host-command guard, deny-by-default (empty)
+      - "apt-get"
+  ```
+  `attempts` defaults to **2** (0 disables auto-repair, so an infra fail escalates
+  immediately). `allow_host_commands` defaults to **empty** (nothing host-level
+  allowed). Absent (`None`) means no auto-repair, an infra fail routes through the
+  ordinary failed-epoch path.
+- **`verify_epochs:`** a bool (default **`true`**) toggling the end-of-epoch
+  agentic pass. The pass never runs (and never errors) when an epoch has no
+  `criteria` or there is no local tier; set `false` to disable it entirely (the
+  deterministic floor + planner `review` epochs still gate).
+
 ## The run-dir layout
 
 All run state lives under `.grindstone/runs/<run-id>/` in the **target** repo

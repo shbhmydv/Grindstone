@@ -274,12 +274,44 @@ def path_in_scope(path: str, ownership: list[str]) -> bool:
     return False
 
 
-def scope_violations(changed: list[str], ownership: list[str]) -> list[str]:
-    """Changed paths that fall outside every ownership glob. Empty ownership is
-    deny-all: with no globs, every changed path is a violation.
+def _under_dep_dir(path: str, dep_dirs: list[str]) -> bool:
+    """Is ``path`` the declared dependency dir itself, or anything beneath it?
+
+    ``dep_dirs`` are the repo-relative ``prepare.env_dirs`` (e.g. ``node_modules``,
+    ``.venv``), MATERIALIZED dependency dirs, not authored work. A worker that runs
+    ``npm install`` populates them, and the core force-adds + commits them when the
+    worktree has no effective ``.gitignore``, so they would otherwise read as a wall
+    of out-of-scope writes. Only the DECLARED dirs are excluded (an undeclared write
+    outside ownership is still a real violation).
     """
 
-    return [p for p in changed if not path_in_scope(p, ownership)]
+    for dep in dep_dirs:
+        dep = dep.strip("/")
+        if dep and (path == dep or path.startswith(dep + "/")):
+            return True
+    return False
+
+
+def scope_violations(
+    changed: list[str], ownership: list[str], dep_dirs: list[str] | None = None
+) -> list[str]:
+    """Changed paths that fall outside every ownership glob. Empty ownership is
+    deny-all: with no globs, every changed path is a violation.
+
+    ``dep_dirs`` (the declared ``prepare.env_dirs``) are NEVER violations: a path
+    under a materialized dependency dir is a build artifact, not authored work, so
+    it is excluded before the ownership check. This is the robust fix regardless of
+    whether the fresh worktree carried an effective ``.gitignore``; only the
+    explicitly declared dep dirs are exempt, so a genuine out-of-scope write OUTSIDE
+    them is still reported.
+    """
+
+    deps = dep_dirs or []
+    return [
+        p
+        for p in changed
+        if not _under_dep_dir(p, deps) and not path_in_scope(p, ownership)
+    ]
 
 
 # --- integration ---------------------------------------------------------------

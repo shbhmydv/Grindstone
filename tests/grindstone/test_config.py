@@ -17,6 +17,7 @@ import pytest
 from grindstone.config import (
     ALLOW_REPO_SCRIPTS_ENV,
     MODELS_DIR,
+    FloorConfig,
     GrindstoneConfig,
     load_config,
     models_script,
@@ -315,6 +316,126 @@ def test_prepare_unknown_key_rejected(tmp_path: Path) -> None:
         + _PLANNER
         + _LOCAL
         + "prepare: {cmd: x, env_dirs: [a], cache_key_files: [b], bogus: 1}\n",
+    )
+    with pytest.raises(ValueError):
+        load_config(tmp_path)
+
+
+# --- floor: the deterministic repo-owned verification commands -----------------
+
+
+def test_floor_is_optional_and_defaults_none(tmp_path: Path) -> None:
+    # Absent block: no repo floor commands, only the core invariants apply.
+    _write(tmp_path, "roles:\n" + _PLANNER + _LOCAL)
+    cfg = load_config(tmp_path)
+    assert cfg is not None and cfg.floor is None
+
+
+def test_floor_parses_when_present(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "roles:\n"
+        + _PLANNER
+        + _LOCAL
+        + 'floor: {checks: ["npx tsc --noEmit", "npm test --silent"]}\n',
+    )
+    cfg = load_config(tmp_path)
+    assert cfg is not None and cfg.floor is not None
+    assert cfg.floor.checks == ["npx tsc --noEmit", "npm test --silent"]
+
+
+def test_floor_empty_checks_allowed(tmp_path: Path) -> None:
+    # A fresh project may start with a minimal (empty) floor and grow it; an
+    # empty LIST is legal (unlike prepare's non-empty path lists).
+    _write(tmp_path, "roles:\n" + _PLANNER + _LOCAL + "floor: {checks: []}\n")
+    cfg = load_config(tmp_path)
+    assert cfg is not None and cfg.floor is not None
+    assert cfg.floor.checks == []
+
+
+def test_floor_roundtrips(tmp_path: Path) -> None:
+    # The frozen model round-trips through dump/validate byte-for-byte.
+    cfg = FloorConfig(checks=["npx tsc --noEmit"])
+    assert FloorConfig.model_validate(cfg.model_dump()) == cfg
+
+
+def test_floor_empty_command_string_rejected(tmp_path: Path) -> None:
+    # An empty/whitespace COMMAND in the list is a config typo (it would pass
+    # trivially), distinct from an empty list, and is rejected.
+    _write(tmp_path, "roles:\n" + _PLANNER + _LOCAL + 'floor: {checks: ["", "x"]}\n')
+    with pytest.raises(ValueError):
+        load_config(tmp_path)
+
+
+def test_floor_unknown_key_rejected(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "roles:\n" + _PLANNER + _LOCAL + "floor: {checks: [x], bogus: 1}\n",
+    )
+    with pytest.raises(ValueError):
+        load_config(tmp_path)
+
+
+# --- infra_repair: the auto senior infra-repair policy + host-command guard ----
+
+
+def test_infra_repair_optional_defaults_none(tmp_path: Path) -> None:
+    # Absent block: no auto-repair, an infra fail routes through the ordinary path.
+    _write(tmp_path, "roles:\n" + _PLANNER + _LOCAL)
+    cfg = load_config(tmp_path)
+    assert cfg is not None and cfg.infra_repair is None
+
+
+def test_infra_repair_parses_with_defaults(tmp_path: Path) -> None:
+    # Present-but-bare: attempts defaults to 2, allow_host_commands to EMPTY (the
+    # host-command guard is deny-by-default).
+    _write(tmp_path, "roles:\n" + _PLANNER + _LOCAL + "infra_repair: {}\n")
+    cfg = load_config(tmp_path)
+    assert cfg is not None and cfg.infra_repair is not None
+    assert cfg.infra_repair.attempts == 2
+    assert cfg.infra_repair.allow_host_commands == []
+
+
+def test_infra_repair_parses_allowlist(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "roles:\n" + _PLANNER + _LOCAL
+        + 'infra_repair: {attempts: 3, allow_host_commands: ["apt-get", "brew"]}\n',
+    )
+    cfg = load_config(tmp_path)
+    assert cfg is not None and cfg.infra_repair is not None
+    assert cfg.infra_repair.attempts == 3
+    assert cfg.infra_repair.allow_host_commands == ["apt-get", "brew"]
+
+
+def test_infra_repair_attempts_zero_allowed(tmp_path: Path) -> None:
+    # attempts=0 disables auto-repair (an infra fail escalates immediately); >= 0.
+    _write(tmp_path, "roles:\n" + _PLANNER + _LOCAL + "infra_repair: {attempts: 0}\n")
+    cfg = load_config(tmp_path)
+    assert cfg is not None and cfg.infra_repair is not None
+    assert cfg.infra_repair.attempts == 0
+
+
+def test_infra_repair_negative_attempts_rejected(tmp_path: Path) -> None:
+    _write(tmp_path, "roles:\n" + _PLANNER + _LOCAL + "infra_repair: {attempts: -1}\n")
+    with pytest.raises(ValueError):
+        load_config(tmp_path)
+
+
+def test_infra_repair_empty_allowlist_entry_rejected(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "roles:\n" + _PLANNER + _LOCAL
+        + 'infra_repair: {allow_host_commands: ["", "apt"]}\n',
+    )
+    with pytest.raises(ValueError):
+        load_config(tmp_path)
+
+
+def test_infra_repair_unknown_key_rejected(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "roles:\n" + _PLANNER + _LOCAL + "infra_repair: {attempts: 2, bogus: 1}\n",
     )
     with pytest.raises(ValueError):
         load_config(tmp_path)
