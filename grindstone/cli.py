@@ -28,6 +28,7 @@ from grindstone.config import (
     GrindstoneConfig,
     load_config,
     models_script,
+    resolve_role_script,
     validate_script_paths,
 )
 from grindstone.planner import (
@@ -67,53 +68,55 @@ DEFAULT_MAX_PLANNER_CALLS = 96
 DEFAULT_VISION_TIMEOUT_S = 600.0
 
 #: The ``.grindstone/config.yaml`` ``init`` scaffolds: one block per *role*
-#: (``planner`` / ``worker`` / ``senior``), each naming a request script behind
-#: the file contract plus its slots + wall-clock timeout. The CLI never learns
-#: the transport or model behind a role, that lives in the script. ``senior``
-#: is scaffolded active; delete it for a local-only ladder. Each role's ABSOLUTE
-#: script path is resolved through ``models_script`` so it honors the rig stack
-#: (override > preset > default), and a run from any CWD finds it. Loadable as-is
-#: by ``config.load_config``.
+#: (``planner`` / ``worker`` / ``senior``), each NAMING a bundled rig (``rig:``)
+#: plus its slots + wall-clock timeout. The CLI never learns the transport or
+#: model behind a role, that lives in the rig's ``<role>_request.sh``. ``senior``
+#: is scaffolded active; delete it for a local-only ladder. A ``rig:`` name (not
+#: an absolute path) keeps the generated config PORTABLE: the role -> script
+#: mapping happens at run time via ``resolve_role_script``, so it resolves on any
+#: machine, not pinned to one checkout's absolute paths. Loadable as-is by
+#: ``config.load_config``.
 def _render_config_template(rig: str | None) -> str:
-    """The scaffolded config text with each role's script path resolved for ``rig``.
+    """The scaffolded config text naming each role's backend by ``rig`` (portable).
 
-    ``models_script`` resolves each role's script through the rig stack: an
-    explicit ``--rig codex`` searches ``codex/`` then the shipped ``claude/``
-    floor (never the gitignored ``personal/``), while the implicit default
-    (``rig=None``) lets an operator's ``models/personal`` scripts win where
-    present, else the shipped Claude floor. The optional vision/polish lines stay
-    commented out and name only the bare script (resolved at run time if the
-    block is uncommented).
+    Each role names a bundled rig by NAME (``rig:``), not an absolute script path,
+    so a generated config resolves on ANY machine (the rig -> ``<role>_request.sh``
+    mapping happens at run time, never pinned to this checkout's paths). The
+    ``--rig`` flag selects the name written; with no ``--rig`` each role gets
+    ``rig: claude`` (the shipped floor). At run time a role resolves its rig to
+    ``<role>_request.sh`` under that rig, falling through to the claude floor when
+    the rig lacks the script. The optional vision/polish lines stay commented out
+    and name only the bare script (resolved at run time if the block is uncommented).
     """
 
-    planner = models_script("planner_request.sh", rig=rig)
-    worker = models_script("worker_request.sh", rig=rig)
-    senior = models_script("senior_request.sh", rig=rig)
+    rig_name = rig if rig is not None else "claude"
     return f"""\
 # Grindstone per-repo config (.grindstone/config.yaml).
-# Owner-facing settings for `grindstone run` / `grindstone resume`. Each role is
-# a request script behind a file contract; the script owns the transport, model
-# identity and GPU. Delete this file to fall back to `grindstone init`.
+# Owner-facing settings for `grindstone run` / `grindstone resume`. Each role
+# names a bundled rig (`rig:`); the rig's `<role>_request.sh` owns the transport,
+# model identity and GPU. Delete this file to fall back to `grindstone init`.
 
 roles:
   # The planner role: a strong model plans one epoch at a time. slots=1
   # (one planner call in flight); timeout is the per-call wall-clock budget.
+  # `rig` names the backend (e.g. claude / codex / local), resolved at run time
+  # to that rig's planner_request.sh (claude floor when the rig lacks it).
   planner:
-    script: {planner}
+    rig: {rig_name}
     slots: 1
     timeout_s: 600
 
   # The worker role: the on-rig grinders. slots = the epoch fan-out bound
   # (how many tasks run concurrently on this rig).
   worker:
-    script: {worker}
+    rig: {rig_name}
     slots: 2
     timeout_s: 1800
 
   # The senior worker role: the escalation tier. OPTIONAL, delete this whole
   # block for a local-only ladder.
   senior:
-    script: {senior}
+    rig: {rig_name}
     slots: 2
     timeout_s: 3600
 
@@ -183,7 +186,7 @@ def _resolve_planner(
     if cfg is None:
         raise _no_config_exit()
     return ScriptPlanner(
-        script=cfg.roles.planner.script,
+        script=resolve_role_script("planner", cfg.roles.planner),
         stop_script=models_script("stop.sh"),
         repo=repo,
         slots=cfg.roles.planner.slots,
@@ -213,7 +216,7 @@ def _resolve_ladder(
         (
             "worker",
             ScriptWorker(
-                script=cfg.roles.worker.script,
+                script=resolve_role_script("worker", cfg.roles.worker),
                 stop_script=stop_script,
                 slots=cfg.roles.worker.slots,
                 timeout_s=cfg.roles.worker.timeout_s,
@@ -227,7 +230,7 @@ def _resolve_ladder(
             (
                 "senior",
                 ScriptWorker(
-                    script=senior.script,
+                    script=resolve_role_script("senior", senior),
                     stop_script=stop_script,
                     slots=senior.slots,
                     timeout_s=senior.timeout_s,

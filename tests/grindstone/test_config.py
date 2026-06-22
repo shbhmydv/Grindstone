@@ -19,8 +19,10 @@ from grindstone.config import (
     MODELS_DIR,
     FloorConfig,
     GrindstoneConfig,
+    RoleConfig,
     load_config,
     models_script,
+    resolve_role_script,
     validate_script_paths,
 )
 
@@ -625,6 +627,147 @@ def test_bundled_models_scripts_are_accepted(
     cfg = load_config(tmp_path)
     assert cfg is not None
     validate_script_paths(cfg)  # under models/ -> no raise
+
+
+# --- RoleConfig: rig OR script (mutually exclusive), neither = implicit default --
+
+
+def test_roleconfig_accepts_rig_alone() -> None:
+    rc = RoleConfig(rig="codex", slots=1, timeout_s=600)
+    assert rc.rig == "codex"
+    assert rc.script is None
+
+
+def test_roleconfig_accepts_script_alone() -> None:
+    rc = RoleConfig(script=Path("/m/planner.sh"), slots=1, timeout_s=600)
+    assert rc.script == Path("/m/planner.sh")
+    assert rc.rig is None
+
+
+def test_roleconfig_accepts_neither() -> None:
+    # Neither rig nor script: the implicit default rig (personal/ then claude/).
+    rc = RoleConfig(slots=2, timeout_s=1800)
+    assert rc.script is None and rc.rig is None
+
+
+def test_roleconfig_rejects_both_script_and_rig() -> None:
+    with pytest.raises(ValueError):
+        RoleConfig(script=Path("/m/planner.sh"), rig="codex", slots=1, timeout_s=600)
+
+
+def test_config_role_rig_loads_from_yaml(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "roles:\n"
+        "  planner: {rig: codex, slots: 1, timeout_s: 600}\n"
+        "  worker: {rig: local, slots: 2, timeout_s: 1800}\n",
+    )
+    cfg = load_config(tmp_path)
+    assert cfg is not None
+    assert cfg.roles.planner.rig == "codex" and cfg.roles.planner.script is None
+    assert cfg.roles.worker.rig == "local" and cfg.roles.worker.script is None
+
+
+def test_config_role_both_script_and_rig_is_error(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "roles:\n"
+        "  planner: {rig: codex, script: /m/planner.sh, slots: 1, timeout_s: 600}\n"
+        + _LOCAL,
+    )
+    with pytest.raises(ValueError):
+        load_config(tmp_path)
+
+
+# --- resolve_role_script: the single role -> <role>_request.sh mapping ----------
+
+
+def test_resolve_role_script_explicit_script_wins() -> None:
+    rc = RoleConfig(script=Path("/m/planner.sh"), slots=1, timeout_s=600)
+    assert resolve_role_script("planner", rc) == Path("/m/planner.sh")
+
+
+def test_resolve_role_script_rig_maps_role_to_request_filename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `rig` resolves the role's <role>_request.sh under that rig (explicit rig).
+    monkeypatch.setattr("grindstone.config.MODELS_DIR", tmp_path)
+    _fake_models(
+        tmp_path,
+        claude=("worker_request.sh",),
+        codex=("worker_request.sh",),
+    )
+    rc = RoleConfig(rig="codex", slots=2, timeout_s=1800)
+    assert resolve_role_script("worker", rc) == (
+        tmp_path / "codex" / "worker_request.sh"
+    ).resolve()
+
+
+def test_resolve_role_script_rig_falls_through_to_claude_floor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A named rig lacking the role's script falls to the shipped claude/ floor.
+    monkeypatch.setattr("grindstone.config.MODELS_DIR", tmp_path)
+    _fake_models(tmp_path, claude=("senior_request.sh",))
+    rc = RoleConfig(rig="codex", slots=2, timeout_s=3600)
+    assert resolve_role_script("senior", rc) == (
+        tmp_path / "claude" / "senior_request.sh"
+    ).resolve()
+
+
+def test_resolve_role_script_neither_uses_implicit_default_rig(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Neither rig nor script -> implicit default (rig=None): personal/ beats claude/.
+    monkeypatch.setattr("grindstone.config.MODELS_DIR", tmp_path)
+    _fake_models(
+        tmp_path,
+        claude=("planner_request.sh",),
+        personal=("planner_request.sh",),
+    )
+    rc = RoleConfig(slots=1, timeout_s=600)
+    assert resolve_role_script("planner", rc) == (
+        tmp_path / "personal" / "planner_request.sh"
+    ).resolve()
+
+
+# --- validate_script_paths: skip rig-derived roles, still guard explicit scripts -
+
+
+def test_validate_script_paths_skips_rig_only_roles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # rig-only roles have no explicit path to check (rig-derived scripts always
+    # resolve under models/), so the RCE guard skips them and does not raise.
+    monkeypatch.delenv(ALLOW_REPO_SCRIPTS_ENV, raising=False)
+    _write(
+        tmp_path,
+        "roles:\n"
+        "  planner: {rig: claude, slots: 1, timeout_s: 600}\n"
+        "  worker: {rig: codex, slots: 2, timeout_s: 1800}\n"
+        "  senior: {rig: local, slots: 2, timeout_s: 3600}\n",
+    )
+    cfg = load_config(tmp_path)
+    assert cfg is not None
+    validate_script_paths(cfg)  # rig-only -> no path to guard -> no raise
+
+
+def test_validate_script_paths_still_rejects_explicit_out_of_models(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A rig-only planner is skipped, but the worker's EXPLICIT out-of-models script
+    # is still rejected (the guard is per-role, not all-or-nothing).
+    monkeypatch.delenv(ALLOW_REPO_SCRIPTS_ENV, raising=False)
+    _write(
+        tmp_path,
+        "roles:\n"
+        "  planner: {rig: claude, slots: 1, timeout_s: 600}\n"
+        "  worker: {script: /m/local.sh, slots: 2, timeout_s: 1800}\n",
+    )
+    cfg = load_config(tmp_path)
+    assert cfg is not None
+    with pytest.raises(ValueError):
+        validate_script_paths(cfg)
 
 
 def test_env_opt_in_allows_arbitrary_repo_script(

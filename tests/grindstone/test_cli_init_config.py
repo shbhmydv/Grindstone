@@ -22,7 +22,7 @@ from grindstone.cli import (
     _resolve_planner,
     main,
 )
-from grindstone.config import GrindstoneConfig, load_config
+from grindstone.config import GrindstoneConfig, load_config, resolve_role_script
 from grindstone.mock_planner import MockPlanner
 from grindstone.rundir import RunDir
 from grindstone.script_planner import ScriptPlanner
@@ -90,18 +90,28 @@ def test_init_writes_loadable_config(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert cfg_path.is_file()
     cfg = load_config(repo)  # the scaffold parses to a valid config
     assert isinstance(cfg, GrindstoneConfig)
-    # Default rig: every role's baked path resolves under models/claude/.
-    assert cfg.roles.planner.script == (models / "claude" / "planner_request.sh").resolve()
-    assert cfg.roles.worker.script == (models / "claude" / "worker_request.sh").resolve()
-    assert cfg.roles.senior is not None
-    assert cfg.roles.senior.script == (models / "claude" / "senior_request.sh").resolve()
+    # Default rig: each role names `rig: claude` (portable, no absolute paths)...
+    assert cfg.roles.planner.rig == "claude" and cfg.roles.planner.script is None
+    assert cfg.roles.worker.rig == "claude"
+    assert cfg.roles.senior is not None and cfg.roles.senior.rig == "claude"
+    # ...and that rig resolves to the bundled models/claude/ scripts at run time.
+    assert resolve_role_script("planner", cfg.roles.planner) == (
+        models / "claude" / "planner_request.sh"
+    ).resolve()
+    assert resolve_role_script("worker", cfg.roles.worker) == (
+        models / "claude" / "worker_request.sh"
+    ).resolve()
+    assert resolve_role_script("senior", cfg.roles.senior) == (
+        models / "claude" / "senior_request.sh"
+    ).resolve()
 
 
-def test_init_rig_codex_bakes_codex_planner_default_workers(
+def test_init_rig_codex_writes_codex_rig_resolves_planner_default_workers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # `init --rig codex` inserts the codex preset for the planner only; the workers
-    # have no codex/ script so they fall back to the claude/ floor.
+    # `init --rig codex` writes `rig: codex` for every role; at run time the
+    # planner resolves under codex/, while the workers (no codex/ script) fall
+    # through to the claude/ floor.
     repo = tmp_path / "repo"
     repo.mkdir()
     models = _fake_models(tmp_path, codex=True)
@@ -109,10 +119,18 @@ def test_init_rig_codex_bakes_codex_planner_default_workers(
     assert main(["init", "--repo", str(repo), "--rig", "codex"]) == 0
     cfg = load_config(repo)
     assert cfg is not None
-    assert cfg.roles.planner.script == (models / "codex" / "planner_request.sh").resolve()
-    assert cfg.roles.worker.script == (models / "claude" / "worker_request.sh").resolve()
-    assert cfg.roles.senior is not None
-    assert cfg.roles.senior.script == (models / "claude" / "senior_request.sh").resolve()
+    assert cfg.roles.planner.rig == "codex"
+    assert cfg.roles.worker.rig == "codex"
+    assert cfg.roles.senior is not None and cfg.roles.senior.rig == "codex"
+    assert resolve_role_script("planner", cfg.roles.planner) == (
+        models / "codex" / "planner_request.sh"
+    ).resolve()
+    assert resolve_role_script("worker", cfg.roles.worker) == (
+        models / "claude" / "worker_request.sh"
+    ).resolve()
+    assert resolve_role_script("senior", cfg.roles.senior) == (
+        models / "claude" / "senior_request.sh"
+    ).resolve()
 
 
 def test_init_appends_gitignore_idempotently(tmp_path: Path) -> None:

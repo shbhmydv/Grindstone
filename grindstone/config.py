@@ -24,7 +24,13 @@ import os
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 #: Repo-relative path of the owner config.
 _CONFIG_REL = Path(".grindstone") / "config.yaml"
@@ -101,18 +107,40 @@ _FROZEN = ConfigDict(extra="forbid", frozen=True)
 
 
 class RoleConfig(BaseModel):
-    """One role behind a request script: ``script`` + ``slots`` + ``timeout_s``.
+    """One role behind a request script: ``rig`` OR ``script`` + ``slots`` + ``timeout_s``.
 
-    ``script`` is the absolute path to the role's request script (``models/``);
-    ``slots`` is the authoritative per-role concurrency bound (>= 1);
-    ``timeout_s`` is the transport-owned wall-clock supervisor (> 0). No model
-    identity or transport, those live behind the script.
+    A role is reached through a ``<role>_request.sh`` under ``models/``; name the
+    backend two MUTUALLY EXCLUSIVE ways (``resolve_role_script`` does the mapping):
+
+    * ``rig``: a bundled rig NAME (e.g. ``claude`` / ``codex`` / ``local``),
+      resolved at run time to the role's ``<role>_request.sh`` under that rig (the
+      portable form ``grindstone init`` scaffolds, not pinned to one checkout's
+      absolute paths). NAMING a rig lets each role pick a different backend.
+    * ``script``: an explicit absolute path to the role's request script (the
+      power-user / legacy form). It must resolve under ``models/`` unless the
+      operator opts out (``validate_script_paths``).
+
+    Setting BOTH is an error (ambiguous). Setting NEITHER resolves the implicit
+    default rig (``rig=None`` -> ``personal/`` then the shipped ``claude/`` floor).
+    ``slots`` is the authoritative per-role concurrency bound (>= 1); ``timeout_s``
+    is the transport-owned wall-clock supervisor (> 0). No model identity or
+    transport, those live behind the script.
     """
 
     model_config = _FROZEN
-    script: Path
+    script: Path | None = None
+    rig: str | None = None
     slots: int
     timeout_s: float
+
+    @model_validator(mode="after")
+    def _script_xor_rig(self) -> RoleConfig:
+        if self.script is not None and self.rig is not None:
+            raise ValueError(
+                "set EITHER script or rig, not both (ambiguous): name a bundled "
+                "rig OR an explicit script path, never both"
+            )
+        return self
 
     @field_validator("slots")
     @classmethod
@@ -140,6 +168,22 @@ class RolesConfig(BaseModel):
     planner: RoleConfig
     worker: RoleConfig
     senior: RoleConfig | None = None
+
+
+def resolve_role_script(role: str, rc: RoleConfig) -> Path:
+    """Map a role to its request script: the single role->filename mapping.
+
+    ``role`` is one of ``"planner"`` / ``"worker"`` / ``"senior"``. An explicit
+    ``rc.script`` wins verbatim (the power-user form); otherwise the role's
+    ``<role>_request.sh`` is resolved through ``models_script`` under ``rc.rig``
+    (a NAMED rig, or the implicit default rig when ``rc.rig`` is ``None``). This is
+    the one place that knows a role's request-script filename, so the CLI never
+    spells ``<role>_request.sh`` itself.
+    """
+
+    if rc.script is not None:
+        return rc.script
+    return models_script(f"{role}_request.sh", rig=rc.rig)
 
 
 class VisionReviewConfig(BaseModel):
@@ -416,11 +460,15 @@ def validate_script_paths(cfg: GrindstoneConfig) -> None:
 
     if os.environ.get(ALLOW_REPO_SCRIPTS_ENV) == "1":
         return
-    candidates: list[tuple[str, Path]] = [
-        ("roles.planner.script", cfg.roles.planner.script),
-        ("roles.worker.script", cfg.roles.worker.script),
-    ]
-    if cfg.roles.senior is not None:
+    # Only roles that EXPLICITLY name a ``script:`` are guarded: a rig-derived
+    # script (``rig:`` / neither) always resolves under ``models/`` via
+    # ``models_script``, so it is inherently safe and has no path to check.
+    candidates: list[tuple[str, Path]] = []
+    if cfg.roles.planner.script is not None:
+        candidates.append(("roles.planner.script", cfg.roles.planner.script))
+    if cfg.roles.worker.script is not None:
+        candidates.append(("roles.worker.script", cfg.roles.worker.script))
+    if cfg.roles.senior is not None and cfg.roles.senior.script is not None:
         candidates.append(("roles.senior.script", cfg.roles.senior.script))
     if cfg.vision_review is not None:
         candidates.append(("vision_review.script", cfg.vision_review.script))
