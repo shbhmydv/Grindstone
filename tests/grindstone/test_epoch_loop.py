@@ -13,12 +13,15 @@ from grindstone.contracts.models import CmdCheck, ImplementTask
 from grindstone.epoch_loop import (
     EpochState,
     IntegrationState,
+    _EpochStateStore,
+    _integrate,
     epoch_done_predicate,
 )
 from grindstone.events import Event, read_events
 from grindstone.mock_worker import MockWorker
 from grindstone.rundir import RunDir, create_run_dir
-from grindstone.task_loop import TaskIdentity, pending_cursor
+from grindstone.task_loop import TaskIdentity, TaskOutcome, pending_cursor
+from grindstone import worktree as wt
 from grindstone.worker import WorkerTransport
 
 from tests.grindstone.conftest import (
@@ -108,7 +111,7 @@ def test_done_predicate_holds_at_terminal(git_repo: Path, run_dir: RunDir) -> No
 
 
 def test_done_predicate_false_with_inflight() -> None:
-    ident = TaskIdentity("P1", "E1", "T1")
+    ident = TaskIdentity("run-1", "P1", "E1", "T1")
     cur = pending_cursor(ident, "implement")
     state = EpochState(
         phase_id="P1",
@@ -129,6 +132,55 @@ def test_done_predicate_false_with_inflight() -> None:
         update={"tasks": {"T1": cur.model_copy(update={"status": "done"})}}
     )
     assert epoch_done_predicate(done) is True
+
+
+# --- run-scoped branch names (cross-run collision is structurally impossible) ---
+
+
+def test_attempt_branch_is_run_scoped() -> None:
+    ident = TaskIdentity(run_id="20260101T000000Z", phase_id="P1", epoch_id="E1", task_id="T1")
+    assert ident.attempt_branch(1) == "grind/20260101T000000Z/P1/E1/T1-a1"
+    # The log-key prefix stays run-agnostic (only branch names carry the run id).
+    assert ident.fq == "P1/E1/T1"
+
+
+def test_run_scoping_isolates_leftover_branch_from_prior_run(git_repo: Path) -> None:
+    """The real bug: a leftover ``grind/...`` branch from a prior run must not
+    collide when a fresh run (different run id) creates the same phase/epoch/task
+    worktree branch. Run-scoping the name makes the create path crash-free.
+    """
+
+    base = wt.head_commit(git_repo)
+    # A leftover task branch from a PRIOR run id, in the SAME repo.
+    old = TaskIdentity(run_id="OLDRUN", phase_id="P1", epoch_id="E1", task_id="T1")
+    wt.add_worktree(git_repo, git_repo.parent / "wt-old" / "a1", branch=old.attempt_branch(1), base=base)
+    assert wt.branch_exists(git_repo, old.attempt_branch(1))
+
+    # A fresh run with a different run id creates the same phase/epoch/task branch.
+    new = TaskIdentity(run_id="NEWRUN", phase_id="P1", epoch_id="E1", task_id="T1")
+    assert new.attempt_branch(1) != old.attempt_branch(1)
+    # No "branch already exists" crash, because the name is run-scoped.
+    wt.add_worktree(git_repo, git_repo.parent / "wt-new" / "a1", branch=new.attempt_branch(1), base=base)
+    assert wt.branch_exists(git_repo, new.attempt_branch(1))
+
+
+def test_run_epoch_branch_names_carry_run_id(git_repo: Path, run_dir: RunDir) -> None:
+    """An end-to-end epoch names its task + integration branches under the run id,
+    so a second run (distinct run dir) can never share a branch with this one.
+    """
+
+    import subprocess
+
+    outcome = _run(run_dir, git_repo, _disjoint_tasks(2), _file_workers(2))
+    assert outcome.status == "completed"
+    run_id = run_dir.root.name
+    assert outcome.integration.branch == f"grind/{run_id}/P1/E1/_integration"
+    # The old, non-run-scoped task-branch namespace is unused.
+    refs = subprocess.run(
+        ["git", "branch", "--list", "grind/P1/E1/T*"],
+        cwd=str(git_repo), capture_output=True, text=True,
+    ).stdout
+    assert refs.strip() == ""
 
 
 # --- partial epoch (some tasks fail; DONE ones still integrate) -----------------
@@ -267,3 +319,131 @@ def test_artifact_epoch_skips_integration(tmp_path: Path) -> None:
     assert outcome.status == "completed"
     assert outcome.integration.status == "skipped"
     assert not (run_dir.root / "worktrees").exists()
+
+
+# --- stale integration branch must not poison a fresh integration ---------------
+
+
+def _commit_branch_adding(repo: Path, branch: str, base: str, files: dict[str, str]) -> str:
+    """Create ``branch`` at ``base``, add ``files``, commit, return the tip sha.
+
+    A throwaway DONE-task branch built without running a worker: a worktree on a
+    new branch off ``base``, the files written + committed, the worktree removed.
+    """
+
+    import subprocess
+
+    wt_path = repo / ".tmp-build" / branch.replace("/", "_")
+    wt.add_worktree(repo, wt_path, branch=branch, base=base)
+    for rel, content in files.items():
+        (wt_path / rel).write_text(content, encoding="utf-8")
+    wt.commit_all(wt_path, f"build {branch}")
+    tip = wt.resolve_commit(repo, branch)
+    wt.remove_worktree(repo, wt_path)
+    subprocess.run(["git", "worktree", "prune"], cwd=str(repo), check=True)
+    return tip
+
+
+def _store_for(run_dir: RunDir, branch: str, base: str, merged: list[str]) -> _EpochStateStore:
+    state = EpochState(
+        phase_id="P1",
+        epoch_id="E1",
+        title="t",
+        mode="implement",
+        is_implement=True,
+        base=base,
+        integration=IntegrationState(branch=branch, status="pending", merged=merged, conflict=None),
+        tasks={},
+    )
+    return _EpochStateStore(run_dir, state)
+
+
+def _done_outcome(task_id: str, branch: str) -> TaskOutcome:
+    return TaskOutcome(
+        identity=TaskIdentity("run-1", "P1", "E1", task_id),
+        status="done",
+        tier="local",
+        attempts=1,
+        handoff=None,
+        handoff_key=None,
+        branch=branch,
+        reason=None,
+    )
+
+
+def test_fresh_integration_drops_stale_same_named_branch(git_repo: Path, run_dir: RunDir) -> None:
+    # A prior run left an integration branch of the SAME name carrying its own
+    # package.json. Without the drop, merging this run's fresh task branches into
+    # that stale branch yields a phantom both-added conflict on package.json (a
+    # file genuinely owned by exactly one task this run).
+    base = wt.head_commit(git_repo)
+    integ = "grind/P1/E1/_integration"
+    _commit_branch_adding(git_repo, integ, base, {"package.json": "STALE"})
+
+    t1 = _commit_branch_adding(git_repo, "grind/P1/E1/T1", base, {"package.json": "FRESH"})
+    t2 = _commit_branch_adding(git_repo, "grind/P1/E1/T2", base, {"app.json": "APP"})
+    assert t1 and t2
+
+    store = _store_for(run_dir, integ, base, merged=[])
+    outcome = _integrate(
+        repo=git_repo,
+        run_dir=run_dir,
+        store=store,
+        branch=integ,
+        base=base,
+        done_in_order=[_done_outcome("T1", "grind/P1/E1/T1"), _done_outcome("T2", "grind/P1/E1/T2")],
+    )
+
+    assert outcome.status == "completed"
+    assert outcome.conflict is None
+    assert outcome.merged == ["T1", "T2"]
+    # The stale branch was dropped and recreated at base: the FRESH package.json
+    # wins, and app.json is present. The STALE content is gone.
+    import subprocess
+
+    pkg = subprocess.run(
+        ["git", "show", f"{integ}:package.json"], cwd=str(git_repo), capture_output=True, text=True
+    ).stdout
+    assert pkg == "FRESH"
+    assert tracked_files(git_repo, integ) == [".gitignore", "README.md", "app.json", "package.json"]
+
+
+def test_resume_mid_integration_keeps_existing_branch(git_repo: Path, run_dir: RunDir) -> None:
+    # Resume mid-integration: the integration branch already carries T1 (merged
+    # non-empty), so _integrate must NOT drop it (that would discard real
+    # progress); it merges only the remaining task and keeps T1's content.
+    base = wt.head_commit(git_repo)
+    integ = "grind/P1/E1/_integration"
+    t1 = _commit_branch_adding(git_repo, "grind/P1/E1/T1", base, {"f1.txt": "ONE"})
+    t2 = _commit_branch_adding(git_repo, "grind/P1/E1/T2", base, {"f2.txt": "TWO"})
+    assert t1 and t2
+
+    # Materialize the integration branch with T1 already merged into it (the
+    # durable state records merged == ["T1"]).
+    import subprocess
+
+    int_wt = run_dir.root / "worktrees" / "_seed"
+    wt.add_worktree(git_repo, int_wt, branch=integ, base=base)
+    merge = wt.merge_into(int_wt, "grind/P1/E1/T1")
+    assert merge.ok
+    wt.remove_worktree(git_repo, int_wt)
+    subprocess.run(["git", "worktree", "prune"], cwd=str(git_repo), check=True)
+    integ_tip_before = wt.resolve_commit(git_repo, integ)
+
+    store = _store_for(run_dir, integ, base, merged=["T1"])
+    outcome = _integrate(
+        repo=git_repo,
+        run_dir=run_dir,
+        store=store,
+        branch=integ,
+        base=base,
+        done_in_order=[_done_outcome("T1", "grind/P1/E1/T1"), _done_outcome("T2", "grind/P1/E1/T2")],
+    )
+
+    assert outcome.status == "completed"
+    assert outcome.merged == ["T1", "T2"]
+    # T1's content survived (the branch was NOT reset to base), and T2 was added.
+    assert tracked_files(git_repo, integ) == [".gitignore", "README.md", "f1.txt", "f2.txt"]
+    # The integration tip moved forward from the seeded T1 tip (T2 merged on top),
+    # so the prior progress is an ancestor, not discarded.
+    assert wt.is_ancestor(git_repo, integ_tip_before, integ)

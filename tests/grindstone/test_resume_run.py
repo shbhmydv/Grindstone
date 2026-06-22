@@ -128,7 +128,7 @@ def _craft_running_epoch(repo: Path, run_dir: RunDir) -> dict[str, object]:
          "done_when": [check_cmd("test -f f1.txt")],
          "criteria": ["f1.txt is correct"], "file_ownership": ["f1.txt"]}
     )
-    ident = TaskIdentity("P1", "E1", "T1")
+    ident = TaskIdentity(run_dir.root.name, "P1", "E1", "T1")
     with JournalWriter(run_dir.events_path) as journal:
         journal.append(RunStarted(seq=0, ts=TS, run_id="r", job_path="job.md"))
         journal.append(SkeletonProposed(seq=1, ts=TS, phases=[PhaseRef(id="P1", title="build")]))
@@ -148,7 +148,8 @@ def _craft_running_epoch(repo: Path, run_dir: RunDir) -> dict[str, object]:
         phase_id="P1", epoch_id="E1", title="impl", mode="implement", is_implement=True,
         base=wt.head_commit(repo),
         integration=IntegrationState(
-            branch="grind/P1/E1/_integration", status="pending", merged=[], conflict=None
+            branch=f"grind/{run_dir.root.name}/P1/E1/_integration",
+            status="pending", merged=[], conflict=None,
         ),
         tasks={"T1": cursor},
     )

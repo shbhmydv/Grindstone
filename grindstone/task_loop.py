@@ -92,20 +92,27 @@ HANDOFF_FILE_MAX_BYTES = 8 * 1024 * 1024
 class TaskIdentity:
     """The task's place in the run tree; replaces S1's module-level constants."""
 
+    run_id: str
     phase_id: str
     epoch_id: str
     task_id: str
 
     @property
     def fq(self) -> str:
-        """Fully-qualified log-key prefix ``<phase>/<epoch>/<task>``."""
+        """Fully-qualified log-key prefix ``<phase>/<epoch>/<task>``.
+
+        Run-agnostic on purpose: log keys are scoped by the run dir, not the
+        name, so only branch names carry the run id (see ``attempt_branch``).
+        """
 
         return f"{self.phase_id}/{self.epoch_id}/{self.task_id}"
 
     def attempt_branch(self, attempt: int) -> str:
-        """The per-attempt worktree branch (ruling 4)."""
+        """The per-attempt worktree branch (ruling 4), run-scoped so two runs
+        (or a re-run after escalation) can never collide on a leftover branch.
+        """
 
-        return f"grind/{self.phase_id}/{self.epoch_id}/{self.task_id}-a{attempt}"
+        return f"grind/{self.run_id}/{self.phase_id}/{self.epoch_id}/{self.task_id}-a{attempt}"
 
 
 # --- public result + persisted per-task cursor ---------------------------------

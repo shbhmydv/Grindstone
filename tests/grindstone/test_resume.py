@@ -53,7 +53,7 @@ TS = "2026-06-10T00:00:00+00:00"
 def _craft_inflight_single(repo: Path, run_dir: RunDir) -> None:
     """Write the journal + state.json a kill leaves with T1 in flight (attempt 1)."""
 
-    ident = TaskIdentity("P1", "E1", "T1")
+    ident = TaskIdentity(run_dir.root.name, "P1", "E1", "T1")
     with JournalWriter(run_dir.events_path) as journal:
         journal.append(RunStarted(seq=0, ts=TS, run_id="r", job_path="j"))
         journal.append(SkeletonProposed(seq=1, ts=TS, phases=[PhaseRef(id="P1", title="t")]))
@@ -91,7 +91,8 @@ def _craft_inflight_single(repo: Path, run_dir: RunDir) -> None:
         is_implement=True,
         base=wt.head_commit(repo),
         integration=IntegrationState(
-            branch="grind/P1/E1/_integration", status="pending", merged=[], conflict=None
+            branch=f"grind/{run_dir.root.name}/P1/E1/_integration",
+            status="pending", merged=[], conflict=None,
         ),
         tasks={"T1": cursor},
     )

@@ -5,9 +5,12 @@ branched from the **epoch base** (the repo tip at epoch dispatch). The worker's
 writes land there, the core scope-checks the diff against the task's
 ``file_ownership`` globs, commits on success (models never run git), and at the
 done-predicate the core fast-forward-merges every DONE task's branch, in task
-order, into the epoch integration branch. Pairwise-disjoint ownership plus the
-scope check make the merges commute, so ANY merge conflict is a structural bug
-and aborts the epoch (``integration_conflict``), never a retried runtime path.
+order, into the epoch integration branch. Given a fresh integration branch
+started at the epoch base each epoch (the branch name is not run-scoped, so
+``epoch_loop._integrate`` drops any stale same-named leftover before a fresh
+integration), pairwise-disjoint ownership plus the scope check make the merges
+commute, so ANY merge conflict is a structural bug and aborts the epoch
+(``integration_conflict``), never a retried runtime path.
 
 Pure subprocess git (no GitPython). The scars ported from the v7 pipeline,
 worktrees as scratch CWD, force removal + prune of debris, merge in an isolated
@@ -318,7 +321,14 @@ def scope_violations(
 
 
 def ensure_integration_branch(repo: Path, branch: str, base: str) -> None:
-    """Create the integration branch at ``base`` if it does not yet exist."""
+    """Create the integration branch at ``base`` if it does not yet exist.
+
+    A no-op when the branch is already present, which is correct ONLY for a
+    resume mid-integration (the branch carries real merged progress). For a FRESH
+    integration the caller must drop any same-named leftover first (the branch
+    name is not run-scoped, so a prior run's branch would otherwise be reused with
+    stale content). ``epoch_loop._integrate`` enforces that precondition.
+    """
 
     if not branch_exists(repo, branch):
         _git(repo, "branch", branch, base)
@@ -327,9 +337,12 @@ def ensure_integration_branch(repo: Path, branch: str, base: str) -> None:
 def merge_into(worktree: Path, branch: str) -> MergeOutcome:
     """Merge ``branch`` into the branch checked out in ``worktree``.
 
-    ``--no-ff`` so every task contributes a recorded merge commit. A conflict is
-    structurally impossible given disjoint ownership + the scope check, so it is
-    reported (not retried) and the merge is aborted to leave the worktree clean.
+    ``--no-ff`` so every task contributes a recorded merge commit. Given a FRESH
+    integration branch started at ``base`` each epoch (enforced by
+    ``epoch_loop._integrate``, which drops any stale same-named branch before a
+    fresh integration) plus disjoint ownership + the scope check, a conflict is
+    structurally impossible, so it is reported (not retried) and the merge is
+    aborted to leave the worktree clean.
     """
 
     merge = _git(worktree, *_GIT_IDENTITY, "merge", "--no-ff", "--no-edit", branch, check=False)

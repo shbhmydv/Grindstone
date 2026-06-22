@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from grindstone.config import PrepareConfig
 from grindstone.contracts.models import (
     CriterionJudgement,
     EpochVerdict,
@@ -704,6 +705,174 @@ def test_semantic_fail_retry_then_clean_pass_completes(git_repo: Path, run_dir: 
 
     handled = [e for e in read_events(run_dir.events_path) if isinstance(e, FailedEpochHandled)]
     assert handled and handled[0].action == "retry"
+
+
+# --- G15 a prepare/dependency-install failure is a SEMANTIC gap, not infra --------
+#
+# The epoch's COMMITTED manifest does not install in a clean environment (e.g. a
+# package.json peer-dependency conflict makes ``npm install`` fail ERESOLVE). That is
+# the worker's work being unbuildable, a DEFECT the planner CAN fix, NOT a verifier-
+# tooling failure. So the prepare failure routes to the planner via handle_failed_epoch
+# (the FULL prepare output persisted by reference at a keyed-log path), it does NOT
+# escalate the whole run to a human dead-end.
+
+
+def _failing_prepare() -> PrepareConfig:
+    """A prepare whose cmd FAILS (so ``materialize_env`` raises PrepareError), with a
+    DISTINCT marker only in the runtime output (so finding it in the persisted log
+    proves the FULL output, not just the cmd text, reached disk)."""
+
+    return PrepareConfig(
+        cmd="echo ERESOLVE-PEER-CONFLICT-MARKER >&2 && exit 1",
+        env_dirs=["node_modules"],
+        cache_key_files=["package-lock.json"],
+    )
+
+
+def _artifact_gate_script(out_key: str, *, dispose: dict[str, object]) -> list[object]:
+    """A skeleton + artifact epoch whose phase gate is ``artifact_exists`` ONLY (no
+    CmdCheck), so the gate needs NO eval worktree and does NOT run ``prepare``: the floor
+    clears, the epoch reaches the agentic pass, and ONLY there does ``_verify_epoch``
+    build its worktree + run the (failing) prepare. ``dispose`` is the planner's
+    disposition for the resulting failed epoch."""
+
+    gate = [{"artifact_exists": out_key}]
+    return [
+        skeleton_decision(
+            phase_dict("P1", title="build", exit_criterion=gate, budget=20),
+            phase_dict("P2", title="done", exit_criterion=gate, budget=20),
+        ),
+        artifact_decision(_artifact_task_with_criteria("T1", out_key, ["the work installs"])),
+        dispose,
+    ]
+
+
+def test_prepare_failure_routes_to_planner_as_semantic_gap_not_infra(
+    git_repo: Path, run_dir: RunDir
+) -> None:
+    """RED-then-green: an epoch whose committed work does not install (prepare fails)
+    routes through handle_failed_epoch (a SEMANTIC gap), NOT an infra dead-end escalation.
+    The planner's halt is reached (failed_epoch_handled fires); the run does NOT escalate
+    with the verifier-tooling 'could not be prepared/built' message."""
+
+    out_key = "P1/E1/T1/manifest.md"
+    verifier = WorkerEpochVerifier(_VerifierWorker(passed=True))  # would pass if asked
+    planner = MockPlanner(
+        script=_artifact_gate_script(
+            out_key,
+            # Only consumed if the prepare failure ROUTES as a semantic gap (the fix);
+            # under the old infra-escalation this decision is never reached.
+            dispose=handle_failed_epoch_halt("the manifest does not install; fix the deps"),
+        )
+    )
+    outcome = run_grind(
+        run_dir, job_path="job.md", planner=planner,
+        ladder=[("local", _ContentArtifactWorker("a manifest\n"))], repo=git_repo,
+        verifier=verifier, prepare=_failing_prepare(),
+    )
+    assert outcome.status == "escalated"  # the planner's halt, not an infra dead-end
+    # The gap routed through the failed-epoch machinery (NOT mis-escalated as infra).
+    from grindstone.events import FailedEpochHandled
+
+    handled = [
+        e for e in read_events(run_dir.events_path) if isinstance(e, FailedEpochHandled)
+    ]
+    assert handled and handled[0].action == "halt"
+    kinds = [e.event for e in read_events(run_dir.events_path)]
+    assert "failed_epoch_handled" in kinds
+    # The verifier was NEVER asked (prepare failed before the verdict pass): the gap is
+    # the unbuildable manifest, not a verdict.
+    assert isinstance(verifier._transport, _VerifierWorker)  # type: ignore[attr-defined]
+    assert verifier._transport.seen_briefs == []  # type: ignore[attr-defined]
+    # The run did NOT escalate with the verifier-tooling message (the old infra path).
+    assert outcome.reason is None or "could not be prepared" not in outcome.reason.lower()
+
+
+def test_prepare_failure_persists_full_output_to_keyed_log_by_reference(
+    git_repo: Path, run_dir: RunDir
+) -> None:
+    """The FULL prepare failure output is persisted to a stable ``P*/E*/...`` keyed-log
+    path (so it shows in log_index/the planner manifest) and the planner-facing gap
+    carries that PATH, never the embedded multi-KB output (reference-not-embed)."""
+
+    marker = "ERESOLVE-PEER-CONFLICT-MARKER"
+    out_key = "P1/E1/T1/manifest.md"
+    verifier = WorkerEpochVerifier(_VerifierWorker(passed=True))
+    planner = _RecordingPlanner(
+        MockPlanner(
+            script=_artifact_gate_script(
+                out_key,
+                dispose=handle_failed_epoch_halt("the manifest does not install; fix the deps"),
+            )
+        )
+    )
+    outcome = run_grind(
+        run_dir, job_path="job.md", planner=planner,
+        ladder=[("local", _ContentArtifactWorker("a manifest\n"))], repo=git_repo,
+        verifier=verifier, prepare=_failing_prepare(),
+    )
+    assert outcome.status == "escalated"
+    # The full prepare failure landed at a P*/E*/... keyed-log path (in the manifest).
+    keys = [k for k in run_dir.log_index() if k.endswith("prepare_failure.txt")]
+    assert keys, "the prepare failure must persist a keyed-log file"
+    persisted = run_dir.resolve(keys[0]).read_text(encoding="utf-8")
+    # The FULL captured output (the failing cmd + its runtime marker) is on disk.
+    assert "prepare failed" in persisted
+    assert marker in persisted
+    # The planner saw the failed-epoch boundary; the gap carries the PATH, the body is
+    # delivered by reference (the runtime marker is NOT embedded in the prompt).
+    failed_prompt = planner.prompts[-1]
+    assert keys[0] in failed_prompt or str(run_dir.resolve(keys[0])) in failed_prompt
+    assert marker not in failed_prompt  # the output body travels by file, not embedded
+
+
+def test_unborn_tip_checkout_failure_still_escalates_as_infra(
+    git_repo: Path, run_dir: RunDir
+) -> None:
+    """The OTHER infra path is untouched: when the integration tip cannot be checked out
+    (unborn HEAD / unresolvable ref) the verifier environment genuinely cannot be built,
+    so the run STILL escalates as infra (the planner cannot fix a missing tip), NOT a
+    semantic gap routed to handle_failed_epoch."""
+
+    import grindstone.run_loop as run_loop_mod
+    from grindstone import worktree as wt
+
+    # An artifact_exists gate needs no eval worktree, so the floor clears WITHOUT calling
+    # add_worktree_detached; the ONLY worktree creation left is _verify_epoch's. Force
+    # THAT to fail (unborn/unresolvable tip) so we exercise the genuine verifier-tooling
+    # infra path in isolation.
+    def _boom_add(repo: Path, worktree: Path, *, ref: str) -> None:
+        raise wt.GitError("simulated unborn HEAD: cannot resolve the integration tip")
+
+    out_key = "P1/E1/T1/manifest.md"
+    verifier = WorkerEpochVerifier(_VerifierWorker(passed=True))
+    planner = MockPlanner(
+        script=[
+            skeleton_decision(
+                phase_dict("P1", title="build", exit_criterion=[{"artifact_exists": out_key}], budget=20),
+                phase_dict("P2", title="done", exit_criterion=[{"artifact_exists": out_key}], budget=20),
+            ),
+            artifact_decision(_artifact_task_with_criteria("T1", out_key, ["c"])),
+            # NO handle_failed_epoch: the core must escalate on its own (infra path).
+        ]
+    )
+    orig = run_loop_mod.wt.add_worktree_detached
+    run_loop_mod.wt.add_worktree_detached = _boom_add  # type: ignore[assignment]
+    try:
+        outcome = run_grind(
+            run_dir, job_path="job.md", planner=planner,
+            ladder=[("local", _ContentArtifactWorker("a manifest\n"))], repo=git_repo,
+            verifier=verifier,
+        )
+    finally:
+        run_loop_mod.wt.add_worktree_detached = orig  # type: ignore[assignment]
+    assert outcome.status == "escalated"
+    kinds = [e.event for e in read_events(run_dir.events_path)]
+    # An infra escalation: NOT charged as a semantic gap.
+    assert "failed_epoch_handled" not in kinds
+    assert "epoch_verification_failed" not in kinds
+    assert outcome.reason is not None
+    assert "integration tip" in outcome.reason.lower()
 
 
 def test_persistent_malformed_verdict_escalates_as_infra_not_semantic(

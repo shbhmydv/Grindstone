@@ -1352,9 +1352,11 @@ VERIFIER_MAX_ATTEMPTS = 2
 class _VerificationInfraFailure:
     """A verification-INFRASTRUCTURE failure (G6 Part B): the deterministic floor and
     the worker handoff were honest, but the verification TOOLING could not produce a
-    valid verdict after the bounded re-runs (or the eval environment could not be set
-    up). Distinct from a semantic gap: the core escalates the run with this clear
-    message instead of mis-blaming the worker via ``handle_failed_epoch``."""
+    valid verdict after the bounded re-runs, OR the integration tip could not be checked
+    out (unborn / unresolvable ref). Distinct from a semantic gap the planner can fix:
+    the core escalates the run with this clear message instead of mis-blaming the worker
+    via ``handle_failed_epoch``. A prepare/dependency-install failure is NOT this: that is
+    the COMMITTED work failing to build, a defect routed to the planner as a gap."""
 
     message: str
 
@@ -1379,13 +1381,20 @@ def _verify_epoch(
 
     Three classified returns:
     - ``[]`` on a clean pass (every criterion met).
-    - a non-empty gap list on a well-formed ``pass=false`` verdict (a SEMANTIC gap,
-      routed through ``handle_failed_epoch`` unchanged).
-    - a ``_VerificationInfraFailure`` when the verifier could not produce a valid
-      verdict after ``VERIFIER_MAX_ATTEMPTS`` re-runs, or the eval environment could
-      not be set up (a verification-INFRASTRUCTURE failure: the floor passed, the
-      worker is honest, the TOOLING failed). The caller escalates, never charging it
-      to the worker as a semantic gap (G6 Part B).
+    - a non-empty gap list (``list[str]``), routed through ``handle_failed_epoch`` to the
+      planner. Two sources: a well-formed ``pass=false`` verdict (the verifier found a
+      SEMANTIC gap), OR a prepare/dependency-install failure (the epoch's COMMITTED work
+      does not build in a clean environment, e.g. a peer-dep conflict). The latter is a
+      DEFECT the planner can fix (fix the manifest), not a tooling failure: its FULL
+      prepare output is persisted to a keyed-log path and the gap carries that PATH (read
+      by reference). Both fall through to the failed-epoch disposition (which climbs the
+      cap, so even an unfixable prepare failure terminates deterministically).
+    - a ``_VerificationInfraFailure`` ONLY for a genuine verifier-TOOLING failure the
+      planner cannot fix: the verifier could not produce a valid verdict after
+      ``VERIFIER_MAX_ATTEMPTS`` re-runs (G6 Part B), or the integration tip could not be
+      checked out (unborn / unresolvable ref). The floor passed and the worker is honest;
+      the caller escalates rather than charging the worker. A prepare failure is NOT this
+      (it IS the worker's work, so it routes as a gap above).
 
     The deterministic floor already cleared (no task failed), so this pass can only
     fail the epoch, never rubber-stamp it."""
@@ -1427,11 +1436,19 @@ def _verify_epoch(
         try:
             materialize_env(repo, worktree, prepare)
         except PrepareError as exc:
-            # Materializing the eval deps failed: infrastructure, not a semantic gap.
-            return _VerificationInfraFailure(
-                f"verification environment could not be prepared: {exc}; "
-                f"the deterministic floor passed, the eval environment could not be built"
-            )
+            # The epoch's COMMITTED manifest does not install in a clean environment
+            # (e.g. a package.json peer-dependency conflict makes `npm install` fail
+            # ERESOLVE). That is the worker's WORK being unbuildable, a DEFECT the
+            # planner can fix, NOT a verifier-tooling failure: route it as a SEMANTIC
+            # gap (through handle_failed_epoch), never a human dead-end escalation. The
+            # FULL prepare output is persisted to a keyed-log path so it reaches the
+            # planner BY REFERENCE (the gap carries the PATH, not the multi-KB body).
+            keyed = _persist_prepare_failure(run_dir, phase_id, outcome.epoch_id, str(exc))
+            return [
+                f"the epoch's committed code does not install in a clean environment: "
+                f"the prepare step failed (see {keyed}); fix the dependency manifest so "
+                f"it installs cleanly"
+            ]
         verdict = _verify_with_retries(
             verifier, worktree, brief, phase_id, outcome, run_dir
         )
@@ -1471,6 +1488,24 @@ def _verdict_log_key(phase_id: str, epoch_id: str) -> str:
     the ``<workspace>`` manifest, where the planner reads it BY REFERENCE."""
 
     return f"{phase_id}/{epoch_id}/verdict.json"
+
+
+def _persist_prepare_failure(
+    run_dir: RunDir, phase_id: str, epoch_id: str, output: str
+) -> str:
+    """Persist a verification prepare/dependency-install failure under a keyed-log path.
+
+    A ``P*/E*/prepare_failure.txt`` key so the relocated record shows up in
+    ``log_index()`` and thus in the ``<workspace>`` manifest, where the planner reads the
+    FULL failing output BY REFERENCE (the gap string carries this key, never the multi-KB
+    body). The full ``output`` (the failing cmd + its captured stdout/stderr, already in
+    the PrepareError text) is written verbatim, no byte cap. Returns the log key."""
+
+    key = f"{phase_id}/{epoch_id}/prepare_failure.txt"
+    dest = run_dir.resolve(key)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(output + "\n", encoding="utf-8")
+    return key
 
 
 def _verify_with_retries(
@@ -1776,7 +1811,7 @@ def _run_one_infra_repair(
     tip = store.state.last_integration_branch or "HEAD"
     base_commit = wt.resolve_commit(repo, tip)
     worktree = run_dir.root / "worktrees" / f"_infra_repair_{attempt}"
-    branch = f"grind/infra-repair-{attempt}"
+    branch = f"grind/{run_dir.root.name}/infra-repair-{attempt}"
     failing_cmds = [r.cmd for r in failing if r.cmd is not None]
     output_tail = "\n\n".join(r.label for r in failing)
     journal.emit(

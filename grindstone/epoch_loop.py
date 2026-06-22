@@ -16,9 +16,11 @@ REAL, taken from the typed ``ImplementEpochArgs`` / ``ArtifactEpochArgs``.
     done-predicate -> task queue empty AND nothing in flight (an explicit
       predicate over the epoch state, the S3 loop's gate, not a pool join).
     integration    -> merge every DONE task's branch, in task order, into the
-      epoch integration branch. Disjoint ownership + scope check make conflicts
-      impossible by construction, so ANY conflict aborts the epoch as
-      ``integration_conflict`` (a structural bug, never retried).
+      epoch integration branch (started fresh at the epoch base each epoch, so a
+      stale same-named leftover never poisons it). Disjoint ownership + scope
+      check then make conflicts impossible by construction, so ANY conflict
+      aborts the epoch as ``integration_conflict`` (a structural bug, never
+      retried).
     epoch_completed -> EpochOutcome (returned + serialized to outcome.json).
 
 Determinism contract: per-task event ORDER is causal and tested; cross-task
@@ -363,11 +365,22 @@ def _integrate(
 ) -> IntegrationOutcome:
     """Fast-forward-merge each DONE task's branch into the integration branch.
 
-    Idempotent for resume: a branch already merged is an ancestor of the
-    integration branch (or has been deleted) and is skipped. Any conflict aborts
-    the epoch, disjointness makes it structurally impossible.
+    A fresh integration (nothing merged yet) starts from ``base``: any stale
+    same-named branch (the name is not run-scoped) is dropped first so prior-run
+    content cannot poison the merge. Idempotent for resume: when progress exists
+    (``merged`` non-empty) the branch is kept, and a branch already merged is an
+    ancestor of the integration branch (or has been deleted) and is skipped. Any
+    conflict aborts the epoch; given the fresh-base precondition + disjointness it
+    is structurally impossible.
     """
 
+    # A fresh integration (nothing merged yet) must start from `base`. The
+    # internal integration branch name is not run-scoped, so a same-named branch
+    # left by a prior run or a prior attempt would silently poison the merge with
+    # stale content (a phantom both-added conflict). Drop it first. On resume
+    # mid-integration (merged non-empty) the branch carries real progress: keep it.
+    if not store.state.integration.merged:
+        wt.delete_branch(repo, branch)
     wt.ensure_integration_branch(repo, branch, base)
     merged: list[str] = list(store.state.integration.merged)
 
@@ -515,12 +528,13 @@ def run_epoch(
 
     tasks: list[Task] = list(args.tasks)
     ordered_ids = [t.id for t in tasks]
-    identities = {t.id: TaskIdentity(phase_id, epoch_id, t.id) for t in tasks}
+    run_id = run_dir.root.name
+    identities = {t.id: TaskIdentity(run_id, phase_id, epoch_id, t.id) for t in tasks}
     if is_implement and repo is not None:
         base = base if base is not None else wt.head_commit(repo)
     else:
         base = None
-    integration_branch = f"grind/{phase_id}/{epoch_id}/_integration" if is_implement else None
+    integration_branch = f"grind/{run_id}/{phase_id}/{epoch_id}/_integration" if is_implement else None
 
     state = EpochState(
         phase_id=phase_id,
@@ -607,7 +621,8 @@ def resume_epoch(
     task_by_id: dict[str, Task] = {t.id: t for t in args.tasks}
     ordered_ids = [t.id for t in args.tasks]
     identities = {
-        tid: TaskIdentity(state.phase_id, state.epoch_id, tid) for tid in state.tasks
+        tid: TaskIdentity(run_dir.root.name, state.phase_id, state.epoch_id, tid)
+        for tid in state.tasks
     }
 
     store = _EpochStateStore(run_dir, state)
