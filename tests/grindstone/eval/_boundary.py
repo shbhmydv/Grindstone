@@ -3,10 +3,21 @@
 ``run_planner_boundary`` is the eval's single live entry point: given a job spec +
 a rig, it constructs the SAME planner input the run loop builds, arms the SAME
 self-validation context the run loop arms (``check_decision.write_validator``),
-invokes the rig's real ``planner_request.sh`` in self-validate mode, reads the
-``decision.json`` the planner ground out, and runs it through the SAME core gate
-(``validate_decision``). It returns the validated, typed ``EpochDecision`` (or
-raises with the gate errors + the raw output for debugging).
+invokes the rig's real ``planner_request.sh`` in self-validate mode, reads back the
+decision via the SAME read priority the orchestrator uses, and runs it through the
+SAME core gate (``validate_decision``). It returns the validated, typed
+``EpochDecision`` (or raises with the gate errors + the raw output for debugging).
+
+The decision READ here mirrors ``grindstone.script_planner.ScriptPlanner._dispatch``
+exactly: the decision text is taken from a priority chain, not from
+``decision.json`` alone, so the eval accepts precisely what the orchestrator would.
+The chain is (1) ``workdir/decision.json`` if it exists and is non-empty after
+strip (the self-validating rig's disk contract), (2) else the ``--out`` file if it
+exists and is non-empty (the rig's final message), (3) else the script's stdout.
+When the winning source is NOT ``decision.json`` the boundary still succeeds, but
+emits a ``warnings.warn`` so the self-validate-on-disk reliability gap stays visible
+without failing the eval: falling back to ``--out`` means the model skipped the
+on-disk grounding loop, a quality signal, not a correctness failure.
 
 The gate CONTEXT here is a faithful copy of ``run_loop._arm_self_validation`` +
 ``run_loop._plan_boundary_loop``: the exact eight keys ``write_validator`` bakes,
@@ -24,6 +35,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import tempfile
+import warnings
 from pathlib import Path
 
 from grindstone import check_decision
@@ -78,9 +90,10 @@ def run_planner_boundary(
 
     Replicates ``run_loop._plan_boundary``: derive the boundary signals, arm the
     self-validation context, build the planner input, invoke the rig's real planner
-    script in self-validate mode (``--workdir``), read back ``decision.json``, and
-    gate it. Raises ``BoundaryError`` (with gate errors + raw output) when no
-    gate-clean decision is produced."""
+    script in self-validate mode (``--workdir``), read back the decision via the same
+    priority chain ``ScriptPlanner._dispatch`` uses (decision.json -> --out -> stdout),
+    and gate it. Raises ``BoundaryError`` (with gate errors + every captured source)
+    when no gate-clean decision is produced."""
 
     skeleton_exists = skeleton is not None
     failed_epoch_active = failed_epoch is not None
@@ -147,15 +160,10 @@ def run_planner_boundary(
             timeout=timeout + 60,
         )
 
-        raw_out = out_file.read_text(encoding="utf-8") if out_file.is_file() else ""
         decision_file = workdir / check_decision.DECISION_FILE
-        if not decision_file.is_file():
-            raise BoundaryError(
-                f"rig {rig!r} planner wrote no {check_decision.DECISION_FILE} "
-                f"(script exit {proc.returncode}).\nstderr:\n{proc.stderr}\n"
-                f"planner out:\n{raw_out}"
-            )
-        decision_text = decision_file.read_text(encoding="utf-8")
+        decision_text, source = _select_decision_text(
+            decision_file, out_file, proc.stdout
+        )
 
         gate = validate_decision(
             extract_decision_json(decision_text),
@@ -169,11 +177,50 @@ def run_planner_boundary(
             senior_max_task_files=DEFAULT_SENIOR_MAX_TASK_FILES,
         )
         if gate.decision is None:
+            raw_out = (
+                out_file.read_text(encoding="utf-8") if out_file.is_file() else ""
+            )
             raise BoundaryError(
-                f"rig {rig!r} decision failed the core gate: {gate.errors}\n"
-                f"raw decision.json:\n{decision_text}"
+                f"rig {rig!r} produced no gate-clean decision "
+                f"(chosen source {source!r}, script exit {proc.returncode}): "
+                f"{gate.errors}\n"
+                f"chosen decision text:\n{decision_text}\n"
+                f"--out:\n{raw_out}\n"
+                f"stdout:\n{proc.stdout}\n"
+                f"stderr:\n{proc.stderr}"
+            )
+        if source != "decision_json":
+            warnings.warn(
+                f"rig {rig!r} did not self-validate on disk: no gate-clean "
+                f"{check_decision.DECISION_FILE} in the workdir; the gate-clean "
+                f"decision came from the {source!r} fallback. The orchestrator "
+                f"accepts this, but the on-disk self-validate loop was skipped "
+                f"(a quality signal, not a correctness failure).",
+                stacklevel=2,
             )
         return gate.decision
+
+
+def _select_decision_text(
+    decision_file: Path, out_file: Path, stdout: str
+) -> tuple[str, str]:
+    """Pick the decision text + its source, mirroring ``ScriptPlanner._dispatch``.
+
+    Priority, exactly as the orchestrator reads it: (1) ``decision_file`` if it
+    exists and is non-empty after strip (the self-validating rig's disk contract);
+    (2) else ``out_file`` if it exists and is non-empty (the rig's final message);
+    (3) else ``stdout``. Returns ``(text, source)`` where ``source`` is one of
+    ``"decision_json"``, ``"out_file"``, ``"stdout"``."""
+
+    if decision_file.is_file():
+        text = decision_file.read_text(encoding="utf-8")
+        if text.strip():
+            return text, "decision_json"
+    if out_file.is_file():
+        text = out_file.read_text(encoding="utf-8")
+        if text:
+            return text, "out_file"
+    return stdout, "stdout"
 
 
 def _init_temp_repo(path: Path) -> Path:
