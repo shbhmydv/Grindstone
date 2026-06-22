@@ -240,3 +240,49 @@ def test_prior_failures_carries_no_embedded_bulk() -> None:
     # The whole prior_failures block stays small (kilobytes, never the megabyte bulk).
     block = prompt.split("<prior_failures>", 1)[1].split("</prior_failures>", 1)[0]
     assert len(block) < 2048
+
+
+# --- domain skills: selected-only delivery in the worker prompt -----------------
+
+
+def test_skills_field_round_trips_on_tasks() -> None:
+    """The optional ``skills`` field is accepted + preserved on both task shapes."""
+
+    impl = ImplementTask(
+        id="T1", goal="g", done_when=[CmdCheck(cmd="true")],
+        file_ownership=["a.py"], skills=["rn-nav", "rn-a11y"],
+    )
+    art = ArtifactTask(
+        id="T1", goal="g", done_when=[CmdCheck(cmd="true")],
+        artifact_out="r.md", skills=["rn-nav"],
+    )
+    assert impl.skills == ["rn-nav", "rn-a11y"]
+    assert art.skills == ["rn-nav"]
+    # Default is an empty list (a task that selected none).
+    assert ImplementTask(
+        id="T2", goal="g", done_when=[CmdCheck(cmd="true")], file_ownership=["b.py"]
+    ).skills == []
+
+
+def test_worker_prompt_composes_only_selected_domain_skills() -> None:
+    """Retrieve-not-concatenate: the prompt carries ONLY the skills in
+    request.domain_skills (already the selected subset), each under its named tag."""
+
+    request = WorkerRequest(
+        task=ImplementTask(
+            id="T1", goal="g", done_when=[CmdCheck(cmd="true")],
+            file_ownership=["a.py"], skills=["rn-nav"],
+        ),
+        task_id="P1/E1/T1", inputs={}, scratch=Path("/tmp/s"),
+        attempt=1, failure_context=[], mode="implement",
+        domain_skills={"rn-nav": "NAV BODY TEXT"},
+    )
+    prompt = build_worker_prompt(request)
+    assert "<domain_skills>" in prompt
+    assert '<skill name="rn-nav">' in prompt
+    assert "NAV BODY TEXT" in prompt
+
+
+def test_worker_prompt_has_no_domain_skills_block_when_empty() -> None:
+    request = _implement_request()  # no domain_skills -> empty dict default
+    assert "<domain_skills>" not in build_worker_prompt(request)

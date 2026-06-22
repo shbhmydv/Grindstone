@@ -244,11 +244,38 @@ def content_grep_check_violations(tasks: list[_TaskBase]) -> list[str]:
     return out
 
 
+def unknown_skill_violations(
+    tasks: list[_TaskBase], *, known_skill_names: frozenset[str]
+) -> list[str]:
+    """Reject any task ``skills`` name not in the target repo's domain catalogue.
+
+    A task selects domain skills (``.grindstone/skills/<name>.md``) by NAME; the
+    planner cannot hallucinate one, every selected name must be a key the catalogue
+    index advertised (``domain_skills.load_domain_skill_index``). The known set is
+    threaded into the gate by the run loop; an EMPTY set (the default, and the case
+    for a repo with no catalogue) means NO name is known, so any selected skill is
+    rejected, which is exactly "no catalogue -> ``skills`` must be empty". The
+    rejection names the offending task + skill so the re-ask steers the planner.
+    """
+
+    out: list[str] = []
+    for task in tasks:
+        for name in task.skills:
+            if name not in known_skill_names:
+                out.append(
+                    f"task {task.id}: unknown domain skill {name!r} (not in the "
+                    f"target repo's .grindstone/skills/index.md catalogue); select "
+                    f"only skills the index advertises, or none"
+                )
+    return out
+
+
 def epoch_decision_violations(
     decision: EpochDecision,
     *,
     existing_log_keys: frozenset[str],
     completed_phase_ids: frozenset[str],
+    known_skill_names: frozenset[str] = frozenset(),
 ) -> list[str]:
     """All semantic violations for one planner decision (empty = pass)."""
 
@@ -257,6 +284,9 @@ def epoch_decision_violations(
     if isinstance(args, (ImplementEpochArgs, ArtifactEpochArgs)):
         out += _inputs_exist(list(args.tasks), existing_log_keys)
         out += _unique_task_ids(list(args.tasks))
+        out += unknown_skill_violations(
+            list(args.tasks), known_skill_names=known_skill_names
+        )
     if isinstance(args, ImplementEpochArgs):
         out += _ownership_disjoint(list(args.tasks))
     if isinstance(decision, ReviewDecision):

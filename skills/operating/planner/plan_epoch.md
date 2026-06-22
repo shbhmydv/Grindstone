@@ -37,6 +37,11 @@ escalate_run / complete_run.
   design bar. The state machine renders the verdict deterministically (a failed
   taste verdict fails the phase, just like a failed command), it is not a task
   `done_when` (a worker scratch has no renderer/screenshot).
+- Domain skills: when a `<domain_skills>` catalogue is shown above, attach the
+  relevant skills to a task by listing their NAMES in that task's `skills` field;
+  the core delivers the selected skill text into that task's worker. Keep selection
+  MINIMAL, name only the skills a task actually needs (none is fine), and never a
+  name the catalogue does not advertise (the gate rejects an unknown skill).
 - done_when is scoped by mode. research/review/artifact tasks run in a scratch
   dir that is NOT a repo checkout: their done_when must verify the
   artifact itself (e.g. `test -s notes.md` in the task CWD, or an

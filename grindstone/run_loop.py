@@ -75,6 +75,7 @@ from grindstone.script_polish import Polisher
 from grindstone.script_vision import VisionReviewError, VisionReviewer
 from grindstone.verify import EpochVerifier, VerificationError
 from grindstone.contracts.semantics import HandoffMode
+from grindstone.domain_skills import load_domain_skill_index
 from grindstone.epoch_loop import EpochArgs, EpochOutcome, resume_epoch, run_epoch
 from grindstone.journal import reap_sibling_journals, write_journal
 from grindstone.memory import load_digest
@@ -896,6 +897,7 @@ def _arm_self_validation(
     has_senior: bool,
     local_max_task_files: int,
     senior_max_task_files: int,
+    known_skill_names: frozenset[str],
 ) -> None:
     """Drop ``check_decision.py`` + its context into the planner worktree.
 
@@ -919,6 +921,7 @@ def _arm_self_validation(
         "has_senior": has_senior,
         "local_max_task_files": local_max_task_files,
         "senior_max_task_files": senior_max_task_files,
+        "known_skill_names": sorted(known_skill_names),
     }
     try:
         check_decision.write_validator(
@@ -948,6 +951,7 @@ def _plan_boundary(
     has_senior: bool,
     local_max_task_files: int,
     senior_max_task_files: int,
+    domain_skill_index: dict[str, str],
 ) -> _Boundary:
     """Drive planner calls at one epoch boundary to a dispatchable decision.
 
@@ -997,12 +1001,13 @@ def _plan_boundary(
         _arm_self_validation(
             workspace, store, run_dir, completed_phase_ids, phase_ctx, failed_epoch,
             has_senior, local_max_task_files, senior_max_task_files,
+            frozenset(domain_skill_index),
         )
         return _plan_boundary_loop(
             journal, store, run_dir, planner, sleep_fn, repo, last_epoch_rows,
             max_planner_calls, phase_ctx, completed_phase_ids, vision_reviewer,
             prepare, floor, failed_epoch, has_senior, local_max_task_files,
-            senior_max_task_files, workspace=workspace,
+            senior_max_task_files, domain_skill_index, workspace=workspace,
             reasks=reasks, reask_errors=reask_errors,
         )
     finally:
@@ -1027,6 +1032,7 @@ def _plan_boundary_loop(
     has_senior: bool,
     local_max_task_files: int,
     senior_max_task_files: int,
+    domain_skill_index: dict[str, str],
     *,
     workspace: WorkspaceInfo | None,
     reasks: int,
@@ -1048,6 +1054,7 @@ def _plan_boundary_loop(
             repo_memory=store.state.repo_memory,
             failed_epoch=failed_epoch,
             workspace=workspace,
+            domain_skill_index=domain_skill_index,
         )
         try:
             raw = _transport_call(
@@ -1069,6 +1076,7 @@ def _plan_boundary_loop(
             has_senior=has_senior,
             local_max_task_files=local_max_task_files,
             senior_max_task_files=senior_max_task_files,
+            known_skill_names=frozenset(domain_skill_index),
         )
         if gate.decision is None:
             journal.emit(
@@ -2283,6 +2291,11 @@ def _drive(
     # A ``senior`` tier in the ladder means a visual implement epoch starts on
     # senior, so the size gate applies the senior file-count bound to it.
     has_senior = any(name == "senior" for name, _ in ladder)
+    # The target repo's DOMAIN-skill catalogue (name -> one-line description), read
+    # ONCE per run-loop entry: the planner sees this index to SELECT skills per task,
+    # and its names bound what the gate accepts. Empty when there is no repo or no
+    # ``.grindstone/skills/index.md`` (most repos) -> a graceful no-op everywhere.
+    domain_skill_index = load_domain_skill_index(repo) if repo is not None else {}
     while True:
         if max_epochs is not None and store.state.epoch_counter >= max_epochs:
             return _fail_valve(journal, store, f"safety valve: {max_epochs} epochs reached")
@@ -2351,6 +2364,7 @@ def _drive(
             has_senior,
             local_max_task_files,
             senior_max_task_files,
+            domain_skill_index,
         )
         if boundary.kind == "escalate":
             return _escalate(journal, store, boundary.reason or "planner escalated")

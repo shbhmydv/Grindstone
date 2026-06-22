@@ -40,6 +40,7 @@ from pydantic import BaseModel, ConfigDict
 
 from grindstone.check_handoff import CHECK_COMMAND, CHECK_SCRIPT_NAME, generate_check_script
 from grindstone.config import PrepareConfig
+from grindstone.domain_skills import load_domain_skill
 from grindstone.prepare import materialize_env
 from grindstone.contracts.gate import handoff_schema_errors
 from grindstone.contracts.models import (
@@ -647,6 +648,28 @@ def _worker_subtree(repo: Path | None, task: Task) -> str | None:
     return None
 
 
+def _load_domain_skills(repo: Path | None, task: Task) -> dict[str, str]:
+    """The SELECTED domain skills' text for this task (name -> ``.md`` body).
+
+    Retrieve-not-concatenate: load ONLY the skills the planner named in
+    ``task.skills`` from the target repo's ``.grindstone/skills/`` catalogue. Empty
+    when the task selected none, or when there is no repo (an artifact task with no
+    target repo cannot resolve a catalogue). A named-but-missing skill is a clean
+    FAILED attempt (``_AttemptFailed``), not a crash: the gate already rejects a name
+    absent from the catalogue index, so this only fires on an index/file mismatch.
+    """
+
+    if repo is None or not task.skills:
+        return {}
+    out: dict[str, str] = {}
+    for name in task.skills:
+        try:
+            out[name] = load_domain_skill(repo, name)
+        except (FileNotFoundError, ValueError) as exc:
+            raise _AttemptFailed(f"domain skill {name!r} could not be loaded: {exc}") from exc
+    return out
+
+
 def _dispatch_attempt(
     *,
     identity: TaskIdentity,
@@ -695,6 +718,7 @@ def _dispatch_attempt(
         failure_context=list(cursor.failure_context),
         mode=mode,
         repo_map=_worker_subtree(repo, task),
+        domain_skills=_load_domain_skills(repo, task),
     )
     try:
         worker.run(request)

@@ -41,6 +41,7 @@ from pathlib import Path
 from grindstone import check_decision
 from grindstone.config import RoleConfig, resolve_role_script
 from grindstone.contracts.models import EpochDecision, Phase
+from grindstone.domain_skills import load_domain_skill_index
 from grindstone.planner import (
     DEFAULT_LOCAL_MAX_TASK_FILES,
     DEFAULT_SENIOR_MAX_TASK_FILES,
@@ -98,9 +99,14 @@ def run_planner_boundary(
     skeleton_exists = skeleton is not None
     failed_epoch_active = failed_epoch is not None
     completed = sorted(completed_phase_ids)
-    # The eight-key gate context, byte-for-byte the set run_loop._arm_self_validation
-    # bakes via write_validator (existing_log_keys empty: a fresh eval boundary has no
-    # keyed log; phase_escalated False: the eval never drives a budget-exhausted phase).
+    # The target repo's domain-skill catalogue (empty for the common eval repo with
+    # no .grindstone/skills/index.md): the planner sees the index, the gate bounds
+    # selection by its names, mirroring run_loop.
+    domain_skill_index = load_domain_skill_index(repo) if repo is not None else {}
+    known_skill_names = frozenset(domain_skill_index)
+    # The gate context, byte-for-byte the set run_loop._arm_self_validation bakes via
+    # write_validator (existing_log_keys empty: a fresh eval boundary has no keyed
+    # log; phase_escalated False: the eval never drives a budget-exhausted phase).
     context: dict[str, object] = {
         "existing_log_keys": [],
         "completed_phase_ids": completed,
@@ -110,6 +116,7 @@ def run_planner_boundary(
         "has_senior": has_senior,
         "local_max_task_files": DEFAULT_LOCAL_MAX_TASK_FILES,
         "senior_max_task_files": DEFAULT_SENIOR_MAX_TASK_FILES,
+        "known_skill_names": sorted(known_skill_names),
     }
 
     script = resolve_role_script(
@@ -139,6 +146,7 @@ def run_planner_boundary(
             last_epoch_rows=None,
             reask_errors=[],
             failed_epoch=failed_epoch,
+            domain_skill_index=domain_skill_index,
         )
         prompt_file = scratch / "prompt.txt"
         prompt_file.write_text(prompt, encoding="utf-8")
@@ -175,6 +183,7 @@ def run_planner_boundary(
             has_senior=has_senior,
             local_max_task_files=DEFAULT_LOCAL_MAX_TASK_FILES,
             senior_max_task_files=DEFAULT_SENIOR_MAX_TASK_FILES,
+            known_skill_names=known_skill_names,
         )
         if gate.decision is None:
             raw_out = (

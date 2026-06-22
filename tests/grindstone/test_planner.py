@@ -788,3 +788,85 @@ def test_preamble_teaches_three_level_skill_split() -> None:
     assert "lockfile" in _plan_epoch()
     # The size gate is advertised in the task-level guidance.
     assert "SIZE GATE" in _plan_epoch()
+
+
+# --- domain skills: planner index block + skill-name gate ----------------------
+
+
+def test_domain_skills_block_renders_index_when_present() -> None:
+    """A non-empty catalogue index renders a <domain_skills> selection block in the
+    volatile tail (name + description), instructing minimal per-task selection."""
+
+    index = {
+        "rn-nav": "React Navigation patterns; use when wiring screens.",
+        "rn-a11y": "accessibility; screen-reader / contrast work.",
+    }
+    prompt = build_planner_input(
+        job=_JOB, skeleton=_phases("P1", "P2"), phase_id="P1", epoch_counter=1,
+        log_index=[], last_epoch_rows=None, reask_errors=[],
+        domain_skill_index=index,
+    )
+    # Sentinel distinct from the plan_epoch scenario nudge (which mentions the tag).
+    assert "Domain skills this target repo provides" in prompt
+    assert "rn-nav: React Navigation patterns" in prompt
+    assert "rn-a11y: accessibility" in prompt
+
+
+def test_domain_skills_block_absent_when_index_empty() -> None:
+    """No catalogue (the common case) renders no block at all, byte-clean no-op."""
+
+    _SENTINEL = "Domain skills this target repo provides"
+    prompt = build_planner_input(
+        job=_JOB, skeleton=_phases("P1", "P2"), phase_id="P1", epoch_counter=1,
+        log_index=[], last_epoch_rows=None, reask_errors=[],
+    )
+    assert _SENTINEL not in prompt
+    # And explicitly passing an empty index is identical (no block).
+    empty = build_planner_input(
+        job=_JOB, skeleton=_phases("P1", "P2"), phase_id="P1", epoch_counter=1,
+        log_index=[], last_epoch_rows=None, reask_errors=[],
+        domain_skill_index={},
+    )
+    assert _SENTINEL not in empty
+
+
+def _impl_with_skills(tid: str, fname: str, skills: list[str]) -> dict[str, object]:
+    return {**impl_task(tid, fname), "skills": skills}
+
+
+def test_gate_rejects_unknown_skill_name() -> None:
+    # A task naming a skill the catalogue does not advertise is rejected, the
+    # offending task + skill are named so the re-ask steers the planner.
+    dec = implement_decision(_impl_with_skills("T1", "f1.txt", ["ghost-skill"]))
+    res = validate_decision(
+        json.dumps(dec), existing_log_keys=_EMPTY, completed_phase_ids=_EMPTY,
+        skeleton_exists=True, known_skill_names=frozenset({"rn-nav"}),
+    )
+    assert res.decision is None
+    assert any("ghost-skill" in e and "T1" in e for e in res.errors)
+
+
+def test_gate_accepts_known_skill_name() -> None:
+    dec = implement_decision(_impl_with_skills("T1", "f1.txt", ["rn-nav"]))
+    res = validate_decision(
+        json.dumps(dec), existing_log_keys=_EMPTY, completed_phase_ids=_EMPTY,
+        skeleton_exists=True, known_skill_names=frozenset({"rn-nav", "rn-a11y"}),
+    )
+    assert res.errors == []
+    assert res.decision is not None and res.decision.tool == "implement"
+
+
+def test_gate_no_catalogue_means_skills_must_be_empty() -> None:
+    # Default known set is empty (no catalogue): a task may select NO skill...
+    ok = validate_decision(
+        json.dumps(implement_decision(impl_task("T1", "f1.txt"))),
+        existing_log_keys=_EMPTY, completed_phase_ids=_EMPTY, skeleton_exists=True,
+    )
+    assert ok.errors == [] and ok.decision is not None
+    # ...but naming any skill with no catalogue is rejected.
+    bad = validate_decision(
+        json.dumps(implement_decision(_impl_with_skills("T1", "f1.txt", ["rn-nav"]))),
+        existing_log_keys=_EMPTY, completed_phase_ids=_EMPTY, skeleton_exists=True,
+    )
+    assert bad.decision is None
+    assert any("rn-nav" in e for e in bad.errors)

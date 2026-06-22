@@ -14,7 +14,7 @@ kills) lives in the transport, never in the loop (§10).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, Union
 
@@ -89,6 +89,13 @@ class WorkerRequest:
     #: files (a navigation aid for large repos). ``None`` below threshold / on any
     #: failure / for tasks with no seed files; rendered only when present.
     repo_map: str | None = None
+    #: The SELECTED domain skills for this task (name -> the ``.md`` text), loaded
+    #: by ``task_loop`` from the target repo's ``.grindstone/skills/`` catalogue for
+    #: each name in ``task.skills``. Retrieve-not-concatenate: only the skills the
+    #: planner selected for THIS task ride here, never the whole catalogue. Empty
+    #: for a task that selected none / a repo with no catalogue (the common case);
+    #: rendered as a ``<domain_skills>`` block only when present.
+    domain_skills: dict[str, str] = field(default_factory=dict)
     #: An INFRA-REPAIR brief (gate-rebalance G3): when set, the dispatch is not a
     #: feature task but a focused senior repair of a structurally-broken gate
     #: ENVIRONMENT. Carrying it on the request keeps the transport unchanged, the
@@ -253,6 +260,28 @@ def _review_targets_block(task: ArtifactTask) -> str:
 """
 
 
+def _domain_skills_block(request: WorkerRequest) -> str:
+    """Compose the SELECTED domain skills into a ``<domain_skills>`` block (pure).
+
+    Retrieve-not-concatenate: ``request.domain_skills`` already holds ONLY the
+    skills the planner selected for this task (the loader fetched them in
+    ``task_loop``); the worker never sees the whole catalogue. Each skill is its
+    repo-authored ``.md`` text under a named child tag. Empty -> empty string.
+    """
+
+    if not request.domain_skills:
+        return ""
+    blocks = "\n".join(
+        f'<skill name="{name}">\n{text}\n</skill>'
+        for name, text in sorted(request.domain_skills.items())
+    )
+    return (
+        "\n<domain_skills>\nRepo-specific skills selected for this task. Treat them "
+        "as authoritative guidance for THIS repo's conventions and patterns:\n"
+        f"{blocks}\n</domain_skills>\n"
+    )
+
+
 def build_worker_prompt(request: WorkerRequest) -> str:
     """Construct the worker prompt (pure function, no pi, no I/O).
 
@@ -297,6 +326,7 @@ def build_worker_prompt(request: WorkerRequest) -> str:
         occupancy_line = (
             "  - occupancy: {\"compacted\": <bool>, \"subagent_splits\": <int>}."
         )
+    domain_skills_block = _domain_skills_block(request)
     context_block = ""
     if request.failure_context:
         joined = "\n".join(f"  - {c}" for c in request.failure_context)
@@ -327,7 +357,7 @@ def build_worker_prompt(request: WorkerRequest) -> str:
 These deterministic checks will be re-run by the orchestrator. They MUST pass:
 {_render_checks(request)}
 </done_when>
-{plan_block}{context_block}
+{plan_block}{domain_skills_block}{context_block}
 <stop_rule>
 If the done_when checks cannot be satisfied in THIS verification environment (a
 required tool/dependency is missing, or the task as specified is not achievable

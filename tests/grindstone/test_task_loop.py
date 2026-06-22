@@ -1121,3 +1121,69 @@ def test_done_when_failure_feedback_references_persisted_detail(
     assert "rejected handoff:" in entry  # the handoff was copied + referenced
     handoff_str = entry.split("rejected handoff: ", 1)[1].split("]", 1)[0].strip()
     assert Path(handoff_str).is_file()  # the rejected handoff exists on disk
+
+
+# --- domain skills: task_loop loads + delivers the selected skills --------------
+
+
+class _SkillSpyWorker:
+    """An ok worker that records the domain_skills delivered on its request."""
+
+    def __init__(self) -> None:
+        self.seen: dict[str, str] = {}
+
+    def run(self, request: WorkerRequest) -> None:
+        self.seen = dict(request.domain_skills)
+        (request.scratch / "review.md").write_text("reviewed\n", encoding="utf-8")
+        (request.scratch / OUT_FILE).write_text(OUT_CONTENT, encoding="utf-8")
+        (request.scratch / "handoff.json").write_text(
+            json.dumps(handoff_payload(FQ)), encoding="utf-8"
+        )
+
+
+def _catalogue(repo: Path, *, index: str, skills: dict[str, str]) -> None:
+    skills_dir = repo / ".grindstone" / "skills"
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    (skills_dir / "index.md").write_text(index, encoding="utf-8")
+    for name, body in skills.items():
+        (skills_dir / f"{name}.md").write_text(body, encoding="utf-8")
+
+
+def test_task_loop_delivers_only_selected_domain_skills(tmp_path: Path) -> None:
+    repo = init_git_repo(tmp_path / "repo")
+    _catalogue(
+        repo,
+        index="- rn-nav: navigation\n- rn-a11y: accessibility\n",
+        skills={"rn-nav": "NAV BODY", "rn-a11y": "A11Y BODY"},
+    )
+    run = create_run_dir(repo, "run-skills")
+    task = make_toy_task().model_copy(update={"skills": ["rn-nav"]})
+    spy = _SkillSpyWorker()
+    outcome = _run_impl(repo, run, task, _ladder(spy))
+    [t] = outcome.tasks
+    assert t.status == "done"
+    # ONLY the selected skill rode the request (retrieve, not concatenate).
+    assert spy.seen == {"rn-nav": "NAV BODY"}
+
+
+def test_task_loop_no_catalogue_is_noop(tmp_path: Path) -> None:
+    repo = init_git_repo(tmp_path / "repo")  # no .grindstone/skills/
+    run = create_run_dir(repo, "run-no-skills")
+    spy = _SkillSpyWorker()
+    outcome = _run_impl(repo, run, make_toy_task(), _ladder(spy))
+    [t] = outcome.tasks
+    assert t.status == "done"
+    assert spy.seen == {}
+
+
+def test_task_loop_missing_skill_file_fails_attempt(tmp_path: Path) -> None:
+    # The index advertises rn-nav but ships no rn-nav.md: the loader raises, which
+    # the dispatch maps to a clean failed attempt (never a crash).
+    repo = init_git_repo(tmp_path / "repo")
+    _catalogue(repo, index="- rn-nav: navigation\n", skills={})
+    run = create_run_dir(repo, "run-missing-skill")
+    task = make_toy_task().model_copy(update={"skills": ["rn-nav"]})
+    outcome = _run_impl(repo, run, task, _ladder(make_ok_worker()))
+    [t] = outcome.tasks
+    assert t.status == "failed"
+    assert t.failure_reason is not None and "domain skill" in t.failure_reason

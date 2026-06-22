@@ -523,6 +523,32 @@ def _workspace_block(ws: WorkspaceInfo) -> str:
     )
 
 
+def _domain_skills_block(index: dict[str, str]) -> str:
+    """The available domain-skill catalogue, rendered for the planner's SELECTION.
+
+    A bounded reference list (name -> one-line description), the target repo's
+    own ``.grindstone/skills/index.md``. The planner attaches the relevant skills
+    to a task by NAME via the task's ``skills`` field; the core delivers only the
+    SELECTED skill text into that task's worker prompt (retrieve, not concatenate).
+    Empty index -> empty string (the common case: most repos ship no catalogue), so
+    a memory-less repo pays zero bytes and the block simply never appears.
+    """
+
+    if not index:
+        return ""
+    lines = "\n".join(f"  - {name}: {desc}" for name, desc in sorted(index.items()))
+    return (
+        "<domain_skills>\n"
+        "Domain skills this target repo provides. SELECT the relevant ones for a "
+        "task by listing their NAMES in that task's `skills` field; the core "
+        "delivers the selected skill TEXT to that task's worker. Keep selection "
+        "MINIMAL, name only the skills the task actually needs (retrieve, do not "
+        "attach the whole catalogue):\n"
+        f"{lines}\n"
+        "</domain_skills>\n"
+    )
+
+
 def _failed_epoch_block(info: FailedEpochInfo) -> str:
     tasks = (
         "\n".join(f"  - {tid}: {reason}" for tid, reason in info.failed_tasks)
@@ -609,6 +635,7 @@ def volatile_tail(
     phase: PhaseTailInfo | None = None,
     failed_epoch: FailedEpochInfo | None = None,
     workspace: "WorkspaceInfo | None" = None,
+    domain_skills: dict[str, str] | None = None,
 ) -> str:
     """The per-call suffix: running state, phase status, last-epoch report,
     re-ask feedback, request. Never byte-stable, it carries everything that
@@ -639,6 +666,7 @@ def volatile_tail(
         _failed_epoch_block(failed_epoch) if failed_epoch is not None else ""
     )
     workspace_block = _workspace_block(workspace) if workspace is not None else ""
+    domain_block = _domain_skills_block(domain_skills) if domain_skills else ""
     if last_epoch_rows is None:
         last = "<last_epoch>\n  (none, this is the first decision)\n</last_epoch>\n"
     else:
@@ -658,7 +686,7 @@ def volatile_tail(
     )
     return (
         state + phase_status + failed_epoch_block + workspace_block
-        + last + errors + request
+        + domain_block + last + errors + request
     )
 
 
@@ -675,6 +703,7 @@ def build_planner_input(
     repo_memory: str | None = None,
     failed_epoch: FailedEpochInfo | None = None,
     workspace: "WorkspaceInfo | None" = None,
+    domain_skill_index: dict[str, str] | None = None,
 ) -> str:
     """Full constructed input: ``stable_head`` + ``<scenario>`` + ``volatile_tail``.
 
@@ -688,7 +717,12 @@ def build_planner_input(
     ``workspace`` (when present) is injected into the volatile tail only; the stable
     head stays byte-identical across a run regardless of it. The structural repo-map and
     the verifier's verdict (digest + evidence + gaps) are delivered BY REFERENCE through
-    the ``workspace`` manifest (``repo_map`` + the ``verdict.json`` path), not inlined."""
+    the ``workspace`` manifest (``repo_map`` + the ``verdict.json`` path), not inlined.
+
+    ``domain_skill_index`` (name -> one-line description) is the target repo's domain
+    skill catalogue (``.grindstone/skills/index.md``); when non-empty it renders an
+    ``<domain_skills>`` selection block in the volatile tail so the planner can attach
+    relevant skills to a task by name. Empty / ``None`` (most repos) renders nothing."""
 
     scenario = select_planner_scenario(
         skeleton_exists=skeleton is not None,
@@ -706,6 +740,7 @@ def build_planner_input(
             phase=phase,
             failed_epoch=failed_epoch,
             workspace=workspace,
+            domain_skills=domain_skill_index,
         )
     )
 
@@ -954,6 +989,7 @@ def validate_decision(
     has_senior: bool = False,
     local_max_task_files: int = DEFAULT_LOCAL_MAX_TASK_FILES,
     senior_max_task_files: int = DEFAULT_SENIOR_MAX_TASK_FILES,
+    known_skill_names: frozenset[str] = frozenset(),
 ) -> GateResult:
     """Gate raw decision text: extract-input → JSON → schema → typed → semantic.
 
@@ -990,6 +1026,7 @@ def validate_decision(
             decision,
             existing_log_keys=existing_log_keys,
             completed_phase_ids=completed_phase_ids,
+            known_skill_names=known_skill_names,
         )
     )
     errors += _position_legality(

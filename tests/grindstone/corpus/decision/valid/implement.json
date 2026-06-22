@@ -10,7 +10,6 @@
         "goal": "implement the tokenizer",
         "inputs": ["p1/e1/spec.md"],
         "done_when": [{ "cmd": "pytest tests/tokenizer", "expect_exit": 0 }],
-        "skills": ["python"],
         "file_ownership": ["src/tokenizer/**"]
       },
       {

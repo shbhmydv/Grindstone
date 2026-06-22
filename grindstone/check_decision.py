@@ -76,6 +76,9 @@ def _run(decision_path: Path, context_path: Path) -> tuple[int, str]:
         senior_max_task_files=int(
             cast("int", ctx.get("senior_max_task_files", DEFAULT_SENIOR_MAX_TASK_FILES))
         ),
+        known_skill_names=frozenset(
+            cast("list[str]", ctx.get("known_skill_names", []))
+        ),
     )
     if gate.decision is not None:
         return 0, "OK: decision conforms to the epoch-decision schema."
