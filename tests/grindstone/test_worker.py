@@ -9,8 +9,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from grindstone.contracts.models import CmdCheck, ImplementTask
-from grindstone.worker import WorkerRequest, build_worker_prompt
+import pytest
+
+from grindstone.config import load_operating_skill
+from grindstone.contracts.models import ArtifactTask, CmdCheck, ImplementTask
+from grindstone.contracts.semantics import HandoffMode
+from grindstone.worker import (
+    REVIEW_CHECK_COMMAND,
+    REVIEW_FILENAME,
+    WORKER_SCENARIOS,
+    WorkerRequest,
+    build_worker_prompt,
+    select_worker_scenario,
+)
 
 
 def _request(failure_context: list[str]) -> WorkerRequest:
@@ -29,6 +40,167 @@ def _request(failure_context: list[str]) -> WorkerRequest:
         failure_context=failure_context,
         mode="implement",
     )
+
+
+def _implement_request() -> WorkerRequest:
+    task = ImplementTask(
+        id="T1",
+        goal="edit the widget",
+        done_when=[CmdCheck(cmd="true")],
+        file_ownership=["src/widget.py", "src/helpers/*.py"],
+    )
+    return WorkerRequest(
+        task=task,
+        task_id="P1/E1/T1",
+        inputs={},
+        scratch=Path("/tmp/scratch"),
+        attempt=1,
+        failure_context=[],
+        mode="implement",
+    )
+
+
+def _artifact_request(
+    mode: HandoffMode, *, targets: list[str] | None = None
+) -> WorkerRequest:
+    task = ArtifactTask(
+        id="T1",
+        goal="produce the report",
+        done_when=[CmdCheck(cmd="true")],
+        artifact_out="report.md",
+        targets=targets,
+    )
+    return WorkerRequest(
+        task=task,
+        task_id="P1/E1/T1",
+        inputs={},
+        scratch=Path("/tmp/scratch"),
+        attempt=1,
+        failure_context=[],
+        mode=mode,
+    )
+
+
+# --- operating-skill split: WORKER_CORE + per-mode scenario skill ---------------
+
+#: A phrase unique to each mode's loaded ``.md`` (present in exactly that one
+#: scenario, and NOT in WORKER_CORE or the dynamic blocks).
+_MODE_SENTINELS = {
+    "implement": "CONTRACT FIRST",
+    "research": "investigate and report",
+    "review": "judge the targets",
+    "artifact": "Produce the artifact named above so that",
+}
+
+
+def test_select_worker_scenario_maps_task_and_mode() -> None:
+    # An ImplementTask is always the implement scenario, regardless of mode.
+    assert select_worker_scenario(_implement_request()) == "implement"
+    # A non-write ArtifactTask routes by the epoch mode.
+    assert select_worker_scenario(_artifact_request("research")) == "research"
+    assert select_worker_scenario(_artifact_request("review")) == "review"
+    assert select_worker_scenario(_artifact_request("artifact")) == "artifact"
+    # Every name the selector can return has a loadable skill file.
+    for req in (
+        _implement_request(),
+        _artifact_request("research"),
+        _artifact_request("review"),
+        _artifact_request("artifact"),
+    ):
+        assert select_worker_scenario(req) in WORKER_SCENARIOS
+
+
+@pytest.mark.parametrize("mode", ["implement", "research", "review", "artifact"])
+def test_build_worker_prompt_composes_core_plus_one_scenario(mode: str) -> None:
+    if mode == "implement":
+        request = _implement_request()
+    else:
+        request = _artifact_request(mode)  # type: ignore[arg-type]
+    prompt = build_worker_prompt(request)
+    # The always-on WORKER_CORE skeleton is present in every composition.
+    assert f'<task id="{request.task_id}">' in prompt
+    assert "<done_when>" in prompt
+    assert "<handoff>" in prompt
+    # The selected scenario's sentinel is present...
+    assert _MODE_SENTINELS[mode] in prompt
+    # ...and the OTHER three modes' sentinels are NOT.
+    for other, sentinel in _MODE_SENTINELS.items():
+        if other != mode:
+            assert sentinel not in prompt
+
+
+def test_implement_prompt_keeps_dynamic_file_ownership() -> None:
+    prompt = build_worker_prompt(_implement_request())
+    # The dynamic ownership globs stay in the code-built block (not the .md).
+    assert "<file_ownership>" in prompt
+    assert "src/widget.py" in prompt
+    assert "src/helpers/*.py" in prompt
+    # The static discipline is NOT in the dynamic block, it is the loaded skill.
+    assert "CONTRACT FIRST" in load_operating_skill("worker", "implement")
+    assert "<file_ownership>" not in load_operating_skill("worker", "implement")
+
+
+def test_review_prompt_keeps_dynamic_targets() -> None:
+    prompt = build_worker_prompt(
+        _artifact_request("review", targets=["src/a.py", "src/b.py"])
+    )
+    assert "src/a.py" in prompt
+    assert "src/b.py" in prompt
+    # The dynamic targets list is NOT baked into the static review skill.
+    assert "src/a.py" not in load_operating_skill("worker", "review")
+
+
+def test_worker_skill_constant_literals_do_not_drift() -> None:
+    """Drift guard: the implement skill spells the live constant VALUES (it is
+    concatenated raw, never ``.format``-ed), so a constant change must update the
+    .md too. The pinned reviewer subagent name is likewise spelled literally."""
+
+    implement = load_operating_skill("worker", "implement")
+    assert REVIEW_FILENAME in implement
+    assert REVIEW_CHECK_COMMAND in implement
+    # The fresh-context review step names the registered ``reviewer`` subagent.
+    assert "`reviewer`" in implement
+
+
+def test_split_preserves_every_load_bearing_worker_instruction() -> None:
+    """Content-preservation guard: the four monolithic plan helpers were split into
+    WORKER_CORE + four scenario files + the in-code dynamic blocks. Every load-bearing
+    instruction must survive SOMEWHERE in the union of the four composed prompts."""
+
+    union = (
+        build_worker_prompt(_implement_request())
+        + build_worker_prompt(
+            _artifact_request("review", targets=["src/a.py"])
+        )
+        + build_worker_prompt(_artifact_request("research"))
+        + build_worker_prompt(_artifact_request("artifact"))
+    )
+    for phrase in (
+        # implement discipline
+        "CONTRACT FIRST",
+        "WORK IN DEPENDENCY ORDER",
+        "VERBATIM SPEC",
+        "BAKE BEFORE HANDOFF",
+        "fresh-context review",
+        "check_handoff.py",
+        "false DONE is always caught",
+        "Changing ANY other file fails the attempt",
+        # research
+        "investigate and report",
+        "do not modify code",
+        "deliverable the planner reads",
+        # review
+        "judge the targets",
+        "explicit verdict",
+        "A review handoff with no citations is rejected",
+        # artifact
+        "every done_when check passes",
+        "keep the handoff to references, not payloads",
+        # CWD containment (inlined into the three non-implement skills)
+        "Your CWD is your entire workspace",
+        "there is no repository here",
+    ):
+        assert phrase in union, f"lost instruction: {phrase!r}"
 
 
 def test_no_prior_failures_block_when_context_empty() -> None:

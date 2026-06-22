@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, Union
 
+from grindstone.config import load_operating_skill
 from grindstone.contracts.models import (
     ArtifactExistsCheck,
     ArtifactTask,
@@ -188,54 +189,45 @@ def _render_inputs(request: WorkerRequest) -> str:
     )
 
 
-def _implement_plan(task: ImplementTask) -> str:
-    """The implement worker plan: the verified solo skill discipline.
+#: The worker scenario names: one operating skill each under
+#: ``skills/operating/worker/<scenario>.md``, selected by ``select_worker_scenario``.
+#: The scenario IS the epoch mode. The executor is ONE role: ``build_worker_prompt``
+#: builds the identical prompt for a worker- or senior-tier task (the tier only
+#: selects which request SCRIPT runs it), so the senior reuses these same skills,
+#: there is no separate senior namespace.
+WORKER_SCENARIOS: frozenset[str] = frozenset(
+    {"implement", "research", "review", "artifact"}
+)
 
-    Contract-first ordering, verbatim-spec re-reads, a mandatory bake whose
-    review step is a fresh-context subagent gated by a non-empty review.md,
-    handoff written last, and the ownership lane (the S4 attempt-2 root cause).
-    In-task implementation splitting is deliberately absent: it measured
-    correctness-neutral at 2-9x token cost; a too-big task escalates to the
-    planner via a truthful FAILED handoff instead.
+
+def select_worker_scenario(request: WorkerRequest) -> str:
+    """Pick the worker's scenario skill from the task shape + mode (pure, no I/O).
+
+    Mirrors the prompt builder's original branch: an ``ImplementTask`` is always
+    the implement scenario (the only write task); every non-write ``ArtifactTask``
+    routes by the epoch ``mode`` (research / review / artifact). An unexpected
+    mode on a non-write task falls to ``artifact`` (the original ``else`` branch).
+    """
+
+    if isinstance(request.task, ImplementTask):
+        return "implement"
+    if request.mode == "research":
+        return "research"
+    if request.mode == "review":
+        return "review"
+    return "artifact"
+
+
+def _file_ownership_block(task: ImplementTask) -> str:
+    """The DYNAMIC implement ownership lane, built from ``task.file_ownership``.
+
+    Kept in code (not the static skill) because the globs are per-task, mirrored
+    on the planner's volatile-tail pattern. Names ``REVIEW_FILENAME`` from the live
+    constant so the orchestration-file exemption never drifts.
     """
 
     globs = "\n".join(f"  - {g}" for g in task.file_ownership)
     return f"""
-<implement_plan>
-Work this plan in order. You implement everything yourself; subagents are for
-the review step only. A saturated context silently drops shared-contract
-details, the discipline below is what keeps a large solo build coherent.
-  1. CONTRACT FIRST. Identify the shared pieces every other file depends on,
-     constants, interface signatures, exception types, schemas. Implement them
-     first, completely, and verify they import/load cleanly before moving on.
-  2. WORK IN DEPENDENCY ORDER, ANCHORED TO THE CONTRACT. Before each unit ask:
-     "must this agree with the internals of another unit?" Wherever two units
-     must agree on something the contract files do not fully fix, pin that
-     convention explicitly and apply it identically in both places yourself.
-     Run the relevant done_when checks as each unit lands.
-  3. VERBATIM SPEC. Before each unit, re-read its authoritative spec in the
-     task goal and inputs end to end. Never work from a paraphrase or from
-     memory, paraphrase silently drops requirements. If your context was
-     compacted, recover by re-reading the spec and the files on disk.
-  4. BAKE BEFORE HANDOFF, mandatory, all of (a)-(c) BEFORE handoff.json:
-     (a) run EVERY done_when check yourself and fix every failure you see
-         (exception: `python3 check_handoff.py` validates handoff.json itself,
-         it cannot pass yet; you satisfy it in step 5);
-     (b) re-read the full task goal once more and audit the seams, implement
-         anything no earlier step clearly covered;
-     (c) get ONE fresh-context review: spawn the registered `reviewer`
-         subagent with the goal, the done_when checks and a summary of what
-         you changed; its findings must be written to `{REVIEW_FILENAME}` in
-         this directory (non-empty, `{REVIEW_CHECK_COMMAND}` is one of your
-         checks). ACT on what it finds.
-  5. Write handoff.json LAST, as its own final step, only after the bake, then
-     run `python3 check_handoff.py` and fix violations until it exits 0.
-If after honest effort the checks cannot pass, write a truthful FAILED or
-PARTIAL handoff with `not_done` and `downstream_needs` filled in, the planner
-re-plans from that. Never claim DONE on failing checks: every check is re-run
-by the orchestrator and a false DONE is always caught.
-</implement_plan>
-
 <file_ownership>
 You may create or edit files ONLY within these globs:
 {globs}
@@ -246,54 +238,18 @@ the CWD as instructed; the orchestrator excludes them from this rule.)
 """
 
 
-#: Shared containment line for the non-implement plans: their scratch is a plain
-#: dir nested INSIDE the target repo's working tree, so a wandering worker can
-#: reach the operator's checkout (E2E gate2 P0: an artifact worker checked out
-#: the integration branch in the live repo). The env fence (GIT_CEILING_DIRECTORIES)
-#: is the mechanism; this line keeps the model from wandering by path at all.
-_CWD_CONTAINMENT = """Your CWD is your entire workspace: read your resolved inputs, write your
-artifact and handoff here. Never cd above it, never read or modify the
-surrounding repository, and do not run git, there is no repository here."""
+def _review_targets_block(task: ArtifactTask) -> str:
+    """The DYNAMIC review targets list, built from ``task.targets``.
 
+    Kept in code (not the static review skill) because the targets are per-task;
+    the skill prose points at this ``<review_targets>`` block.
+    """
 
-def _research_plan() -> str:
-    return f"""
-<research_plan>
-This is a research task: investigate and report; do not modify code.
-{_CWD_CONTAINMENT}
-  1. Read the resolved inputs; they contain everything the goal requires.
-  2. Write your findings into the artifact named above, that artifact is the
-     deliverable the planner reads.
-  3. Ground every claim: the handoff's `citations` MUST contain at least one
-     real file (with line numbers where useful). A research handoff with no
-     citations is rejected.
-</research_plan>
-"""
-
-
-def _review_plan(task: ArtifactTask) -> str:
     targets = "\n".join(f"  - {t}" for t in task.targets or [])
     return f"""
-<review_plan>
-This is a review task: judge the targets; do not modify them.
-{_CWD_CONTAINMENT}
-Targets under review:
+<review_targets>
 {targets}
-  1. Examine each target against the question in the goal.
-  2. Write your findings AND an explicit verdict into the artifact named above.
-  3. Ground every finding: the handoff's `citations` MUST contain at least one
-     real file/line. A review handoff with no citations is rejected.
-</review_plan>
-"""
-
-
-def _artifact_plan() -> str:
-    return f"""
-<artifact_plan>
-Produce the artifact named above so that every done_when check passes. The
-artifact is the deliverable; keep the handoff to references, not payloads.
-{_CWD_CONTAINMENT}
-</artifact_plan>
+</review_targets>
 """
 
 
@@ -306,7 +262,12 @@ def build_worker_prompt(request: WorkerRequest) -> str:
     Between done_when and the handoff block sits the PER-MODE worker plan
     (owner ruling 2026-06-11): do->verify->review discipline belongs to the
     implement plan ONLY; research/review/artifact get their own lean plans, no
-    verify theater. We own the model-facing format (§7: XML-tagged sections).
+    verify theater. The STATIC discipline of each mode is an operating skill
+    loaded verbatim from ``skills/operating/worker/<scenario>.md`` (selected by
+    ``select_worker_scenario``) and concatenated as-is; the DYNAMIC per-task data
+    (the implement ownership globs, the review targets) is built here in code and
+    appended around it, mirroring the planner's CORE + scenario + volatile-tail
+    split. We own the model-facing format (§7: XML-tagged sections).
     """
 
     if request.infra_repair is not None:
@@ -319,19 +280,20 @@ def build_worker_prompt(request: WorkerRequest) -> str:
         artifact_line = (
             f"\nProduce the artifact at log key `{task.artifact_out}`.\n"
         )
+    scenario = select_worker_scenario(request)
+    skill = load_operating_skill("worker", scenario)
     if isinstance(task, ImplementTask):
-        plan_block = _implement_plan(task)
+        # The static implement discipline (skill) + the dynamic ownership lane.
+        plan_block = "\n" + skill + _file_ownership_block(task)
         occupancy_line = (
             "  - occupancy: {\"compacted\": <bool>, \"subagent_splits\": <int>}, "
             "report honestly;\n    your reviewer spawn counts as a split."
         )
     else:
-        if request.mode == "research":
-            plan_block = _research_plan()
-        elif request.mode == "review":
-            plan_block = _review_plan(task)
-        else:
-            plan_block = _artifact_plan()
+        # research / artifact: skill is self-contained; review appends its targets.
+        plan_block = "\n" + skill
+        if scenario == "review":
+            plan_block += _review_targets_block(task)
         occupancy_line = (
             "  - occupancy: {\"compacted\": <bool>, \"subagent_splits\": <int>}."
         )
