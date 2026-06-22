@@ -25,3 +25,6 @@ CLAUDE.local.md
 # --- experiments / scratch ---
 .exp/
 CLAUDE.md
+
+# --- local-only per-rung implementation briefs (never published) ---
+docs/briefs/
