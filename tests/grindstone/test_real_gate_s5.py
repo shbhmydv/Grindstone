@@ -2,18 +2,28 @@
 
 The CONFIG-PATH gate: a full job driven through the CLI exactly as an operator
 would, ``grindstone init`` scaffolds ``.grindstone/config.yaml``, then
-``grindstone run`` loads a local-only role config, builds the REAL
-``codex exec`` planner + REAL ``ScriptWorker`` from it, and runs the S4 toy job to
-completion. This proves the init → config → CLI → loop plumbing (ruling 5), not
-new orchestration; the job shape is S4's.
+``grindstone run`` loads a local-only role config, builds the REAL planner +
+REAL ``ScriptWorker`` from it, and runs the S4 toy job to completion. This proves
+the init → config → CLI → loop plumbing (ruling 5), not new orchestration; the
+job shape is S4's.
+
+It is parametrized over the planner rig so the SAME toy job, config builder,
+valve, and assertions cover BOTH planner presets end to end: ``codex`` (override
+preset, ``codex exec``) and ``claude`` (the SHIPPED DEFAULT,
+``models/default/planner_request.sh`` runs ``claude -p``). Each param proves its
+planner emits schema-conforming epoch decisions across the FULL lifecycle
+(propose_skeleton, implement, complete_run), not just one call. Only the planner
+script path + required CLI differ per param; the local llama-server tier is the
+same. Each param skips loudly if its planner CLI is absent, so codex coverage
+stays intact even when ``claude`` is unavailable and vice versa.
 
 The 12-planner-call valve is TEST-only and is threaded by monkeypatching the
 ``run_grind`` symbol the CLI calls (the CLI exposes no valve flag, it is not a
 real loop bound), so the live wiring path stays intact while quota stays capped.
 
 Run: ``rtk proxy python3 -m pytest tests/grindstone/test_real_gate_s5.py -m real -s``
-Needs a healthy llama-server (GRINDSTONE_TEST_ENDPOINT, default :8080) AND an
-authed ``codex`` CLI; skips loudly if either is absent.
+Needs a healthy llama-server (GRINDSTONE_TEST_ENDPOINT, default :8080) AND the
+selected planner CLI (``codex`` and/or ``claude``); skips loudly if absent.
 """
 
 from __future__ import annotations
@@ -75,18 +85,15 @@ def _healthy(endpoint: str) -> bool:
     return False
 
 
-def _codex_available() -> bool:
-    return shutil.which("codex") is not None
-
-
-def _config_yaml(models_dir: Path) -> str:
+def _config_yaml(models_dir: Path, planner_script: str) -> str:
     """A local-only role config pinned to this rig's scripts (no senior tier, so
-    a healthy-server toy job never escalates to an unauthed cloud rung)."""
+    a healthy-server toy job never escalates to an unauthed cloud rung). Only the
+    planner script differs per rig, the local tier is the same llama-server path."""
 
     return (
         "roles:\n"
         "  planner:\n"
-        f"    script: {models_dir}/codex/planner_request.sh\n"
+        f"    script: {models_dir}/{planner_script}\n"
         "    slots: 1\n"
         "    timeout_s: 600\n"
         "  local:\n"
@@ -96,10 +103,26 @@ def _config_yaml(models_dir: Path) -> str:
     )
 
 
-def test_gate_s5_cli_config_path_real(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+#: Each planner rig the gate proves end to end: (id, planner script, required CLI).
+#: ``codex`` is the override preset, ``claude`` is the SHIPPED DEFAULT planner
+#: (``models/default/planner_request.sh`` runs ``claude -p``). Each param skips
+#: loudly if its CLI is absent, so the codex coverage stays intact regardless.
+_PLANNER_RIGS = [
+    pytest.param("codex/planner_request.sh", "codex", id="codex"),
+    pytest.param("default/planner_request.sh", "claude", id="claude"),
+]
+
+
+@pytest.mark.parametrize("planner_script,planner_cli", _PLANNER_RIGS)
+def test_gate_s5_cli_config_path_real(
+    planner_script: str,
+    planner_cli: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     endpoint = _endpoint()
-    if not _codex_available():
-        pytest.skip("GATE S5 SKIPPED: no `codex` CLI on PATH")
+    if shutil.which(planner_cli) is None:
+        pytest.skip(f"GATE S5 SKIPPED: no `{planner_cli}` CLI on PATH")
     if not _healthy(endpoint):
         pytest.skip(f"GATE S5 SKIPPED: no healthy llama-server at {endpoint}")
 
@@ -108,7 +131,7 @@ def test_gate_s5_cli_config_path_real(tmp_path: Path, monkeypatch: pytest.Monkey
     # the gate needs (local-only, pinned to this rig's role scripts).
     assert main(["init", "--repo", str(repo)]) == 0
     (repo / ".grindstone" / "config.yaml").write_text(
-        _config_yaml(_MODELS_DIR), encoding="utf-8"
+        _config_yaml(_MODELS_DIR, planner_script), encoding="utf-8"
     )
     (repo / "job.md").write_text(_JOB, encoding="utf-8")
     subprocess.run(["git", "add", "-A"], cwd=str(repo), check=True, capture_output=True)
@@ -122,24 +145,28 @@ def test_gate_s5_cli_config_path_real(tmp_path: Path, monkeypatch: pytest.Monkey
         cli, "run_grind", functools.partial(run_grind, max_planner_calls=PLANNER_VALVE)
     )
 
+    run_id = f"s5-gate-{planner_cli}"
     started = time.monotonic()
-    code = main(["run", str(repo / "job.md"), "--repo", str(repo), "--run-id", "s5-gate"])
+    code = main(["run", str(repo / "job.md"), "--repo", str(repo), "--run-id", run_id])
     elapsed = time.monotonic() - started
 
-    run_dir = RunDir(root=repo / ".grindstone" / "runs" / "s5-gate")
+    run_dir = RunDir(root=repo / ".grindstone" / "runs" / run_id)
     state = RunState.model_validate_json(run_dir.run_state_path.read_text())
     files = sorted(tracked_files(repo, state.last_integration_branch)) if state.last_integration_branch else []
     print(
-        f"\n[S5 GATE] {elapsed:.1f}s exit={code} status={state.status} "
+        f"\n[S5 GATE {planner_cli}] {elapsed:.1f}s exit={code} status={state.status} "
         f"planner_calls={state.planner_call_count} branch={state.last_integration_branch}"
     )
-    print(f"[S5 GATE] final branch files: {files}")
-    print(f"[S5 GATE] terminal reason: {state.terminal_reason}")
+    print(f"[S5 GATE {planner_cli}] final branch files: {files}")
+    print(f"[S5 GATE {planner_cli}] terminal reason: {state.terminal_reason}")
 
-    assert code == 0, f"S5 gate exit code {code}, status={state.status} reason={state.terminal_reason}"
+    assert code == 0, (
+        f"S5 gate ({planner_cli}) exit code {code}, "
+        f"status={state.status} reason={state.terminal_reason}"
+    )
     assert state.status == "completed"
     assert {"greet.py", "test_greet.py", "README.md"} <= set(files), files
     # The post-mortem journal was rendered from the real run's events.
     assert run_dir.journal_path.exists(), "journal.md not written"
     journal = run_dir.journal_path.read_text(encoding="utf-8")
-    assert "# Run s5-gate" in journal and "completed" in journal, journal[:200]
+    assert f"# Run {run_id}" in journal and "completed" in journal, journal[:200]
