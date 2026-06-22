@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -44,6 +45,7 @@ from typing import Any, Callable, Literal, Sequence, cast
 
 from pydantic import BaseModel, ConfigDict
 
+from grindstone import check_decision
 from grindstone import worktree as wt
 from grindstone.config import FloorConfig, InfraRepairConfig, PrepareConfig
 from grindstone.infra import InfraClassification, classify_check_failure
@@ -748,6 +750,7 @@ def _transport_call(
     sleep_fn: SleepFn,
     prompt: str,
     max_planner_calls: int | None,
+    workdir: Path | None = None,
 ) -> str:
     """Call the transport, surviving rate-limit / transient failures (ruling 2).
 
@@ -755,6 +758,7 @@ def _transport_call(
     durable); transient → immediate retry (max 3 per call site, then hard); hard
     → escalate. Every attempt journals ``planner_call_started`` then, on failure,
     ``planner_call_failed(classification)``. Returns the raw text on success.
+    ``workdir`` is the writable planner worktree a self-validating rig grinds in.
     """
 
     transient = 0
@@ -764,7 +768,7 @@ def _transport_call(
         journal.emit(lambda s: PlannerCallStarted(seq=s, ts=_now()))
         store.update(planner_call_count=store.state.planner_call_count + 1)
         try:
-            return planner.plan(prompt)
+            return planner.plan(prompt, workdir=workdir)
         except BaseException as exc:  # transport boundary, classify then react
             classification = classify_failure(exc)
             journal.emit(
@@ -821,15 +825,20 @@ def _build_workspace(store: _RunStateStore, run_dir: RunDir, repo: Path | None) 
     if repo is None:
         return None
     tip_dir: Path | None = None
-    ref = store.state.last_integration_branch
-    if ref is not None:
-        candidate = run_dir.root / "worktrees" / _PLANNER_TIP_WORKTREE
-        try:
-            wt.add_worktree_detached(repo, candidate, ref=ref)
-        except wt.GitError:
-            tip_dir = None  # unresolvable tip: the manifest still helps the planner
-        else:
-            tip_dir = candidate
+    # The integration tip when one exists, else the operator HEAD: the FIRST
+    # epoch boundary has no integration branch yet (nothing merged), but the
+    # planner still needs a writable worktree to self-validate its decision in
+    # (the dogfood halt that motivated this was on a first research epoch). An unborn HEAD (a
+    # fresh repo with no commit) raises GitError and leaves the planner on its
+    # read-only fallback; the keyed-log manifest still surfaces either way.
+    ref = store.state.last_integration_branch or "HEAD"
+    candidate = run_dir.root / "worktrees" / _PLANNER_TIP_WORKTREE
+    try:
+        wt.add_worktree_detached(repo, candidate, ref=ref)
+    except wt.GitError:
+        tip_dir = None  # unresolvable tip: the manifest still helps the planner
+    else:
+        tip_dir = candidate
     manifest: list[tuple[str, Path]] = [
         (key, run_dir.resolve(key)) for key in run_dir.log_index()
     ]
@@ -875,6 +884,50 @@ def _teardown_workspace(workspace: WorkspaceInfo | None, run_dir: RunDir, repo: 
     if workspace is None or workspace.integration_tip is None or repo is None:
         return
     wt.remove_worktree(repo, workspace.integration_tip)
+
+
+def _arm_self_validation(
+    workspace: WorkspaceInfo | None,
+    store: _RunStateStore,
+    run_dir: RunDir,
+    completed_phase_ids: frozenset[str],
+    phase_ctx: _PhaseContext | None,
+    failed_epoch: FailedEpochInfo | None,
+    has_senior: bool,
+    local_max_task_files: int,
+    senior_max_task_files: int,
+) -> None:
+    """Drop ``check_decision.py`` + its context into the planner worktree.
+
+    Grounds the planner like the workers: it writes ``decision.json`` in this
+    worktree, runs the validator, and loops until the gate is clean before handing
+    back (the rig's script owns that loop). The baked context is the EXACT keyword
+    set ``_plan_boundary_loop`` feeds ``validate_decision`` below, so the planner's
+    local verdict is byte-identical to the core gate it then faces. Best-effort: a
+    write failure (or no worktree) silently leaves the rig on its read-only path,
+    where the core re-ask ladder still guards correctness. Re-derived identically on
+    resume (same tip, same context)."""
+
+    if workspace is None or workspace.integration_tip is None:
+        return
+    context: dict[str, object] = {
+        "existing_log_keys": sorted(run_dir.log_index()),
+        "completed_phase_ids": sorted(completed_phase_ids),
+        "skeleton_exists": store.state.skeleton is not None,
+        "phase_escalated": phase_ctx is not None and phase_ctx.escalation_active,
+        "failed_epoch_active": failed_epoch is not None,
+        "has_senior": has_senior,
+        "local_max_task_files": local_max_task_files,
+        "senior_max_task_files": senior_max_task_files,
+    }
+    try:
+        check_decision.write_validator(
+            workspace.integration_tip,
+            context=context,
+            grindstone_python=sys.executable,
+        )
+    except OSError:
+        return
 
 
 def _plan_boundary(
@@ -937,6 +990,14 @@ def _plan_boundary(
         # then hand the planner the PATH via the workspace. Rebuilt/overwritten each
         # boundary so it reflects the current tip. None map => no file, no entry.
         workspace = _attach_repo_map(workspace, run_dir, repo_map)
+        # Ground the planner like the workers: arm its worktree with the decision
+        # validator + this boundary's gate context, so a self-validating rig loops
+        # to a gate-clean decision.json before handing back. Built AFTER the repo
+        # map so the validator files never pollute the structural map.
+        _arm_self_validation(
+            workspace, store, run_dir, completed_phase_ids, phase_ctx, failed_epoch,
+            has_senior, local_max_task_files, senior_max_task_files,
+        )
         return _plan_boundary_loop(
             journal, store, run_dir, planner, sleep_fn, repo, last_epoch_rows,
             max_planner_calls, phase_ctx, completed_phase_ids, vision_reviewer,
@@ -989,7 +1050,10 @@ def _plan_boundary_loop(
             workspace=workspace,
         )
         try:
-            raw = _transport_call(journal, store, planner, sleep_fn, prompt, max_planner_calls)
+            raw = _transport_call(
+                journal, store, planner, sleep_fn, prompt, max_planner_calls,
+                workdir=workspace.integration_tip if workspace is not None else None,
+            )
         except _Escalate as exc:
             return _Boundary("escalate", reason=exc.reason)
         except _Valve as exc:

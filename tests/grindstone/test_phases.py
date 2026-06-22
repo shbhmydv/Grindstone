@@ -44,9 +44,9 @@ class _Recording:
         self.inner = inner
         self.prompts: list[str] = []
 
-    def plan(self, prompt: str) -> str:
+    def plan(self, prompt: str, *, workdir: Path | None = None) -> str:
         self.prompts.append(prompt)
-        return self.inner.plan(prompt)
+        return self.inner.plan(prompt, workdir=workdir)
 
 
 # --- criteria-driven advancement + per-phase epoch-index reset (rulings 1) -----

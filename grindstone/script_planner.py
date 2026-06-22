@@ -1,13 +1,16 @@
 """Script-backed planner transport: the `planner` role behind a file contract.
 
 The role-split boundary: grindstone reaches the planner role
-through ``planner_request.sh`` and never learns the transport (codex) or the
-model behind it. The script runs the locked ``codex exec`` invocation against the
-target repo (read-only) and writes the agent's final message to ``--out``, a
-disk contract, never stdout scraping. grindstone reads ``--out`` and does the
-tolerant ``extract_decision_json`` + validation itself (parsing stays in core,
-ruling 1). ``plan`` Popen's the script as a group leader, supervises wall-clock,
-and on timeout delegates the kill to ``stop.sh``.
+through ``planner_request.sh`` and never learns the transport (codex / claude) or
+the model behind it. When the boundary supplies a writable ``--workdir`` (the
+planner worktree), a self-validating rig grinds IN it, writing its epoch JSON to
+``workdir/decision.json`` after looping ``check_decision.py`` until the core gate
+is clean; that file is the disk contract grindstone reads back. A read-only rig
+ignores ``--workdir`` and writes its final message to ``--out`` instead. Either
+way stdout is never scraped, and the core re-runs ``extract_decision_json`` +
+validation as defense in depth (parsing stays in core, ruling 1). ``plan`` Popen's
+the script as a group leader, supervises wall-clock, and on timeout delegates the
+kill to ``stop.sh``.
 
 ``slots`` is the authoritative concurrency bound (typically 1 for the planner):
 a ``Semaphore`` acquired around each ``plan``.
@@ -22,6 +25,7 @@ import tempfile
 import threading
 from pathlib import Path
 
+from grindstone.check_decision import DECISION_FILE
 from grindstone.planner import PlannerHardError
 from grindstone.worker import RateLimited, TransportError, WorkerTimeout
 
@@ -56,11 +60,11 @@ class ScriptPlanner:
         self.timeout_s = timeout_s
         self._sem = threading.Semaphore(slots)
 
-    def plan(self, prompt: str) -> str:
+    def plan(self, prompt: str, *, workdir: Path | None = None) -> str:
         with self._sem:
-            return self._dispatch(prompt)
+            return self._dispatch(prompt, workdir)
 
-    def _dispatch(self, prompt: str) -> str:
+    def _dispatch(self, prompt: str, workdir: Path | None) -> str:
         with tempfile.TemporaryDirectory(prefix="grind-planner-") as td:
             tmp = Path(td)
             prompt_file = tmp / "prompt.txt"
@@ -68,20 +72,32 @@ class ScriptPlanner:
             handle_file = tmp / "handle"
             prompt_file.write_text(prompt, encoding="utf-8")
 
+            # A self-validating rig grinds IN ``workdir`` (the boundary worktree)
+            # and writes its decision to ``workdir/decision.json``, the disk
+            # contract we read back below. We clear any stale copy so a script
+            # that silently writes nothing can never feed us a previous verdict.
+            decision_file = workdir / DECISION_FILE if workdir is not None else None
+            if decision_file is not None:
+                decision_file.unlink(missing_ok=True)
+
+            argv = [
+                str(self.script),
+                "--repo",
+                str(self.repo),
+                "--prompt",
+                str(prompt_file),
+                "--out",
+                str(out_file),
+                "--handle-out",
+                str(handle_file),
+                "--timeout",
+                str(int(self.timeout_s)),
+            ]
+            if workdir is not None:
+                argv += ["--workdir", str(workdir)]
+
             proc = subprocess.Popen(
-                [
-                    str(self.script),
-                    "--repo",
-                    str(self.repo),
-                    "--prompt",
-                    str(prompt_file),
-                    "--out",
-                    str(out_file),
-                    "--handle-out",
-                    str(handle_file),
-                    "--timeout",
-                    str(int(self.timeout_s)),
-                ],
+                argv,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -97,9 +113,15 @@ class ScriptPlanner:
                 ) from exc
             if proc.returncode != 0:
                 self._raise_for_failure(proc.returncode, stderr)
-            # Disk contract: the final message is the --out file; stdout is the
-            # event log, never the result. Fall back to stdout only if the script
-            # wrote no file (edge), so the extractor still has bytes.
+            # Disk contract, in priority order. (1) A self-validating rig wrote a
+            # gate-clean ``decision.json`` into its worktree, that IS the result
+            # (the same file the rig looped ``check_decision.py`` on). (2) Else the
+            # rig's final message is ``--out``. (3) Else stdout, so the extractor
+            # still has bytes. stdout is never scraped when a file exists.
+            if decision_file is not None and decision_file.is_file():
+                text = decision_file.read_text(encoding="utf-8")
+                if text.strip():
+                    return text
             if out_file.is_file():
                 text = out_file.read_text(encoding="utf-8")
                 if text:

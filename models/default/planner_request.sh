@@ -1,18 +1,32 @@
 #!/usr/bin/env bash
 # planner_request.sh, the DEFAULT `planner` role. Runs Claude (Opus) headless via
-# `claude -p` one-shot against the TARGET repo, READ-ONLY. The agent's final
-# message is written to --out (a disk contract); grindstone reads --out and does
-# the tolerant extract_decision_json + validation itself (parsing stays in core,
-# stdout is never scraped for the result).
+# `claude -p` one-shot to decide the next epoch as a single JSON object matching
+# the epoch-decision schema.
+#
+# Two modes, chosen by whether grindstone passes --workdir (the writable planner
+# worktree):
+#   * SELF-VALIDATE (--workdir given): grind IN the worktree like a worker. Write
+#     the decision to ./decision.json, run `python3 check_decision.py decision.json`
+#     (grindstone armed it there with THIS boundary's gate context), FIX every
+#     violation it prints, and loop until it exits 0. That gate-clean file is the
+#     disk contract grindstone reads back. The worktree is a throwaway checkout, so
+#     full tool access (--dangerously-skip-permissions) is safe and required for a
+#     headless run: any file edit here is discarded, only decision.json is read.
+#     This is what stops the planner from burning blind re-asks on a schema it
+#     guessed wrong (a real dogfood halt: a flattened, overlong epoch).
+#   * READ-ONLY (no --workdir): the legacy fallback (artifact-only run / unborn
+#     HEAD). cwd = the target repo, only Read/Grep/Glob granted, the final message
+#     is written to --out; grindstone extracts + validates it itself.
 #
 # This is the shipped default rig: a fresh cloner with Claude Code installed runs
 # with zero setup. The alternative codex-based planner lives at models/codex/ and
 # is opt-in via `grindstone init --rig codex`; an operator's own planner goes in
 # models/override/ (gitignored, highest priority).
 #
-# Grindstone passes only the target repo, a prompt file, an --out path, a
-# handle-out path and a timeout. We propagate claude's exit code and forward its
-# stderr so the caller can map the failure reason (rate|limit|429, auth/login).
+# Grindstone passes the target repo, a prompt file, an --out path, a handle-out
+# path, a timeout and (in self-validate mode) a --workdir. We propagate claude's
+# exit code and forward its stderr so the caller can map the failure reason
+# (rate|limit|429, auth/login).
 set -euo pipefail
 
 # Portable timeout prefix (resolves `timeout`, else `gtimeout`, else none).
@@ -23,7 +37,7 @@ source "$(dirname "$0")/_timeout_prefix.sh"
 # $GRINDSTONE_PLANNER_MODEL (any `claude --model` target).
 model="${GRINDSTONE_PLANNER_MODEL:-opus}"
 
-repo="" prompt="" out="" handle_out="" timeout=""
+repo="" prompt="" out="" handle_out="" timeout="" workdir=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --repo)       repo="$2";   shift 2 ;;
@@ -31,6 +45,7 @@ while [[ $# -gt 0 ]]; do
     --out)        out="$2";    shift 2 ;;
     --handle-out) handle_out="$2"; shift 2 ;;
     --timeout)    timeout="$2"; shift 2 ;;
+    --workdir)    workdir="$2"; shift 2 ;;
     *) echo "planner_request: unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -61,31 +76,41 @@ export GIT_CEILING_DIRECTORIES="$(dirname "$repo")"
 err_tmp="$(mktemp)"
 trap 'rm -f "$err_tmp"' EXIT
 
-# READ-ONLY planning. We run with cwd = the target repo and grant ONLY the
-# read-only navigation tools (Read/Grep/Glob); no Edit/Write/Bash is allowlisted,
-# and we do NOT pass --dangerously-skip-permissions, so in headless `-p` mode any
-# edit/exec tool is denied (it cannot prompt) and the planner cannot mutate the
-# repo. The grindstone-constructed prompt already carries the full input (job
-# spec, skeleton, repo memory, repo map); the repo tools are a parity aid.
-#
-# --output-format text returns the raw final message; we capture stdout to --out.
-# The append-system-prompt reinforces the JSON-only contract the prompt requests.
-sys_append="Output ONLY a single JSON object that matches the grindstone epoch-decision schema (schema_version, tool, args). No prose, no markdown code fences, no commentary before or after the object."
-
 # The prompt is fed to claude on STDIN (`claude -p` reads the prompt from stdin),
 # never as an argv string: a large constructed planner input (job spec + skeleton
 # + repo memory + repo map) could otherwise exceed the kernel's MAX_ARG_STRLEN
 # (~128KB) and the CLI dies before launching ("Argument list too long"). Stdin
-# makes the prompt size irrelevant; --allowedTools is no longer adjacent to a
-# positional, so its greedy variadic parse is also safe.
+# makes the prompt size irrelevant.
 set +e
-( cd "$repo" && "${timeout_prefix[@]}" claude -p \
-  --model "$model" \
-  --output-format text \
-  --allowedTools Read Grep Glob \
-  --append-system-prompt "$sys_append" ) \
-  < "$prompt" > "$out" 2> "$err_tmp"
-rc=$?
+if [[ -n "$workdir" ]]; then
+  # SELF-VALIDATE in the throwaway worktree (cwd = the boundary's _planner_tip
+  # checkout). Full tool access is safe here: the worktree is discarded after the
+  # call, so any edit evaporates and only decision.json is read back. The contract
+  # is the disk file, not stdout; --out still captures the agent log for debugging.
+  workdir="$(cd "$workdir" && pwd)"
+  sys_append="You are the grindstone planner. Decide the SINGLE next epoch as one JSON object matching the epoch-decision schema (schema_version, tool, args). Your CWD is a throwaway worktree checkout of the current code: read and grep it to ground your plan, but any file you change here is discarded. Steps you MUST follow: (1) write your decision JSON to ./decision.json; (2) run \`python3 check_decision.py decision.json\`; (3) if it prints violations, FIX decision.json (the schema is two levels: an epoch carries epoch_title, rationale and a tasks array; per-task fields like id/goal/done_when live INSIDE each task, never on the epoch) and re-run; (4) repeat until it exits 0 with no violations. decision.json, gate-clean, is your ONLY output. Do not print the decision."
+  ( cd "$workdir" && "${timeout_prefix[@]}" claude -p \
+    --model "$model" \
+    --output-format text \
+    --dangerously-skip-permissions \
+    --append-system-prompt "$sys_append" ) \
+    < "$prompt" > "$out" 2> "$err_tmp"
+  rc=$?
+else
+  # READ-ONLY planning. cwd = the target repo, ONLY the read-only navigation tools
+  # (Read/Grep/Glob) granted; no Edit/Write/Bash is allowlisted and we do NOT pass
+  # --dangerously-skip-permissions, so in headless `-p` mode any edit/exec tool is
+  # denied (it cannot prompt) and the planner cannot mutate the repo. The final
+  # message is captured to --out for the core extractor.
+  sys_append="Output ONLY a single JSON object that matches the grindstone epoch-decision schema (schema_version, tool, args). No prose, no markdown code fences, no commentary before or after the object."
+  ( cd "$repo" && "${timeout_prefix[@]}" claude -p \
+    --model "$model" \
+    --output-format text \
+    --allowedTools Read Grep Glob \
+    --append-system-prompt "$sys_append" ) \
+    < "$prompt" > "$out" 2> "$err_tmp"
+  rc=$?
+fi
 set -e
 
 cat "$err_tmp" >&2 || true

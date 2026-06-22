@@ -122,9 +122,14 @@ class PlannerTransport(Protocol):
     NEVER parses or validates (ruling 1). Raises the transport exception family
     on failure: ``RateLimited`` (→ backoff), ``TransportError`` / ``WorkerTimeout``
     (→ transient retry), ``PlannerHardError`` or anything else (→ human).
+
+    ``workdir`` is the boundary's writable planner worktree when one exists: a rig
+    that self-validates runs IN it (writing ``decision.json`` + looping on
+    ``check_decision.py``); a read-only rig ignores it. ``None`` leaves the rig on
+    its read-only fallback (no worktree: artifact-only run or unborn HEAD).
     """
 
-    def plan(self, prompt: str) -> str: ...
+    def plan(self, prompt: str, *, workdir: Path | None = None) -> str: ...
 
 
 # --- failure classification + backoff (ruling 2) -------------------------------

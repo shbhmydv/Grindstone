@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Union
 
 from grindstone.planner import PlannerHardError, RateLimited, TransportError, WorkerTimeout
@@ -44,7 +45,9 @@ class MockPlanner:
     wrap: str = "bare"
     _calls: int = field(default=0)
 
-    def plan(self, prompt: str) -> str:
+    def plan(self, prompt: str, *, workdir: Path | None = None) -> str:
+        # A pure scripted transport: no worktree to grind in, so ``workdir`` is
+        # accepted for protocol parity with ScriptPlanner and deliberately ignored.
         if self._calls >= len(self.script):
             raise AssertionError("mock planner script exhausted")
         entry = self.script[self._calls]

@@ -94,9 +94,9 @@ class _RecordingPlanner:
         self._inner = inner
         self.prompts: list[str] = []
 
-    def plan(self, prompt: str) -> str:
+    def plan(self, prompt: str, *, workdir: Path | None = None) -> str:
         self.prompts.append(prompt)
-        return self._inner.plan(prompt)
+        return self._inner.plan(prompt, workdir=workdir)
 
 
 def _impl_task_with_criteria(tid: str, fname: str, criteria: list[str]) -> dict[str, object]:

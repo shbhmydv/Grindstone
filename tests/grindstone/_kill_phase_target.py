@@ -46,7 +46,7 @@ class _PhasePlanner:
             implement_decision(impl_task("T1", "f1.txt")),
         ]
 
-    def plan(self, prompt: str) -> str:
+    def plan(self, prompt: str, *, workdir: Path | None = None) -> str:
         i = self.calls
         self.calls += 1
         if i < len(self.script):

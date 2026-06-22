@@ -90,9 +90,9 @@ class _Recording:
         self.inner = inner
         self.prompts: list[str] = []
 
-    def plan(self, prompt: str) -> str:
+    def plan(self, prompt: str, *, workdir: Path | None = None) -> str:
         self.prompts.append(prompt)
-        return self.inner.plan(prompt)
+        return self.inner.plan(prompt, workdir=workdir)
 
 
 # --- S5 repo-memory seam: frozen at run start, fed to every planner call ------
@@ -183,12 +183,14 @@ def test_planner_workspace_exposes_tip_tree_and_resolvable_manifest(
     assert leftover == []
 
 
-def test_first_planner_call_has_no_tip_but_still_exposes_keyed_log(
+def test_first_planner_call_grinds_in_head_worktree_for_self_validation(
     git_repo: Path, run_dir: RunDir
 ) -> None:
-    """The FIRST call (propose_skeleton) has no integration branch yet: the
-    workspace omits the tip path cleanly (no literal None) while still exposing the
-    keyed-log root."""
+    """The FIRST epoch boundary has no integration branch yet, but the planner
+    still needs a writable worktree to self-validate its decision in (a real
+    dogfood halt was on that first research epoch). The workspace falls back to a detached
+    HEAD checkout under ``_planner_tip``; the prompt exposes it and the keyed-log
+    root, never a literal None."""
 
     planner = _Recording(
         MockPlanner(script=[two_phase_skeleton(), complete_decision(check_cmd("true"))])
@@ -196,8 +198,11 @@ def test_first_planner_call_has_no_tip_but_still_exposes_keyed_log(
     run_grind(run_dir, job_path="job.md", planner=planner, ladder=_ladder(), repo=git_repo)
     first = planner.prompts[0]
     assert "<workspace>" in first
-    assert "none yet" in first  # no integration branch built yet
+    assert "_planner_tip" in first  # the writable HEAD worktree is exposed
     assert "integration_tip: None" not in first
+    assert "none yet" not in first
+    # The lifecycle still tears the worktree down (no leak after the run).
+    assert list((run_dir.root / "worktrees").glob("_planner_tip*")) == []
 
 
 # --- repo-map source: the integration TIP, not the stale operator tree ---------
@@ -244,24 +249,16 @@ def test_planner_repo_map_reads_integration_tip_not_operator_tree(
     assert outcome.final_branch is not None
     assert "f1.txt" in tracked_files(git_repo, outcome.final_branch)
 
-    # The first boundary (propose_skeleton) had no tip -> map source = operator tree.
+    # Every boundary builds its map from a dedicated _planner_tip checkout under the
+    # run dir, NEVER the operator tree (which still lacks f1.txt): the first boundary
+    # from a detached HEAD, each later one from the integration tip that CONTAINS
+    # f1.txt. The checkout is torn down after the boundary, so we assert via the
+    # recorded path's relation, not its survival.
     assert seen, "build_repo_map must be called at every boundary"
-    assert seen[0] == git_repo.resolve() or seen[0] == git_repo
-
-    # A LATER boundary ran after the epoch integrated f1.txt onto the tip. Its map
-    # source must be a checkout that CONTAINS f1.txt (the tip), and must NOT be the
-    # operator tree (which still lacks f1.txt). The tip checkout is torn down after
-    # the boundary, so we assert via the recorded path's relation, not its survival.
-    tip_sources = [p for p in seen if p != git_repo and p != git_repo.resolve()]
-    assert tip_sources, (
-        "a post-epoch boundary must build the map from the tip checkout, not the "
-        "operator tree"
-    )
-    # Each tip source is the dedicated _planner_tip worktree under the run dir,
-    # never the operator tree.
-    for src in tip_sources:
-        assert "_planner_tip" in str(src)
-        assert str(src).startswith(str(run_dir.root.resolve()))
+    for src in seen:
+        assert "_planner_tip" in str(src), src
+        assert str(src).startswith(str(run_dir.root.resolve())), src
+        assert src != git_repo and src != git_repo.resolve()
 
 
 def test_repo_map_written_to_run_dir_and_referenced_in_workspace(

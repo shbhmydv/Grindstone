@@ -27,7 +27,7 @@ class _BlockingPlanner:
         self.ready = ready
         self.release = release
 
-    def plan(self, prompt: str) -> str:
+    def plan(self, prompt: str, *, workdir: Path | None = None) -> str:
         self.ready.write_text("ready", encoding="utf-8")
         while not self.release.exists():
             os.sched_yield()

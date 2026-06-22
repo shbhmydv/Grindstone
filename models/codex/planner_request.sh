@@ -20,6 +20,11 @@ while [[ $# -gt 0 ]]; do
     --out)        out="$2";    shift 2 ;;
     --handle-out) handle_out="$2"; shift 2 ;;
     --timeout)    timeout="$2"; shift 2 ;;
+    # The codex rig plans READ-ONLY and does not self-validate, so it ignores the
+    # writable planner worktree grindstone offers: it writes its final message to
+    # --out and grindstone extracts + validates it (no decision.json is produced,
+    # so the core falls back to --out cleanly).
+    --workdir)    shift 2 ;;
     *) echo "planner_request: unknown arg: $1" >&2; exit 2 ;;
   esac
 done

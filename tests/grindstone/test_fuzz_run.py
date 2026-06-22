@@ -47,7 +47,7 @@ class _FuzzPlanner:
         self.rng = random.Random(seed)
         self.proposed = False
 
-    def plan(self, prompt: str) -> str:
+    def plan(self, prompt: str, *, workdir: Path | None = None) -> str:
         if not self.proposed:
             self.proposed = True
             return json.dumps(skeleton_decision(phase_dict("P1"), phase_dict("P2")))
@@ -129,7 +129,7 @@ class _MultiPhasePlanner:
         self.rng = random.Random(seed * 13 + 5)
         self.proposed = False
 
-    def plan(self, prompt: str) -> str:
+    def plan(self, prompt: str, *, workdir: Path | None = None) -> str:
         if not self.proposed:
             self.proposed = True
             return json.dumps(
