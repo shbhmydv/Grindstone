@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Protocol
 
+from grindstone.config import load_operating_skill
 from grindstone.contracts.gate import decision_schema_errors
 from grindstone.contracts.models import (
     ArtifactEpochArgs,
@@ -70,6 +71,8 @@ __all__ = [
     "MAX_RATE_LIMIT_WAITS",
     "MAX_REASKS",
     "MAX_TRANSIENT_RETRIES",
+    "PLANNER_CORE",
+    "PLANNER_SCENARIOS",
     "PhaseTailInfo",
     "PlannerHardError",
     "PlannerTransport",
@@ -84,6 +87,7 @@ __all__ = [
     "extract_decision_json",
     "flatten_last_epoch",
     "is_decision_like",
+    "select_planner_scenario",
     "stable_head",
     "validate_decision",
     "volatile_tail",
@@ -176,12 +180,28 @@ def backoff_delay(wait_index: int) -> float:
 
 # --- input construction: stable head (byte-identical across a run) -------------
 
-SYSTEM_PREAMBLE = """\
+#: The THIN, always-on planner core: the role identity + output discipline + the
+#: cross-cutting facts true for EVERY planner call regardless of scenario (the
+#: structural-check contract, the content-grep prohibition, the verification
+#: floor, references-not-payloads, read-capable planning, the verdict-by-reference
+#: steering, and the authoritative output envelope + args-by-tool table). It is
+#: ALWAYS included, in the byte-identical stable head; the per-call SCENARIO skill
+#: (selected by ``select_planner_scenario`` and loaded from ``skills/operating/
+#: planner/``) carries the situation-specific guidance and is composed after it.
+#:
+#: WHY a constant here and not a loaded markdown file (unlike the scenarios): the
+#: core lives in the stable head, whose byte-identity contract (ruling 3) must hold
+#: independent of on-disk state, and it is tightly coupled to this module's exports
+#: (the schema/tool names). The VARYING part is what benefits from being external
+#: and selectable, so only the scenarios are files; ``load_operating_skill`` stays
+#: role-generic for the worker/senior cores in the next round.
+PLANNER_CORE = """\
 You are the planner for Grindstone, a deterministic epoch-based orchestrator.
 You are a stateless one-shot call. The fixed state machine runs the loop, runs
 all checks, and integrates work; you only decide the NEXT step.
 
-Rules:
+A SCENARIO skill follows (after the job + skeleton): it carries the guidance for
+THIS call's situation. These CORE rules hold for EVERY decision:
 - Emit EXACTLY ONE tool call per turn, as a single JSON object matching the
   epoch_decision schema. No prose, no second object, no commentary.
 - The first decision of a run MUST be propose_skeleton. After that, every call
@@ -211,76 +231,6 @@ Rules:
   it either by its exact log key or by its bare filename, use the bare
   filename in phase exit criteria (the P*/E*/T*/ placement is decided epochs
   later); it passes only while exactly one logged artifact carries that name.
-- implement tasks carry `file_ownership` globs that must be pairwise DISJOINT
-  across the epoch (the merge-correctness mechanism). research/review/artifact
-  tasks carry `artifact_out`; review tasks also carry `targets`.
-- Choose the mode by the deliverable's DESTINATION, never by its flavor.
-  Output the job requires as a COMMITTED file in the repo tree, code, config,
-  docs, even prose, is implement work: only implement tasks run in a worktree
-  and get committed. Output consumed via the keyed log (an analysis, report,
-  or investigation the job does NOT require as a committed file) is research
-  or artifact work shipped through `artifact_out`; review judges existing work
-  and ships a verdict the same way. Never give a task a worktree its
-  deliverable does not need.
-- Sequence by tier of thinking. research/review (and visual epochs) run on the
-  stronger SENIOR tier; implement/artifact run on the WORKER tier (the local rig),
-  so a skeleton is also a routing choice: put judgment on senior, production on
-  the worker tier. For heavy or judgment-laden work, SPLIT into phases rather than
-  cramming it into a single worker epoch, and feed each step forward through the
-  keyed log (a non-implement epoch's `artifact_out` becomes a later epoch's
-  `inputs`). Good shapes (nudges, not a fixed menu): heavy build = research ->
-  implement -> review; report / triage / migration = research -> artifact (do NOT
-  collapse the analysis into one worker artifact epoch, that downgrades it off
-  senior); UI =
-  research -> implement with `visual:true` -> a phase exit criterion that builds,
-  screenshots, then `vision_review`s it. A small job can be a single epoch.
-- A review epoch must INDEPENDENTLY RE-DERIVE a sample of the claims or verdicts
-  it judges and RECONCILE them against the upstream artifact(s) it consumes via
-  `inputs`, not merely confirm that the expected sections or fields are present
-  (a presence-only review spends a planner call yet catches no wrong answer).
-  When a review consumes an upstream artifact, surfacing any contradiction
-  between the reviewed work and that artifact is a primary job of the review.
-- Taste routing: set `"visual": true` on an implement or review epoch whose
-  deliverable is FRONT-END / UI / visual / polish output (layout, styling, a
-  rendered page, a diagram, anything judged by how it LOOKS). That epoch is
-  built by the stronger taste-building senior tier instead of the worker default
-  (the senior is a text model; the actual image judgment is the vision_review
-  gate below). Omit it (defaults false) for non-visual work, backend, logic,
-  plain text/config.
-- Vision-review (taste gate): a third check `{"vision_review":{"screenshot":
-  "<path relative to the eval worktree>","criteria":"<what polished looks
-  like>"}}` makes a strong vision model JUDGE a rendered screenshot against
-  criteria and emit a pass/fail verdict. Use it ONLY in a PHASE EXIT CRITERION
-  for a visual phase: put a cmd check FIRST that builds + screenshots the UI
-  into the tip worktree (e.g. `{"cmd":"npm run build && node shot.js
-  ui/screen.png"}`), then a `vision_review` of that `ui/screen.png` against the
-  design bar. The state machine renders the verdict deterministically (a failed
-  taste verdict fails the phase, just like a failed command), it is not a task
-  `done_when` (a worker scratch has no renderer/screenshot).
-- done_when is scoped by mode. research/review/artifact tasks run in a scratch
-  dir that is NOT a repo checkout: their done_when must verify the
-  artifact itself (e.g. `test -s notes.md` in the task CWD, or an
-  artifact_exists key), never repo build/test commands; those can only pass in
-  implement tasks or phase exit criteria (run in a checkout of the tip).
-- revise_phases means the PHASE STRUCTURE/plan is wrong (wrong milestones, wrong
-  exit criteria, a missing or mis-scoped phase), NOT that one epoch's work
-  failed. Do NOT use revise_phases to react to a failed epoch, the state machine
-  asks you a separate, focused handle_failed_epoch decision for that (below).
-- When an epoch FAILS (a task exhausted its retry ladder, and/or the phase gate
-  kept failing), the next call is CONSTRAINED to handle_failed_epoch: choose
-  exactly one action for THAT epoch, retry (with a `hint`, optionally
-  `escalate_tier:true` to start on senior), escalate_senior (with a `diagnosis`),
-  or halt (with a `reason`, stops the run for a human). The input carries the
-  failed checks WITH their captured command output and the worker handoffs that
-  claimed pass, read them before deciding.
-- GATE SKEPTICISM: if the workers repeatedly report an HONEST pass (their
-  done_when passed in their scratch) while the PHASE GATE keeps failing the SAME
-  way, SUSPECT the gate or the environment, not the code: a missing dependency, a
-  wrong verification context, a check that cannot run where the gate runs it. The
-  captured check output is your evidence. In that situation prefer halt (with a
-  reason naming the suspected env/gate problem) over ordering yet another
-  identical code repair, repeated identical repairs against a structurally
-  unpassable gate is the failure mode this decision exists to stop.
 - The last epoch's verification VERDICT (when one ran) is in the `<workspace>`
   manifest as a `.../verdict.json` path. It holds the verifier's per-criterion
   judgement, the unmet `gaps`, and a DESCRIPTIVE steering `digest` (what the epoch
@@ -306,83 +256,6 @@ Rules:
   tree never changes what passes, and reading is your OWN internal step. Whatever
   you read, your turn STILL ends with EXACTLY ONE epoch_decision tool call and
   nothing else.
-- escalate_run only when you genuinely cannot proceed. complete_run only when
-  the whole job is done; its `evidence` checks are re-run deterministically and
-  rejected if they fail.
-- A skeleton has BETWEEN 2 AND 10 phases. Even a small job needs at least two
-  (e.g. a build phase then a verify phase); phase ids are "P1","P2",… in order.
-  Each epoch has 1-8 tasks with ids "T1"…"T8".
-
-Decomposition is THREE distinct skills, one per level. Apply them in order, and
-keep them separate, the bias and unit of work differ at each level:
-
-[LEVEL 1: PHASING] Split the JOB into phases (propose_skeleton / revise_phases).
-- One phase = one MODE: research / implement / test / review. Do not mix modes
-  in a phase; a phase that "builds and reviews" is two phases.
-- A skeleton has BETWEEN 2 AND 10 phases; phase ids "P1","P2",… in order. Even a
-  small job needs at least two (e.g. a build phase then a verify phase).
-- Sequence by tier of thinking: research/review (and visual phases) run on the
-  stronger SENIOR tier, implement/test on the WORKER tier (the local rig), so
-  phasing is also a routing choice (judgment on senior, production on the worker
-  tier).
-
-[LEVEL 2: EPOCH] Split a PHASE into epochs (one work decision per call).
-- One epoch = one coherent FEATURE or milestone, not a whole phase at once and
-  not a single file. Each epoch boundary is a free planner checkpoint plus a
-  deterministic gate.
-- For an IMPLEMENT phase, the FIRST epoch is an explicit BASELINE DEPENDENCIES
-  epoch: stand up the project skeleton and produce the COMMITTED dependency
-  manifest/lockfile (e.g. package.json + its lockfile, pyproject + lockfile).
-  Later feature epochs build ON that baseline. Do NOT fold dependency setup into
-  a feature epoch, and do NOT try to install/build inside it, just create the
-  manifest as committed files; a separate prepare mechanism installs from the
-  lockfile when gates run.
-- Split SEQUENTIAL work across epochs LIBERALLY: give a step its own epoch
-  whenever it needs an earlier step's `artifact_out`, OR a real checkpoint/gate
-  sits between steps, even at the SAME tier. Do not fuse a genuine A-then-B
-  dependency into one opaque epoch; do not manufacture artificial steps either
-  (every epoch costs a planner call, bounded by `epoch_budget`).
-
-[LEVEL 3: TASK] Split an EPOCH into tasks (the parallel fan-out within it).
-- One task = one bounded SLICE, kept SMALL: a few files, with DISJOINT
-  file_ownership. A task that owns the whole repo (or a dozen unrelated files) is
-  NOT decomposed, the size gate will REJECT it and make you split further.
-- Tasks within an epoch run in PARALLEL and MUST NOT consume each other's
-  outputs. Anything where one task needs another's result is SEQUENTIAL work,
-  put it in a later epoch (or phase), never in a sibling task of the same epoch.
-- Two axes, OPPOSITE biases. Splitting SEQUENTIAL work across epochs (LEVEL 2):
-  be LIBERAL. Splitting PARALLEL tasks inside one epoch (this level): be
-  CONSERVATIVE. Decompose CONSERVATIVELY here, at the top level only: you are a
-  powerful planner, prefer ONE task whenever the work is even remotely
-  interconnected and shared context helps. Split into multiple tasks ONLY when
-  the parts are genuinely independent, or genuinely too big for one worker's
-  context. Naive fan-out of intertangled work hands the hardest part, cross-file
-  consistency, to the least-coordinated agents. But a single task may NOT swallow
-  the whole epoch's files: SMALL and bounded beats one giant task (the size gate
-  enforces this, see below).
-- Each task must fit ONE worker with a ~90k-token working context. Treat 90k as
-  the sizing CONTRACT: the worker has headroom above it, but that headroom is
-  overrun insurance, never plannable budget. If a task cannot plausibly fit, it
-  is two tasks or two epochs.
-- SIZE GATE (deterministic, enforced): a fresh implement task's `file_ownership`
-  is capped per tier (a small count on the worker tier, a larger one on senior/visual), and
-  a whole-repo glob (`**`, `**/*`, or a bare `*`) is REJECTED outright as "not
-  decomposed". An oversized or whole-repo task bounces back as an invalid
-  decision naming the offending task, split it. (A handle_failed_epoch repair may
-  carry broad scope, that path is exempt.)
-- `epoch_budget` is how many epochs a phase may consume before the state machine
-  fires a phase escalation (forcing you to revise_phases or escalate_run). It is
-  a ceiling sized to the phase's real arc, a small phase is 1-2, a broad build
-  phase a few more, not a target; unused budget is free. If the budget runs out
-  because an epoch FAILED, you get the focused handle_failed_epoch decision for
-  that epoch instead (it takes precedence); the revise_phases / escalate_run
-  escalation is for a phase whose gate never passes while its epochs all complete.
-- Carry the relevant job-spec requirements into each task's `goal` VERBATIM, or
-  point at the exact input artifacts (by log key) that contain them. Never
-  paraphrase or summarize a requirement away, lossy paraphrase silently drops
-  requirements. `goal` is capped at 1024 chars: quote exactly what fits and move
-  the rest into referenced input artifacts; never compress a requirement into a
-  summary.
 
 Output format, emit EXACTLY ONE JSON object with this envelope, nothing else:
   {"schema_version":"1","tool":"<one tool name>","args":{ ... }}
@@ -400,19 +273,42 @@ The keys schema_version, tool, args are ALL mandatory. Do NOT use the shorthand
 A check is {"cmd":..,"expect_exit"?:int} or {"artifact_exists":"<log key>"} or
 {"vision_review":{"screenshot":"<eval-worktree-relative path>","criteria":..}}
 (taste gate, phase exit criteria only, after a cmd check renders the shot).
-
-Example first decision (note: TWO phases minimum; checks are STRUCTURAL only):
-  {"schema_version":"1","tool":"propose_skeleton","args":{"phases":[
-    {"id":"P1","title":"Build","exit_criterion":[{"cmd":"test -f out.txt","expect_exit":0}],"epoch_budget":2},
-    {"id":"P2","title":"Verify","exit_criterion":[{"cmd":"npm test --silent","expect_exit":0}],"epoch_budget":1}]}}
-
-Example implement decision (two GENUINELY INDEPENDENT files, so two tasks with
-pairwise-DISJOINT file_ownership; each done_when is a STRUCTURAL check, content
-acceptance rides `criteria`; each goal quotes the spec VERBATIM):
-  {"schema_version":"1","tool":"implement","args":{"epoch_title":"Write greeting and version files","rationale":"two independent files, no shared state","tasks":[
-    {"id":"T1","goal":"Create greeting.txt. Spec verbatim: 'greeting.txt MUST contain exactly the line HELLO'.","done_when":[{"cmd":"test -f greeting.txt"}],"criteria":["greeting.txt contains exactly the line HELLO"],"file_ownership":["greeting.txt"]},
-    {"id":"T2","goal":"Create version.txt. Spec verbatim: 'version.txt MUST contain exactly the line 1.0.0'.","done_when":[{"cmd":"test -f version.txt"}],"criteria":["version.txt contains exactly the line 1.0.0"],"file_ownership":["version.txt"]}]}}
 """
+
+
+#: The planner scenario names: one operating skill each under
+#: ``skills/operating/planner/<scenario>.md``, selected by ``select_planner_scenario``.
+PLANNER_SCENARIOS: frozenset[str] = frozenset(
+    {"plan_skeleton", "plan_epoch", "repair_epoch"}
+)
+
+
+def select_planner_scenario(
+    *, skeleton_exists: bool, failed_epoch_active: bool
+) -> str:
+    """Pick the planner's scenario skill from durable run state (pure, no I/O).
+
+    A state-machine lookup over the SAME signals the position-legality gate keys
+    on, so the skill the planner reads always matches the decision the gate will
+    accept:
+
+    * no skeleton yet -> ``plan_skeleton`` (propose_skeleton is the only legal
+      tool, decompose the job into the phase skeleton).
+    * a failed epoch awaiting disposition -> ``repair_epoch`` (handle_failed_epoch
+      is the only legal tool).
+    * otherwise -> ``plan_epoch`` (the steady-state work decision).
+
+    PRECEDENCE mirrors ``_position_legality``: the skeleton question is settled
+    FIRST (a failed epoch cannot exist before a skeleton, since epochs require
+    one), so ``skeleton_exists == False`` dominates; only once a skeleton exists
+    does ``failed_epoch_active`` route to repair, else the default plan_epoch.
+    """
+
+    if not skeleton_exists:
+        return "plan_skeleton"
+    if failed_epoch_active:
+        return "repair_epoch"
+    return "plan_epoch"
 
 
 def _compact(obj: object) -> str:
@@ -444,12 +340,25 @@ def stable_head(job: str, skeleton: list[Phase] | None, repo_memory: str | None 
         else "<repo_memory>\n</repo_memory>\n"
     )
     return (
-        f"<system>\n{SYSTEM_PREAMBLE}</system>\n"
+        f"<system>\n{PLANNER_CORE}</system>\n"
         f"<job>\n{job}\n</job>\n"
         "<skills>\n</skills>\n"
         f"{memory_slot}"
         f"<skeleton>\n{skeleton_json}\n</skeleton>\n"
     )
+
+
+def _scenario_block(scenario: str) -> str:
+    """Wrap the selected operating skill in its delimited ``<scenario>`` block.
+
+    The scenario varies per call (it keys on the VOLATILE failed-epoch signal), so
+    it lives here in ``build_planner_input`` between the byte-identical head and the
+    volatile tail, NOT in ``stable_head`` (whose byte-identity contract must not key
+    on volatile state). The skill text is loaded verbatim from
+    ``skills/operating/planner/<scenario>.md`` through the role-generic loader."""
+
+    skill = load_operating_skill("planner", scenario)
+    return f'<scenario name="{scenario}">\n{skill}</scenario>\n'
 
 
 # --- input construction: volatile tail -----------------------------------------
@@ -767,22 +676,37 @@ def build_planner_input(
     failed_epoch: FailedEpochInfo | None = None,
     workspace: "WorkspaceInfo | None" = None,
 ) -> str:
-    """Full constructed input: ``stable_head`` + ``volatile_tail`` (ruling 3).
+    """Full constructed input: ``stable_head`` + ``<scenario>`` + ``volatile_tail``.
+
+    The stable head carries the always-on ``PLANNER_CORE``; between it and the tail,
+    the ONE deterministically-selected operating skill is composed in. The scenario
+    is derived from the SAME durable signals the gate keys on (a skeleton exists iff
+    ``skeleton is not None``; an epoch awaits failure disposition iff ``failed_epoch
+    is not None``), so the guidance the planner reads always matches the decision the
+    gate will accept, no new state is invented.
 
     ``workspace`` (when present) is injected into the volatile tail only; the stable
     head stays byte-identical across a run regardless of it. The structural repo-map and
     the verifier's verdict (digest + evidence + gaps) are delivered BY REFERENCE through
     the ``workspace`` manifest (``repo_map`` + the ``verdict.json`` path), not inlined."""
 
-    return stable_head(job, skeleton, repo_memory) + volatile_tail(
-        phase_id=phase_id,
-        epoch_counter=epoch_counter,
-        log_index=log_index,
-        last_epoch_rows=last_epoch_rows,
-        reask_errors=reask_errors,
-        phase=phase,
-        failed_epoch=failed_epoch,
-        workspace=workspace,
+    scenario = select_planner_scenario(
+        skeleton_exists=skeleton is not None,
+        failed_epoch_active=failed_epoch is not None,
+    )
+    return (
+        stable_head(job, skeleton, repo_memory)
+        + _scenario_block(scenario)
+        + volatile_tail(
+            phase_id=phase_id,
+            epoch_counter=epoch_counter,
+            log_index=log_index,
+            last_epoch_rows=last_epoch_rows,
+            reask_errors=reask_errors,
+            phase=phase,
+            failed_epoch=failed_epoch,
+            workspace=workspace,
+        )
     )
 
 

@@ -40,6 +40,38 @@ _CONFIG_REL = Path(".grindstone") / "config.yaml"
 #: ``script:`` must live UNDER here unless the operator opts out (below).
 MODELS_DIR = Path(__file__).resolve().parents[1] / "models"
 
+#: This rig's bundled operating-skills directory (``skills/`` beside the package),
+#: mirrors ``MODELS_DIR``. Grindstone owns these backend-agnostic markdown skills:
+#: an operating skill is the thin, deterministically-selected guidance a ROLE
+#: (planner / worker / senior) gets for ONE call situation, composed into the
+#: prompt as plain text (never a backend flag). They live under
+#: ``skills/operating/<role>/<scenario>.md``; ``load_operating_skill`` resolves them.
+SKILLS_DIR = Path(__file__).resolve().parents[1] / "skills"
+
+#: The operating-skills subtree under ``SKILLS_DIR`` (room for repo-owned domain
+#: skills under a sibling subtree later).
+_OPERATING_SUBDIR = "operating"
+
+
+def load_operating_skill(role: str, scenario: str) -> str:
+    """Read the operating skill ``skills/operating/<role>/<scenario>.md``.
+
+    Role-generic on purpose: the planner selects one of its scenarios today, and
+    the worker / senior roles reuse the SAME loader for their own scenarios. The
+    skill is returned verbatim for the caller to compose into the prompt. Raises
+    ``FileNotFoundError`` (naming the resolved path) when the file is missing, a
+    selector that names a scenario with no skill file is a build error, never a
+    silent empty prompt.
+    """
+
+    path = SKILLS_DIR / _OPERATING_SUBDIR / role / f"{scenario}.md"
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise FileNotFoundError(
+            f"no operating skill for role={role!r} scenario={scenario!r} at {path}"
+        ) from exc
+
 #: The tracked base rig: the shipped Claude (Opus) scripts a fresh cloner runs with
 #: zero setup. ``models_script`` always falls back here (the floor).
 _CLAUDE_FLOOR = "claude"

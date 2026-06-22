@@ -14,10 +14,13 @@ from grindstone.epoch_loop import (
     IntegrationOutcome,
     TaskResult,
 )
+from grindstone.config import load_operating_skill
 from grindstone.planner import (
     BACKOFF_CAP_S,
     MAX_RATE_LIMIT_WAITS,
-    SYSTEM_PREAMBLE,
+    PLANNER_CORE,
+    PLANNER_SCENARIOS,
+    FailedEpochInfo,
     PlannerHardError,
     RateLimited,
     TransportError,
@@ -27,11 +30,31 @@ from grindstone.planner import (
     build_planner_input,
     classify_failure,
     flatten_last_epoch,
+    select_planner_scenario,
     stable_head,
     validate_decision,
     volatile_tail,
 )
 from grindstone.rundir import create_run_dir
+
+
+def _plan_skeleton() -> str:
+    return load_operating_skill("planner", "plan_skeleton")
+
+
+def _plan_epoch() -> str:
+    return load_operating_skill("planner", "plan_epoch")
+
+
+def _repair_epoch() -> str:
+    return load_operating_skill("planner", "repair_epoch")
+
+
+def _all_planner_guidance() -> str:
+    """The union of the always-on CORE + every selectable scenario skill: the full
+    instruction surface the split must preserve (nothing silently dropped)."""
+
+    return PLANNER_CORE + _plan_skeleton() + _plan_epoch() + _repair_epoch()
 
 from tests.grindstone.conftest import (
     complete_decision,
@@ -44,6 +67,17 @@ from tests.grindstone.conftest import (
 
 def _phases(*ids: str) -> list[Phase]:
     return [Phase.model_validate(phase_dict(i)) for i in ids]
+
+
+def _failed_epoch() -> FailedEpochInfo:
+    return FailedEpochInfo(
+        epoch_id="E1",
+        failed_tasks=[("T1", "no handoff.json written")],
+        failed_checks=["cmd `npx tsc` (exit 1)"],
+        passing_handoffs=[("T1", "implemented as asked")],
+        disposed_count=1,
+        cap=3,
+    )
 
 
 # --- failure classification (ruling 2) -----------------------------------------
@@ -64,64 +98,132 @@ def test_backoff_schedule_doubles_and_caps() -> None:
     assert backoff_delay(10) == BACKOFF_CAP_S  # saturates at the cap
 
 
-# --- preamble teaching content (audit fixes #3, #4) ----------------------------
+# --- operating-skill split: CORE + selected scenario (Batch 1) -----------------
 
 
-def test_preamble_teaches_sizing_independence_and_decomposition() -> None:
-    # Task independence: parallel tasks must not consume each other's outputs.
-    assert "MUST NOT consume each other's" in SYSTEM_PREAMBLE
-    # The ~90k worker-context sizing contract (ARCHITECTURE.md floor/ceiling).
-    assert "90k" in SYSTEM_PREAMBLE
-    # epoch_budget meaning explained, not just emitted.
-    assert "epoch_budget" in SYSTEM_PREAMBLE
-    assert "phase escalation" in SYSTEM_PREAMBLE
-    # Conservative top-level decomposition (owner ruling 2026-06-12).
-    assert "Decompose CONSERVATIVELY" in SYSTEM_PREAMBLE
-    # Verbatim job-spec requirements in goals (owner architectural ruling) + the
-    # 1024-char cap escape hatch (quote what fits, reference the rest).
-    assert "VERBATIM" in SYSTEM_PREAMBLE
-    assert "1024" in SYSTEM_PREAMBLE
+def test_select_planner_scenario_maps_state_to_skill() -> None:
+    # No skeleton yet -> decompose the job (propose_skeleton is the only legal tool).
+    assert (
+        select_planner_scenario(skeleton_exists=False, failed_epoch_active=False)
+        == "plan_skeleton"
+    )
+    # A failed epoch awaiting disposition -> the focused repair scenario.
+    assert (
+        select_planner_scenario(skeleton_exists=True, failed_epoch_active=True)
+        == "repair_epoch"
+    )
+    # Steady state (skeleton exists, nothing failed) -> the default work scenario.
+    assert (
+        select_planner_scenario(skeleton_exists=True, failed_epoch_active=False)
+        == "plan_epoch"
+    )
+    # PRECEDENCE: the skeleton question is settled FIRST (a failed epoch cannot
+    # exist before a skeleton); no-skeleton dominates even if the flag is set.
+    assert (
+        select_planner_scenario(skeleton_exists=False, failed_epoch_active=True)
+        == "plan_skeleton"
+    )
+    # Every name the selector can return has a loadable skill file.
+    for sk in (False, True):
+        for fe in (False, True):
+            assert (
+                select_planner_scenario(skeleton_exists=sk, failed_epoch_active=fe)
+                in PLANNER_SCENARIOS
+            )
 
 
-def test_preamble_constrains_artifact_mode_done_when() -> None:
-    """E2E gate2 finding: the planner attached repo test commands to an artifact
-    task's done_when, unsatisfiable by construction (artifact CWD is run-dir
-    scratch, not a repo checkout), so the task burned every attempt on a check
-    that could never pass. The preamble must scope done_when by mode."""
-
-    assert "artifact itself" in SYSTEM_PREAMBLE
-    assert "never repo build/test commands" in SYSTEM_PREAMBLE
-
-
-def test_preamble_teaches_mode_selection_by_destination() -> None:
-    """E2E gates 3+4 (2/2): document deliverables always came out `implement`.
-    Both jobs demanded the file IN the repo tree, so implement was right, but
-    the preamble never taught the selection rule at all, so jobs wanting
-    log-keyed deliverables (analyses, reports) would get worktrees too. The
-    rule follows the deliverable's DESTINATION: committed repo files (even
-    prose) = implement, the only mode that commits; log-keyed deliverables =
-    research/artifact via artifact_out, no worktree."""
-
-    assert "DESTINATION" in SYSTEM_PREAMBLE
-    assert "even prose" in SYSTEM_PREAMBLE
-    assert "consumed via the keyed log" in SYSTEM_PREAMBLE
-
-
-def test_preamble_teaches_artifact_publication_and_bare_filename_checks() -> None:
-    """Gate-6 RCA companion: the planner must know (a) accepted artifact tasks
-    get their artifact_out PUBLISHED to the keyed log, and (b) an
-    artifact_exists check may use a bare filename, required at skeleton time,
-    when the P*/E*/T*/ placement is unknowable, matching exactly one logged
-    artifact."""
-
-    assert "published to the keyed log" in SYSTEM_PREAMBLE
-    assert "bare filename" in SYSTEM_PREAMBLE
+def test_build_planner_input_composes_core_plus_one_scenario() -> None:
+    # Sentinels unique to each scenario file (present in exactly one of the three).
+    sentinels = {
+        "plan_skeleton": "[LEVEL 1: PHASING]",
+        "plan_epoch": "[LEVEL 2: EPOCH]",
+        "repair_epoch": "GATE SKEPTICISM",
+    }
+    core_sentinel = "A SCENARIO skill follows"
+    cases = {
+        "plan_skeleton": dict(skeleton=None, failed_epoch=None),
+        "plan_epoch": dict(skeleton=_phases("P1", "P2"), failed_epoch=None),
+        "repair_epoch": dict(skeleton=_phases("P1", "P2"), failed_epoch=_failed_epoch()),
+    }
+    for scenario, state in cases.items():
+        prompt = build_planner_input(
+            job=_JOB, phase_id="P1", epoch_counter=1, log_index=[],
+            last_epoch_rows=None, reask_errors=[],
+            **state,  # type: ignore[arg-type]
+        )
+        # The always-on CORE is present in every composition.
+        assert core_sentinel in prompt
+        assert f'<scenario name="{scenario}">' in prompt
+        # The selected scenario's sentinel is present...
+        assert sentinels[scenario] in prompt
+        # ...and the OTHER two scenarios' sentinels are NOT.
+        for other, sent in sentinels.items():
+            if other != scenario:
+                assert sent not in prompt
 
 
-def test_preamble_carries_valid_implement_example() -> None:
-    # Audit fix #4: a worked implement example exists and is valid JSON.
-    start = SYSTEM_PREAMBLE.index('{"schema_version":"1","tool":"implement"')
-    obj, _ = json.JSONDecoder().raw_decode(SYSTEM_PREAMBLE[start:])
+def test_split_preserves_every_load_bearing_instruction() -> None:
+    """Content-preservation guard: the monolithic preamble was split into CORE +
+    three scenario files. Every load-bearing instruction must survive SOMEWHERE in
+    the union, nothing silently dropped by the reorganization."""
+
+    union = _all_planner_guidance()
+    for phrase in (
+        # task sizing / decomposition (was LEVEL 2/3)
+        "MUST NOT consume each other's",
+        "90k",
+        "epoch_budget",
+        "phase escalation",
+        "Decompose CONSERVATIVELY",
+        "VERBATIM",
+        "1024",
+        "BASELINE DEPENDENCIES",
+        "lockfile",
+        "SIZE GATE",
+        # mode selection + done_when scoping
+        "DESTINATION",
+        "even prose",
+        "consumed via the keyed log",
+        "artifact itself",
+        "never repo build/test commands",
+        # references / artifact publication (CORE)
+        "published to the keyed log",
+        "bare filename",
+        # structural-checks + content-grep contract (CORE)
+        "CONTENT-GREP",
+        "STRUCTURAL",
+        "FLOOR",
+        "`criteria`",
+        # failed-epoch repair scenario
+        "handle_failed_epoch",
+        "GATE SKEPTICISM",
+        # phasing scenario
+        "[LEVEL 1: PHASING]",
+        "[LEVEL 2: EPOCH]",
+        "[LEVEL 3: TASK]",
+    ):
+        assert phrase in union, f"lost instruction: {phrase!r}"
+    # The split's own examples must still author no content-grep check.
+    assert "grep -q" not in union
+
+
+def test_core_holds_the_always_on_contract() -> None:
+    # Output discipline + the authoritative envelope live in the always-on CORE.
+    assert "EXACTLY ONE tool call" in PLANNER_CORE
+    assert '{"schema_version":"1","tool":"<one tool name>","args":{ ... }}' in PLANNER_CORE
+    # The cross-cutting check contract (structural-only, no content-greps, floor).
+    assert "CONTENT-GREP" in PLANNER_CORE
+    assert "FLOOR" in PLANNER_CORE
+    # Read-capable planning + verdict-by-reference steering are call-invariant.
+    assert "READ-CAPABLE PLANNING" in PLANNER_CORE
+    assert "verdict.json" in PLANNER_CORE
+
+
+def test_plan_epoch_skill_carries_valid_implement_example() -> None:
+    # The worked implement example moved to the plan_epoch scenario; still valid JSON.
+    skill = _plan_epoch()
+    start = skill.index('{"schema_version":"1","tool":"implement"')
+    obj, _ = json.JSONDecoder().raw_decode(skill[start:])
     assert obj["tool"] == "implement"
     tasks = obj["args"]["tasks"]
     # Models disjoint ownership across the epoch + machine-checkable done_when.
@@ -324,12 +426,13 @@ def test_preamble_invites_reading_the_workspace() -> None:
     paths for steering, while keeping the JSON-only contract + deterministic-floor
     disposition intact."""
 
-    assert "<workspace>" in SYSTEM_PREAMBLE
+    # Read-capable planning is call-invariant, so it lives in the always-on CORE.
+    assert "<workspace>" in PLANNER_CORE
     # Read-capability is stated, and that it is for STEERING only (the floor disposes).
-    assert "read" in SYSTEM_PREAMBLE and "grep" in SYSTEM_PREAMBLE.lower()
-    assert "STEERING" in SYSTEM_PREAMBLE or "steering" in SYSTEM_PREAMBLE
+    assert "read" in PLANNER_CORE and "grep" in PLANNER_CORE.lower()
+    assert "STEERING" in PLANNER_CORE or "steering" in PLANNER_CORE
     # The JSON-only output contract is reaffirmed after the reading invitation.
-    assert "EXACTLY ONE" in SYSTEM_PREAMBLE
+    assert "EXACTLY ONE" in PLANNER_CORE
 
 
 def test_workspace_block_carries_absolute_paths(tmp_path: Path) -> None:
@@ -428,12 +531,12 @@ def test_workspace_block_omits_repo_map_entry_when_absent(tmp_path: Path) -> Non
 
 
 def test_preamble_points_planner_at_workspace_repo_map_path() -> None:
-    """SYSTEM_PREAMBLE must describe the repo-map as an on-disk file referenced from
-    the <workspace> (read it for structural planning), NOT as an inline prompt block.
+    """The CORE must describe the repo-map as an on-disk file referenced from the
+    <workspace> (read it for structural planning), NOT as an inline prompt block.
     The old inline-map wording is gone."""
 
-    assert "repo_map" in SYSTEM_PREAMBLE
-    assert "<repo_map>" not in SYSTEM_PREAMBLE
+    assert "repo_map" in PLANNER_CORE
+    assert "<repo_map>" not in _all_planner_guidance()
 
 
 def test_build_planner_input_threads_workspace_in_tail(tmp_path: Path) -> None:
@@ -660,28 +763,28 @@ def test_gate_allows_structural_checks_in_done_when() -> None:
 
 
 def test_preamble_forbids_content_greps_and_teaches_criteria() -> None:
-    # The preamble explicitly forbids content-grep checks and steers the planner
-    # to express semantic acceptance as natural-language `criteria` instead.
-    assert "CONTENT-GREP" in SYSTEM_PREAMBLE
-    assert "`criteria`" in SYSTEM_PREAMBLE
+    # The content-grep contract is cross-cutting, so it lives in the always-on CORE:
+    # it forbids content-grep checks and steers semantic acceptance into `criteria`.
+    assert "CONTENT-GREP" in PLANNER_CORE
+    assert "`criteria`" in PLANNER_CORE
     # The forbiddance names the grep family it rejects.
-    assert "grep" in SYSTEM_PREAMBLE
+    assert "grep" in PLANNER_CORE
     # checks/done_when are scoped to STRUCTURAL facts.
-    assert "STRUCTURAL" in SYSTEM_PREAMBLE
+    assert "STRUCTURAL" in PLANNER_CORE
     # The verification floor is owned by repo config + core, not restated.
-    assert "FLOOR" in SYSTEM_PREAMBLE
-    # The preamble's own examples must not author content-grep checks.
-    assert "grep -q" not in SYSTEM_PREAMBLE
+    assert "FLOOR" in PLANNER_CORE
+    # No part of the split (core + every scenario) authors a content-grep check.
+    assert "grep -q" not in _all_planner_guidance()
 
 
 def test_preamble_teaches_three_level_skill_split() -> None:
-    # Part 4A: the decomposition guidance is split into clearly delineated,
-    # per-level sections (phasing / epoch / task), one skill each.
-    assert "[LEVEL 1: PHASING]" in SYSTEM_PREAMBLE
-    assert "[LEVEL 2: EPOCH]" in SYSTEM_PREAMBLE
-    assert "[LEVEL 3: TASK]" in SYSTEM_PREAMBLE
+    # The decomposition guidance is split per level, now across the scenario skills:
+    # LEVEL 1 phasing lives in plan_skeleton; LEVELS 2/3 live in plan_epoch.
+    assert "[LEVEL 1: PHASING]" in _plan_skeleton()
+    assert "[LEVEL 2: EPOCH]" in _plan_epoch()
+    assert "[LEVEL 3: TASK]" in _plan_epoch()
     # The implement-phase baseline-dependencies epoch (committed manifest/lockfile).
-    assert "BASELINE DEPENDENCIES" in SYSTEM_PREAMBLE
-    assert "lockfile" in SYSTEM_PREAMBLE
+    assert "BASELINE DEPENDENCIES" in _plan_epoch()
+    assert "lockfile" in _plan_epoch()
     # The size gate is advertised in the task-level guidance.
-    assert "SIZE GATE" in SYSTEM_PREAMBLE
+    assert "SIZE GATE" in _plan_epoch()
