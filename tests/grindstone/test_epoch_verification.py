@@ -786,6 +786,23 @@ def test_prepare_failure_routes_to_planner_as_semantic_gap_not_infra(
     assert verifier._transport.seen_briefs == []  # type: ignore[attr-defined]
     # The run did NOT escalate with the verifier-tooling message (the old infra path).
     assert outcome.reason is None or "could not be prepared" not in outcome.reason.lower()
+    # The gap routed to the planner is CAPABILITY-NEUTRAL: it tells the planner to
+    # resolve the conflict by ALIGNING/correcting versions and explicitly warns against
+    # DROPPING dependencies the app needs (so the planner does not lazily delete a
+    # required package to make install succeed, silently killing a capability).
+    from grindstone.events import EpochVerificationFailed
+
+    vfailed = [
+        e for e in read_events(run_dir.events_path)
+        if isinstance(e, EpochVerificationFailed)
+    ]
+    assert vfailed, "the prepare failure must route as a verification gap"
+    gap_text = " ".join(vfailed[0].gaps).lower()
+    assert "prepare step failed" in gap_text  # still references the failed prepare
+    assert "align" in gap_text  # resolve by aligning compatible versions
+    # ...and explicitly warns AGAINST removing/dropping needed dependencies.
+    assert "without dropping" in gap_text or "not by removing" in gap_text
+    assert "drop" in gap_text or "remov" in gap_text
 
 
 def test_prepare_failure_persists_full_output_to_keyed_log_by_reference(

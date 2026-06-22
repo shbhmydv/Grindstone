@@ -1443,11 +1443,16 @@ def _verify_epoch(
             # gap (through handle_failed_epoch), never a human dead-end escalation. The
             # FULL prepare output is persisted to a keyed-log path so it reaches the
             # planner BY REFERENCE (the gap carries the PATH, not the multi-KB body).
+            # The guidance is CAPABILITY-NEUTRAL: it steers the planner to resolve the
+            # conflict by ALIGNING compatible versions and explicitly warns against
+            # dropping a dependency the app needs (the lazy "make install pass" fix that
+            # silently kills a capability, e.g. removing react-dom to clear a conflict).
             keyed = _persist_prepare_failure(run_dir, phase_id, outcome.epoch_id, str(exc))
             return [
                 f"the epoch's committed code does not install in a clean environment: "
-                f"the prepare step failed (see {keyed}); fix the dependency manifest so "
-                f"it installs cleanly"
+                f"the prepare step failed (see {keyed}); fix the manifest so it installs "
+                f"cleanly WITHOUT dropping dependencies the app needs: resolve version "
+                f"conflicts by aligning compatible versions, not by removing packages"
             ]
         verdict = _verify_with_retries(
             verifier, worktree, brief, phase_id, outcome, run_dir
