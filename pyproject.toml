@@ -2,11 +2,16 @@
 pythonpath = ["."]
 testpaths = ["tests"]
 # The `real` marker tags rung gates that exercise live infrastructure
-# (llama-server workers on :8080/:8082, the codex exec planner). Excluded
-# from the default unit suite; run via `pytest tests/grindstone -m real`.
-addopts = "-q --tb=short -m 'not real'"
+# (llama-server workers on :8080/:8082, the codex exec planner). The `eval`
+# marker tags the behavioral planner eval corpus (tests/grindstone/eval/): it
+# drives a REAL model through a rig and asserts PROPERTIES (bands, not goldens)
+# of the decisions. Both are slow + need live endpoints, so both are excluded
+# from the default unit suite; run the eval corpus via
+# `GRINDSTONE_EVAL_RIG=local pytest tests/grindstone/eval -m eval`.
+addopts = "-q --tb=short -m 'not real and not eval'"
 markers = [
     "real: rung gate against live workers/planner (excluded by default)",
+    "eval: behavioral planner eval against a live rig (excluded by default)",
 ]
 
 [project]
