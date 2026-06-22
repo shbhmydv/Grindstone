@@ -229,7 +229,7 @@ def test_flatten_last_epoch_reads_handoff_refs(tmp_path: Path) -> None:
         phase_id="P1", epoch_id="E1", status="completed",
         tasks=[
             TaskResult(task_id="T1", fq_task_id="P1/E1/T1", status="done", attempts=1,
-                       tier="local", handoff_key=key, failure_reason=None),
+                       tier="worker", handoff_key=key, failure_reason=None),
             TaskResult(task_id="T2", fq_task_id="P1/E1/T2", status="failed", attempts=4,
                        tier="cloud", handoff_key=None, failure_reason="no handoff.json written"),
         ],
@@ -277,7 +277,7 @@ def test_flatten_last_epoch_preserves_full_what_changed(tmp_path: Path) -> None:
         phase_id="P1", epoch_id="E1", status="completed",
         tasks=[
             TaskResult(task_id="T1", fq_task_id="P1/E1/T1", status="done", attempts=1,
-                       tier="local", handoff_key=key, failure_reason=None),
+                       tier="worker", handoff_key=key, failure_reason=None),
         ],
         integration=IntegrationOutcome(status="completed", branch="b", merged=["T1"], conflict=None),
     )

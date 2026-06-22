@@ -54,7 +54,7 @@ TS = "2026-06-10T00:00:00+00:00"
 
 
 def _ladder() -> list[tuple[str, OwnershipWorker]]:
-    return [("local", OwnershipWorker())]
+    return [("worker", OwnershipWorker())]
 
 
 def _craft_awaiting_planner(run_dir: RunDir) -> None:
@@ -140,7 +140,7 @@ def _craft_running_epoch(repo: Path, run_dir: RunDir) -> dict[str, object]:
         journal.append(TaskDispatched(seq=4, ts=TS, epoch_id="E1", task_id="T1"))
     cursor = TaskCursorState(
         fq_task_id="P1/E1/T1", task_id="T1", mode="implement", status="running",
-        tier_index=0, tier_name="local", tier_attempt=1, attempt=1,
+        tier_index=0, tier_name="worker", tier_attempt=1, attempt=1,
         scratch=str(run_dir.root / "worktrees" / "T1" / "attempt-1"),
         branch=ident.attempt_branch(1), failure_context=[], reason=None,
     )
@@ -174,7 +174,7 @@ def test_resume_running_epoch_verifies_inflight_epoch(git_repo: Path, run_dir: R
     gaps = ["f1.txt is wrong"]
     planner = MockPlanner(script=[handle_failed_epoch_halt("unverified gap")])
     outcome = resume_grind(
-        run_dir, planner=planner, ladder=[("local", OwnershipWorker())], repo=git_repo,
+        run_dir, planner=planner, ladder=[("worker", OwnershipWorker())], repo=git_repo,
         verifier=WorkerEpochVerifier(_VerifierWorker(passed=False, gaps=gaps)),
     )
     assert outcome.status == "escalated"

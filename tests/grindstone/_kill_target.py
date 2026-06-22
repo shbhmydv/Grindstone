@@ -63,7 +63,7 @@ def main() -> None:
         run_dir,
         args=implement_epoch(t1, t2),
         mode="implement",
-        ladder=[("local", _Router(Path(ready), Path(release)))],
+        ladder=[("worker", _Router(Path(ready), Path(release)))],
         repo=repo,
         concurrency=2,
     )

@@ -54,7 +54,7 @@ def _run(run_dir: RunDir, repo: Path, tasks: list[ImplementTask], worker: Worker
         run_dir,
         args=implement_epoch(*tasks),
         mode="implement",
-        ladder=[("local", worker)],
+        ladder=[("worker", worker)],
         repo=repo,
         **kw,
     )
@@ -314,7 +314,7 @@ def test_artifact_epoch_skips_integration(tmp_path: Path) -> None:
     )
     worker = HandoffWorker(handoff_payload(out_file="note.md"), files={"note.md": "hi"})
     outcome = run_one_epoch(
-        run_dir, args=artifact_epoch(task), mode="artifact", ladder=[("local", worker)]
+        run_dir, args=artifact_epoch(task), mode="artifact", ladder=[("worker", worker)]
     )
     assert outcome.status == "completed"
     assert outcome.integration.status == "skipped"
@@ -362,7 +362,7 @@ def _done_outcome(task_id: str, branch: str) -> TaskOutcome:
     return TaskOutcome(
         identity=TaskIdentity("run-1", "P1", "E1", task_id),
         status="done",
-        tier="local",
+        tier="worker",
         attempts=1,
         handoff=None,
         handoff_key=None,

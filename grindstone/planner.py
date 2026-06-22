@@ -223,14 +223,15 @@ Rules:
   and ships a verdict the same way. Never give a task a worktree its
   deliverable does not need.
 - Sequence by tier of thinking. research/review (and visual epochs) run on the
-  stronger SENIOR tier; implement/artifact run on the local rig, so a skeleton
-  is also a routing choice: put judgment on senior, production on local. For
-  heavy or judgment-laden work, SPLIT into phases rather than cramming it into a
-  single local epoch, and feed each step forward through the keyed log (a
-  non-implement epoch's `artifact_out` becomes a later epoch's `inputs`). Good
-  shapes (nudges, not a fixed menu): heavy build = research -> implement ->
-  review; report / triage / migration = research -> artifact (do NOT collapse the
-  analysis into one local artifact epoch, that downgrades it off senior); UI =
+  stronger SENIOR tier; implement/artifact run on the WORKER tier (the local rig),
+  so a skeleton is also a routing choice: put judgment on senior, production on
+  the worker tier. For heavy or judgment-laden work, SPLIT into phases rather than
+  cramming it into a single worker epoch, and feed each step forward through the
+  keyed log (a non-implement epoch's `artifact_out` becomes a later epoch's
+  `inputs`). Good shapes (nudges, not a fixed menu): heavy build = research ->
+  implement -> review; report / triage / migration = research -> artifact (do NOT
+  collapse the analysis into one worker artifact epoch, that downgrades it off
+  senior); UI =
   research -> implement with `visual:true` -> a phase exit criterion that builds,
   screenshots, then `vision_review`s it. A small job can be a single epoch.
 - A review epoch must INDEPENDENTLY RE-DERIVE a sample of the claims or verdicts
@@ -242,7 +243,7 @@ Rules:
 - Taste routing: set `"visual": true` on an implement or review epoch whose
   deliverable is FRONT-END / UI / visual / polish output (layout, styling, a
   rendered page, a diagram, anything judged by how it LOOKS). That epoch is
-  built by the stronger taste-building senior tier instead of the local default
+  built by the stronger taste-building senior tier instead of the worker default
   (the senior is a text model; the actual image judgment is the vision_review
   gate below). Omit it (defaults false) for non-visual work, backend, logic,
   plain text/config.
@@ -321,8 +322,9 @@ keep them separate, the bias and unit of work differ at each level:
 - A skeleton has BETWEEN 2 AND 10 phases; phase ids "P1","P2",… in order. Even a
   small job needs at least two (e.g. a build phase then a verify phase).
 - Sequence by tier of thinking: research/review (and visual phases) run on the
-  stronger SENIOR tier, implement/test on the local rig, so phasing is also a
-  routing choice (judgment on senior, production on local).
+  stronger SENIOR tier, implement/test on the WORKER tier (the local rig), so
+  phasing is also a routing choice (judgment on senior, production on the worker
+  tier).
 
 [LEVEL 2: EPOCH] Split a PHASE into epochs (one work decision per call).
 - One epoch = one coherent FEATURE or milestone, not a whole phase at once and
@@ -363,7 +365,7 @@ keep them separate, the bias and unit of work differ at each level:
   overrun insurance, never plannable budget. If a task cannot plausibly fit, it
   is two tasks or two epochs.
 - SIZE GATE (deterministic, enforced): a fresh implement task's `file_ownership`
-  is capped per tier (a small count on local, a larger one on senior/visual), and
+  is capped per tier (a small count on the worker tier, a larger one on senior/visual), and
   a whole-repo glob (`**`, `**/*`, or a bare `*`) is REJECTED outright as "not
   decomposed". An oversized or whole-repo task bounces back as an invalid
   decision naming the offending task, split it. (A handle_failed_epoch repair may
@@ -990,7 +992,7 @@ def _size_gate_violations(
     scope, and while a failed epoch is awaiting disposition the ONLY legal tool is
     ``handle_failed_epoch`` anyway, so ``failed_epoch_active`` short-circuits the
     gate. TIER-AWARE: a ``visual`` implement epoch starts on the senior tier (when
-    the rig has one), so it gets the larger senior bound; everything else is local.
+    the rig has one), so it gets the larger senior bound; everything else is the worker tier.
     """
 
     if failed_epoch_active or not isinstance(decision, ImplementDecision):

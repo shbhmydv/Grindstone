@@ -33,11 +33,11 @@ Grindstone checks the work directly, and the rest of the design follows from tha
   ranked by PageRank, rendered to a token budget. The planner sees the whole
   repo's spine; a worker sees the neighborhood of the files its task touches.
   Small repos are skipped, and a map that fails to build never fails the run.
-- **Swappable models.** There are three roles: `planner`, `local`, and `senior`.
+- **Swappable models.** There are three roles: `planner`, `worker`, and `senior`.
   Each is a `models/` script behind a file contract. The shipped default rig
-  (`models/default/`) drives Claude (Opus) for every role, so a fresh clone runs
+  (`models/claude/`) drives Claude (Opus) for every role, so a fresh clone runs
   with zero setup; a bundled `codex` planner is opt in (`init --rig codex`), and
-  your own scripts go in `models/override/` (gitignored). Swap any role without
+  your own scripts go in `models/personal/` (gitignored). Swap any role without
   touching the orchestrator.
 - **Resumable.** Every state change is an fsync'd line in an append-only
   `events.ndjson` journal. If a run dies mid-epoch, `resume` picks it back up, and
@@ -153,16 +153,16 @@ log at `P*/E*/T*/…`, and a post-mortem `journal.md`.
 ## Compatibility
 
 Grindstone is the orchestrator; you choose the models behind each role. The
-shipped default rig (`models/default/`) drives Claude (Opus) through the
+shipped default rig (`models/claude/`) drives Claude (Opus) through the
 `claude -p` CLI for every role, so a fresh clone with Claude Code installed runs
 with zero setup. You can point any role at anything that speaks the file contract.
 
-| Layer            | Default rig (`models/default/`)                    | Swappable with                                  |
+| Layer            | Default rig (`models/claude/`)                     | Swappable with                                  |
 | ---------------- | -------------------------------------------------- | ----------------------------------------------- |
 | **Runtime**      | Python ≥ 3.10 · Linux & macOS                      | n/a                                             |
 | **Planner role** | Claude (Opus) via `claude -p`, read-only           | any CLI that emits the decision JSON contract   |
-| **Local role**   | Claude (Opus) via `claude -p` in the worktree      | any local/remote LLM server                     |
-| **Senior role**  | Claude (Opus) via `claude -p`, web search on       | any cloud tier; delete the block for local-only |
+| **Worker role**  | Claude (Opus) via `claude -p` in the worktree      | any local/remote LLM server                     |
+| **Senior role**  | Claude (Opus) via `claude -p`, web search on       | any cloud tier; delete the block for worker-only |
 | **Vision/taste** | a `vision_review.sh` adapter (rig-supplied)        | any vision model behind the screenshot contract |
 | **Target repo**  | any `git` repository                               | n/a                                             |
 
@@ -179,13 +179,13 @@ code via env vars the scripts read:
 | Env var                     | Default | What it sets                                |
 | --------------------------- | ------- | ------------------------------------------- |
 | `GRINDSTONE_PLANNER_MODEL`  | `opus`  | the planner's `claude --model`              |
-| `GRINDSTONE_LOCAL_MODEL`    | `opus`  | the local worker's `claude --model`         |
+| `GRINDSTONE_LOCAL_MODEL`    | `opus`  | the worker role's `claude --model`          |
 | `GRINDSTONE_SENIOR_MODEL`   | `opus`  | the senior worker's `claude --model`        |
 
 For anything deeper, such as a different transport (your own local server, a
 different cloud CLI), extra flags, or your own endpoint, drop a replacement script
-into `models/override/` (gitignored, highest priority) or edit the relevant
-`models/default/` adapter. Each one is the whole boundary between Grindstone and a
+into `models/personal/` (gitignored, implicit-default priority) or edit the relevant
+`models/claude/` adapter. Each one is the whole boundary between Grindstone and a
 model, and the working reference is the clearest spec of the `handoff.json`
 contract your replacement has to honor.
 `grindstone init` scaffolds `.grindstone/config.yaml` with the scripts referenced

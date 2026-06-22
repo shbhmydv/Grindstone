@@ -263,7 +263,7 @@ def test_infra_fail_auto_dispatches_senior_repair_and_proceeds(
     )
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", local), ("senior", senior)], repo=git_repo,
+        ladder=[("worker", local), ("senior", senior)], repo=git_repo,
         infra_repair=InfraRepairConfig(attempts=2),
     )
     assert outcome.status == "completed"
@@ -288,7 +288,7 @@ def test_infra_repair_exhausts_cap_and_escalates_with_clear_message(
     planner = MockPlanner(script=[_gate_skeleton()])  # never reached past the gate
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", FailingWorker()), ("senior", senior)], repo=git_repo,
+        ladder=[("worker", FailingWorker()), ("senior", senior)], repo=git_repo,
         infra_repair=InfraRepairConfig(attempts=2),
     )
     assert outcome.status == "escalated"
@@ -313,7 +313,7 @@ def test_infra_repair_disabled_when_no_config(git_repo: Path, run_dir: RunDir) -
     )
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", FailingWorker()), ("senior", senior)], repo=git_repo,
+        ladder=[("worker", FailingWorker()), ("senior", senior)], repo=git_repo,
         infra_repair=None,
     )
     assert outcome.status == "escalated"
@@ -332,7 +332,7 @@ def test_infra_repair_host_allowlist_carried_into_dispatch(
     planner = MockPlanner(script=[_gate_skeleton(), complete_decision(_GATE)])
     run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", FailingWorker()), ("senior", senior)], repo=git_repo,
+        ladder=[("worker", FailingWorker()), ("senior", senior)], repo=git_repo,
         infra_repair=InfraRepairConfig(attempts=1, allow_host_commands=["apt-get"]),
     )
     assert senior.seen_briefs
@@ -370,7 +370,7 @@ def test_infra_repair_prepare_error_does_not_crash_escalates(
     planner = MockPlanner(script=[_gate_skeleton()])  # never reached past the gate
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", FailingWorker()), ("senior", senior)], repo=git_repo,
+        ladder=[("worker", FailingWorker()), ("senior", senior)], repo=git_repo,
         infra_repair=InfraRepairConfig(attempts=2),
     )
     # No crash: a clean terminal escalation, the cap/escalate path fired.
@@ -400,7 +400,7 @@ def test_infra_repair_attempts_zero_escalates_with_no_dispatch(
     planner = MockPlanner(script=[_gate_skeleton()])
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", FailingWorker()), ("senior", senior)], repo=git_repo,
+        ladder=[("worker", FailingWorker()), ("senior", senior)], repo=git_repo,
         infra_repair=InfraRepairConfig(attempts=0),
     )
     assert outcome.status == "escalated"
@@ -440,7 +440,7 @@ def test_infra_repair_triggers_from_floor_check(
     planner = MockPlanner(script=[skeleton, complete_decision(check_cmd("true"))])
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", FailingWorker()), ("senior", senior)], repo=git_repo,
+        ladder=[("worker", FailingWorker()), ("senior", senior)], repo=git_repo,
         infra_repair=InfraRepairConfig(attempts=2),
         floor=FloorConfig(checks=[_FLOOR_GATE]),
     )
@@ -512,7 +512,7 @@ def test_infra_repair_regressing_sibling_check_not_adopted(
     planner = MockPlanner(script=[skeleton])  # never reached past the gate
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", FailingWorker()), ("senior", senior)], repo=git_repo,
+        ladder=[("worker", FailingWorker()), ("senior", senior)], repo=git_repo,
         infra_repair=InfraRepairConfig(attempts=2),
     )
     assert outcome.status == "escalated"
@@ -580,7 +580,7 @@ def test_infra_repair_skipped_while_failed_epoch_pending(
         ]
     )
     outcome = run_grind(
-        run_dir, job_path="job.md", planner=planner, ladder=[("local", _SwapWorker())],
+        run_dir, job_path="job.md", planner=planner, ladder=[("worker", _SwapWorker())],
         repo=git_repo, tier0_attempts=1, infra_repair=InfraRepairConfig(attempts=2),
     )
     assert outcome.status == "completed"

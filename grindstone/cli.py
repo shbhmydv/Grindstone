@@ -2,7 +2,7 @@
 
 argparse, no click dependency. ``init`` scaffolds the per-repo config (S5).
 ``run`` creates the run dir, assembles the worker ladder + planner transport from
-``.grindstone/config.yaml``, each *role* (``planner`` / ``local`` / ``senior``)
+``.grindstone/config.yaml``, each *role* (``planner`` / ``worker`` / ``senior``)
 is reached through a request **script** behind the file contract; the CLI never
 learns the transport or model behind a role (those live in ``models/``). No
 config fails loudly and points at ``grindstone init`` (core ships no rig
@@ -67,7 +67,7 @@ DEFAULT_MAX_PLANNER_CALLS = 96
 DEFAULT_VISION_TIMEOUT_S = 600.0
 
 #: The ``.grindstone/config.yaml`` ``init`` scaffolds: one block per *role*
-#: (``planner`` / ``local`` / ``senior``), each naming a request script behind
+#: (``planner`` / ``worker`` / ``senior``), each naming a request script behind
 #: the file contract plus its slots + wall-clock timeout. The CLI never learns
 #: the transport or model behind a role, that lives in the script. ``senior``
 #: is scaffolded active; delete it for a local-only ladder. Each role's ABSOLUTE
@@ -77,15 +77,17 @@ DEFAULT_VISION_TIMEOUT_S = 600.0
 def _render_config_template(rig: str | None) -> str:
     """The scaffolded config text with each role's script path resolved for ``rig``.
 
-    ``models_script`` bakes the FIRST existing of override/ > ``<rig>``/ > default/
-    for every role, so a fresh clone gets the shipped Claude rig, an operator's
-    ``models/override`` scripts win where present, and ``--rig codex`` swaps in the
-    bundled codex planner. The optional vision/polish lines stay commented out and
-    name only the bare script (resolved at run time if the block is uncommented).
+    ``models_script`` resolves each role's script through the rig stack: an
+    explicit ``--rig codex`` searches ``codex/`` then the shipped ``claude/``
+    floor (never the gitignored ``personal/``), while the implicit default
+    (``rig=None``) lets an operator's ``models/personal`` scripts win where
+    present, else the shipped Claude floor. The optional vision/polish lines stay
+    commented out and name only the bare script (resolved at run time if the
+    block is uncommented).
     """
 
     planner = models_script("planner_request.sh", rig=rig)
-    local = models_script("local_request.sh", rig=rig)
+    worker = models_script("worker_request.sh", rig=rig)
     senior = models_script("senior_request.sh", rig=rig)
     return f"""\
 # Grindstone per-repo config (.grindstone/config.yaml).
@@ -101,10 +103,10 @@ roles:
     slots: 1
     timeout_s: 600
 
-  # The local worker role: the on-rig grinders. slots = the epoch fan-out bound
+  # The worker role: the on-rig grinders. slots = the epoch fan-out bound
   # (how many tasks run concurrently on this rig).
-  local:
-    script: {local}
+  worker:
+    script: {worker}
     slots: 2
     timeout_s: 1800
 
@@ -194,8 +196,8 @@ def _resolve_ladder(
 ) -> Ladder:
     """The worker ladder from the role scripts.
 
-    The ``local`` role is the required first rung (a ``ScriptWorker`` over
-    ``local_request.sh``); the optional ``senior`` role appends a second rung
+    The ``worker`` role is the required first rung (a ``ScriptWorker`` over
+    ``worker_request.sh``); the optional ``senior`` role appends a second rung
     (the cloud escalation tier) when present. Each worker logs under
     ``<run-dir>/worker_logs`` (never the run dir's state). With NO config the
     core ships no rig-specific defaults (ARCHITECTURE.md: no model config in core), it
@@ -209,12 +211,12 @@ def _resolve_ladder(
     stop_script = models_script("stop.sh")
     tiers: list[tuple[str, ScriptWorker]] = [
         (
-            "local",
+            "worker",
             ScriptWorker(
-                script=cfg.roles.local.script,
+                script=cfg.roles.worker.script,
                 stop_script=stop_script,
-                slots=cfg.roles.local.slots,
-                timeout_s=cfg.roles.local.timeout_s,
+                slots=cfg.roles.worker.slots,
+                timeout_s=cfg.roles.worker.timeout_s,
                 log_root=log_root,
             ),
         )
@@ -239,7 +241,7 @@ def _resolve_ladder(
 def _resolve_concurrency(
     args: argparse.Namespace, cfg: GrindstoneConfig | None
 ) -> int | None:
-    """Fan-out cap = the ``local`` role's slot count (one in-flight task / slot).
+    """Fan-out cap = the ``worker`` role's slot count (one in-flight task / slot).
 
     No config fails loudly toward ``grindstone init`` (run/resume already exit
     in ``_resolve_ladder`` first, but the bound is meaningless without config).
@@ -247,7 +249,7 @@ def _resolve_concurrency(
 
     if cfg is None:
         raise _no_config_exit()
-    return cfg.roles.local.slots
+    return cfg.roles.worker.slots
 
 
 def _resolve_max_planner_calls(cfg: GrindstoneConfig | None) -> int:
@@ -301,7 +303,7 @@ def _resolve_vision_reviewer(cfg: GrindstoneConfig | None) -> VisionReviewer | N
         )
     # No config block: fall back to a bundled vision_review.sh resolved through the
     # rig stack. The shipped default rig carries no taste gate (it is a codex-
-    # flavored script that lives in models/override on a rig that uses it), so when
+    # flavored script that lives in models/personal on a rig that uses it), so when
     # none resolves we return None and the gate degrades to a deterministic FAIL on
     # any vision_review check rather than crashing a run that has no such check.
     try:
@@ -312,17 +314,17 @@ def _resolve_vision_reviewer(cfg: GrindstoneConfig | None) -> VisionReviewer | N
 
 
 def _resolve_verifier(ladder: Ladder, cfg: GrindstoneConfig | None) -> EpochVerifier | None:
-    """The G4 end-of-epoch verifier: the LOCAL tier wrapped as a ``WorkerEpochVerifier``.
+    """The G4 end-of-epoch verifier: the WORKER tier wrapped as a ``WorkerEpochVerifier``.
 
     Default ON (``verify_epochs`` true): the verification pass runs whenever an epoch
-    carries ``criteria`` AND a local tier exists. ``None`` (the pass is disabled)
-    when the config opts out (``verify_epochs: false``) or there is no ``local`` tier;
+    carries ``criteria`` AND a worker tier exists. ``None`` (the pass is disabled)
+    when the config opts out (``verify_epochs: false``) or there is no ``worker`` tier;
     the run loop then skips the pass entirely (it still never errors with no criteria)."""
 
     if cfg is not None and not cfg.verify_epochs:
         return None
     for name, transport in ladder:
-        if name == "local":
+        if name == "worker":
             return WorkerEpochVerifier(transport)
     return None
 
@@ -535,9 +537,9 @@ def _build_parser() -> argparse.ArgumentParser:
     init.add_argument(
         "--rig",
         default=None,
-        help="bundled preset rig for the planner/worker scripts (e.g. `codex`); "
-        "default is the shipped Claude rig. An operator's models/override scripts "
-        "always win where present.",
+        help="bundled preset rig for the planner/worker scripts (e.g. `codex`), "
+        "searched before the shipped Claude floor; omit it for the implicit "
+        "default, where an operator's models/personal scripts win where present.",
     )
 
     run = sub.add_parser("run", help="run a job.md to completion in the foreground")

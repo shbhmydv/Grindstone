@@ -25,11 +25,11 @@ from tests.grindstone.conftest import (
 
 
 def _ladder() -> list[tuple[str, OwnershipWorker]]:
-    return [("local", OwnershipWorker())]
+    return [("worker", OwnershipWorker())]
 
 
 def _job(repo: Path) -> str:
-    # A real run always reads config (the fan-out bound = roles.local.slots), so
+    # A real run always reads config (the fan-out bound = roles.worker.slots), so
     # scaffold one; planner + ladder are still injected (no codex/pi spent).
     main(["init", "--repo", str(repo)])
     job = repo / "job.md"
@@ -137,7 +137,7 @@ def test_run_rejects_repo_script_outside_models(
     cfg.write_text(
         "roles:\n"
         "  planner: {script: /tmp/evil.sh, slots: 1, timeout_s: 600}\n"
-        "  local: {script: /tmp/eviltoo.sh, slots: 2, timeout_s: 1800}\n",
+        "  worker: {script: /tmp/eviltoo.sh, slots: 2, timeout_s: 1800}\n",
         encoding="utf-8",
     )
     job = git_repo / "job.md"

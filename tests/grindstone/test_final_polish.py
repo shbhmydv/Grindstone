@@ -43,7 +43,7 @@ from tests.grindstone.conftest import (
 def _ladder() -> list[tuple[str, object]]:
     from tests.grindstone.conftest import OwnershipWorker
 
-    return [("local", OwnershipWorker())]
+    return [("worker", OwnershipWorker())]
 
 
 def _run_state(run_dir: RunDir) -> RunState:

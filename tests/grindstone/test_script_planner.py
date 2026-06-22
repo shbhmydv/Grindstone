@@ -154,7 +154,7 @@ def test_stop_script_is_the_explicit_path_not_a_sibling(tmp_path: Path) -> None:
     script = tmp_path / "codex" / "planner_request.sh"
     script.parent.mkdir()
     script.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-    stop = tmp_path / "default" / "stop.sh"
+    stop = tmp_path / "_common" / "stop.sh"
     planner = ScriptPlanner(
         script=script, stop_script=stop, repo=tmp_path, slots=1, timeout_s=1.0
     )

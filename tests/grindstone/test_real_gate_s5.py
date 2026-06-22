@@ -10,7 +10,7 @@ job shape is S4's.
 It is parametrized over the planner rig so the SAME toy job, config builder,
 valve, and assertions cover BOTH planner presets end to end: ``codex`` (override
 preset, ``codex exec``) and ``claude`` (the SHIPPED DEFAULT,
-``models/default/planner_request.sh`` runs ``claude -p``). Each param proves its
+``models/claude/planner_request.sh`` runs ``claude -p``). Each param proves its
 planner emits schema-conforming epoch decisions across the FULL lifecycle
 (propose_skeleton, implement, complete_run), not just one call. Only the planner
 script path + required CLI differ per param; the local llama-server tier is the
@@ -96,20 +96,20 @@ def _config_yaml(models_dir: Path, planner_script: str) -> str:
         f"    script: {models_dir}/{planner_script}\n"
         "    slots: 1\n"
         "    timeout_s: 600\n"
-        "  local:\n"
-        f"    script: {models_dir}/override/local_request.sh\n"
+        "  worker:\n"
+        f"    script: {models_dir}/personal/worker_request.sh\n"
         "    slots: 2\n"
         "    timeout_s: 1800\n"
     )
 
 
 #: Each planner rig the gate proves end to end: (id, planner script, required CLI).
-#: ``codex`` is the override preset, ``claude`` is the SHIPPED DEFAULT planner
-#: (``models/default/planner_request.sh`` runs ``claude -p``). Each param skips
+#: ``codex`` is a tracked preset, ``claude`` is the SHIPPED DEFAULT planner
+#: (``models/claude/planner_request.sh`` runs ``claude -p``). Each param skips
 #: loudly if its CLI is absent, so the codex coverage stays intact regardless.
 _PLANNER_RIGS = [
     pytest.param("codex/planner_request.sh", "codex", id="codex"),
-    pytest.param("default/planner_request.sh", "claude", id="claude"),
+    pytest.param("claude/planner_request.sh", "claude", id="claude"),
 ]
 
 

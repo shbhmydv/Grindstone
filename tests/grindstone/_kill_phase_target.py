@@ -66,7 +66,7 @@ def main() -> None:
         run_dir,
         job_path="job.md",
         planner=_PhasePlanner(Path(ready), Path(release)),
-        ladder=[("local", OwnershipWorker())],
+        ladder=[("worker", OwnershipWorker())],
         repo=repo,
     )
 

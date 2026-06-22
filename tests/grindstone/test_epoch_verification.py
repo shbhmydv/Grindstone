@@ -428,7 +428,7 @@ def test_epoch_with_criteria_pass_completes(git_repo: Path, run_dir: RunDir) -> 
     )
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", OwnershipWorker())], repo=git_repo, verifier=verifier,
+        ladder=[("worker", OwnershipWorker())], repo=git_repo, verifier=verifier,
     )
     assert outcome.status == "completed"
     kinds = [e.event for e in read_events(run_dir.events_path)]
@@ -480,7 +480,7 @@ def test_verdict_persists_to_keyed_log_and_reaches_planner_by_reference(
     )
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", OwnershipWorker())], repo=git_repo, verifier=verifier,
+        ladder=[("worker", OwnershipWorker())], repo=git_repo, verifier=verifier,
     )
     assert outcome.status == "completed"
     # The verdict landed at a stable keyed-log path (so it shows in log_index/manifest).
@@ -529,7 +529,7 @@ def test_failing_check_output_reaches_planner_by_path_not_embedded(
     )
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", OwnershipWorker())], repo=git_repo,
+        ladder=[("worker", OwnershipWorker())], repo=git_repo,
     )
     assert outcome.status == "escalated"
     # The full failing output was persisted under check_output/ (by reference).
@@ -561,7 +561,7 @@ def test_no_criteria_skips_the_pass(git_repo: Path, run_dir: RunDir) -> None:
     )
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", OwnershipWorker())], repo=git_repo, verifier=verifier,
+        ladder=[("worker", OwnershipWorker())], repo=git_repo, verifier=verifier,
     )
     assert outcome.status == "completed"
     kinds = [e.event for e in read_events(run_dir.events_path)]
@@ -588,7 +588,7 @@ def test_pass_runs_after_floor_not_when_task_floor_fails(git_repo: Path, run_dir
     )
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", FailingWorker())], repo=git_repo, verifier=verifier,
+        ladder=[("worker", FailingWorker())], repo=git_repo, verifier=verifier,
         tier0_attempts=1,
     )
     assert outcome.status == "escalated"
@@ -616,7 +616,7 @@ def test_semantic_fail_opens_failed_epoch_with_gaps(git_repo: Path, run_dir: Run
     )
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", OwnershipWorker())], repo=git_repo, verifier=verifier,
+        ladder=[("worker", OwnershipWorker())], repo=git_repo, verifier=verifier,
     )
     assert outcome.status == "escalated"
     kinds = [e.event for e in read_events(run_dir.events_path)]
@@ -649,7 +649,7 @@ def test_pending_failed_epoch_shows_real_cap_not_at_cap(
     )
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", OwnershipWorker())], repo=git_repo, verifier=verifier,
+        ladder=[("worker", OwnershipWorker())], repo=git_repo, verifier=verifier,
         max_failed_epochs_per_phase=3,
     )
     assert outcome.status == "escalated"
@@ -698,7 +698,7 @@ def test_semantic_fail_retry_then_clean_pass_completes(git_repo: Path, run_dir: 
     )
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", _UniqueContentWorker())], repo=git_repo, verifier=verifier,
+        ladder=[("worker", _UniqueContentWorker())], repo=git_repo, verifier=verifier,
     )
     assert outcome.status == "completed"
     from grindstone.events import FailedEpochHandled
@@ -767,7 +767,7 @@ def test_prepare_failure_routes_to_planner_as_semantic_gap_not_infra(
     )
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", _ContentArtifactWorker("a manifest\n"))], repo=git_repo,
+        ladder=[("worker", _ContentArtifactWorker("a manifest\n"))], repo=git_repo,
         verifier=verifier, prepare=_failing_prepare(),
     )
     assert outcome.status == "escalated"  # the planner's halt, not an infra dead-end
@@ -825,7 +825,7 @@ def test_prepare_failure_persists_full_output_to_keyed_log_by_reference(
     )
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", _ContentArtifactWorker("a manifest\n"))], repo=git_repo,
+        ladder=[("worker", _ContentArtifactWorker("a manifest\n"))], repo=git_repo,
         verifier=verifier, prepare=_failing_prepare(),
     )
     assert outcome.status == "escalated"
@@ -878,7 +878,7 @@ def test_unborn_tip_checkout_failure_still_escalates_as_infra(
     try:
         outcome = run_grind(
             run_dir, job_path="job.md", planner=planner,
-            ladder=[("local", _ContentArtifactWorker("a manifest\n"))], repo=git_repo,
+            ladder=[("worker", _ContentArtifactWorker("a manifest\n"))], repo=git_repo,
             verifier=verifier,
         )
     finally:
@@ -914,7 +914,7 @@ def test_persistent_malformed_verdict_escalates_as_infra_not_semantic(
     )
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", OwnershipWorker())], repo=git_repo, verifier=verifier,
+        ladder=[("worker", OwnershipWorker())], repo=git_repo, verifier=verifier,
     )
     assert outcome.status == "escalated"
     assert outcome.reason is not None
@@ -946,7 +946,7 @@ def test_malformed_then_valid_verdict_proceeds(git_repo: Path, run_dir: RunDir) 
     )
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", OwnershipWorker())], repo=git_repo, verifier=verifier,
+        ladder=[("worker", OwnershipWorker())], repo=git_repo, verifier=verifier,
     )
     assert outcome.status == "completed"
     kinds = [e.event for e in read_events(run_dir.events_path)]
@@ -968,7 +968,7 @@ def test_no_verifier_skips_the_pass(git_repo: Path, run_dir: RunDir) -> None:
     )
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", OwnershipWorker())], repo=git_repo, verifier=None,
+        ladder=[("worker", OwnershipWorker())], repo=git_repo, verifier=None,
     )
     assert outcome.status == "completed"
     kinds = [e.event for e in read_events(run_dir.events_path)]
@@ -1173,7 +1173,7 @@ def test_research_artifact_content_reaches_verifier_and_completes(
     )
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", _ContentArtifactWorker(body))], repo=git_repo,
+        ladder=[("worker", _ContentArtifactWorker(body))], repo=git_repo,
         verifier=verifier,
     )
     assert outcome.status == "completed"
@@ -1221,7 +1221,7 @@ def test_artifact_never_reported_missing_when_artifact_exists_passes(
     )
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", _ContentArtifactWorker(f"body with {marker}\n"))],
+        ladder=[("worker", _ContentArtifactWorker(f"body with {marker}\n"))],
         repo=git_repo, verifier=verifier,
     )
     assert outcome.status == "completed"
@@ -1252,7 +1252,7 @@ def test_artifact_real_semantic_gap_still_fails(git_repo: Path, run_dir: RunDir)
     )
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", _ContentArtifactWorker("an incomplete note\n"))],
+        ladder=[("worker", _ContentArtifactWorker("an incomplete note\n"))],
         repo=git_repo, verifier=verifier,
     )
     assert outcome.status == "escalated"
@@ -1312,7 +1312,7 @@ def test_huge_artifact_is_delivered_by_reference_not_embedded(
     )
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", _ContentArtifactWorker(huge))], repo=git_repo,
+        ladder=[("worker", _ContentArtifactWorker(huge))], repo=git_repo,
         verifier=verifier,
     )
     assert outcome.status == "completed"
@@ -1353,7 +1353,7 @@ def _land_recorded_epoch(git_repo: Path, run_dir: RunDir) -> None:
     )
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner,
-        ladder=[("local", OwnershipWorker())], repo=git_repo,
+        ladder=[("worker", OwnershipWorker())], repo=git_repo,
         verifier=WorkerEpochVerifier(_VerifierWorker(passed=True)),
     )
     assert outcome.status == "completed"  # the epoch + its branch + outcome.json now exist
@@ -1391,7 +1391,7 @@ def test_resume_reverifies_recorded_but_unverified_epoch(
     gaps = ["the Pink ramp is never mapped"]
     planner = MockPlanner(script=[handle_failed_epoch_halt("incomplete per the resume re-verify")])
     outcome = resume_grind(
-        run_dir, planner=planner, ladder=[("local", OwnershipWorker())], repo=git_repo,
+        run_dir, planner=planner, ladder=[("worker", OwnershipWorker())], repo=git_repo,
         verifier=WorkerEpochVerifier(_VerifierWorker(passed=False, gaps=gaps)),
     )
     assert outcome.status == "escalated"
@@ -1414,7 +1414,7 @@ def test_resume_reverify_pass_proceeds_cleanly(git_repo: Path, run_dir: RunDir) 
     fake = _VerifierWorker(passed=True)
     planner = MockPlanner(script=[complete_decision(check_cmd("test -f f1.txt"))])
     outcome = resume_grind(
-        run_dir, planner=planner, ladder=[("local", OwnershipWorker())], repo=git_repo,
+        run_dir, planner=planner, ladder=[("worker", OwnershipWorker())], repo=git_repo,
         verifier=WorkerEpochVerifier(fake),
     )
     assert outcome.status == "completed"
@@ -1432,7 +1432,7 @@ def test_resume_no_verifier_skips_pending_verification(git_repo: Path, run_dir: 
     fake = _VerifierWorker(passed=False, gaps=["never asked"])
     planner = MockPlanner(script=[complete_decision(check_cmd("test -f f1.txt"))])
     outcome = resume_grind(
-        run_dir, planner=planner, ladder=[("local", OwnershipWorker())], repo=git_repo,
+        run_dir, planner=planner, ladder=[("worker", OwnershipWorker())], repo=git_repo,
         verifier=None,
     )
     assert outcome.status == "completed"

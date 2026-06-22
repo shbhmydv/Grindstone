@@ -55,7 +55,7 @@ def _run_dir(repo: Path) -> RunDir:
 _LOCAL_ONLY = (
     "roles:\n"
     "  planner: {script: /m/planner.sh, slots: 1, timeout_s: 600}\n"
-    "  local: {script: /m/local.sh, slots: 3, timeout_s: 1800}\n"
+    "  worker: {script: /m/local.sh, slots: 3, timeout_s: 1800}\n"
 )
 
 
@@ -63,15 +63,16 @@ _LOCAL_ONLY = (
 
 
 def _fake_models(root: Path, *, codex: bool = False) -> Path:
-    """A hermetic models/ tree (default rig + optional codex preset, no override)
+    """A hermetic models/ tree (claude floor + optional codex preset, no personal)
     so init's baked paths are deterministic regardless of the operator's gitignored
-    models/override on the dev machine."""
+    models/personal on the dev machine."""
 
     models = root / "models"
-    for sub in ("default", "codex", "override"):
+    for sub in ("claude", "codex", "personal", "_common"):
         (models / sub).mkdir(parents=True, exist_ok=True)
-    for name in ("planner_request.sh", "local_request.sh", "senior_request.sh", "stop.sh"):
-        (models / "default" / name).write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    for name in ("planner_request.sh", "worker_request.sh", "senior_request.sh"):
+        (models / "claude" / name).write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    (models / "_common" / "stop.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     if codex:
         (models / "codex" / "planner_request.sh").write_text(
             "#!/usr/bin/env bash\nexit 0\n", encoding="utf-8"
@@ -89,18 +90,18 @@ def test_init_writes_loadable_config(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert cfg_path.is_file()
     cfg = load_config(repo)  # the scaffold parses to a valid config
     assert isinstance(cfg, GrindstoneConfig)
-    # Default rig: every role's baked path resolves under models/default/.
-    assert cfg.roles.planner.script == (models / "default" / "planner_request.sh").resolve()
-    assert cfg.roles.local.script == (models / "default" / "local_request.sh").resolve()
+    # Default rig: every role's baked path resolves under models/claude/.
+    assert cfg.roles.planner.script == (models / "claude" / "planner_request.sh").resolve()
+    assert cfg.roles.worker.script == (models / "claude" / "worker_request.sh").resolve()
     assert cfg.roles.senior is not None
-    assert cfg.roles.senior.script == (models / "default" / "senior_request.sh").resolve()
+    assert cfg.roles.senior.script == (models / "claude" / "senior_request.sh").resolve()
 
 
 def test_init_rig_codex_bakes_codex_planner_default_workers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # `init --rig codex` inserts the codex preset for the planner only; the workers
-    # have no codex/ script so they fall back to default/.
+    # have no codex/ script so they fall back to the claude/ floor.
     repo = tmp_path / "repo"
     repo.mkdir()
     models = _fake_models(tmp_path, codex=True)
@@ -109,9 +110,9 @@ def test_init_rig_codex_bakes_codex_planner_default_workers(
     cfg = load_config(repo)
     assert cfg is not None
     assert cfg.roles.planner.script == (models / "codex" / "planner_request.sh").resolve()
-    assert cfg.roles.local.script == (models / "default" / "local_request.sh").resolve()
+    assert cfg.roles.worker.script == (models / "claude" / "worker_request.sh").resolve()
     assert cfg.roles.senior is not None
-    assert cfg.roles.senior.script == (models / "default" / "senior_request.sh").resolve()
+    assert cfg.roles.senior.script == (models / "claude" / "senior_request.sh").resolve()
 
 
 def test_init_appends_gitignore_idempotently(tmp_path: Path) -> None:
@@ -136,7 +137,7 @@ def test_init_does_not_clobber_existing_config(tmp_path: Path) -> None:
     assert code == 0
     # Existing config is preserved (init is a one-time scaffold, not a reset).
     cfg = load_config(tmp_path)
-    assert cfg is not None and cfg.roles.local.slots == 3
+    assert cfg is not None and cfg.roles.worker.slots == 3
 
 
 # --- config-driven resolution --------------------------------------------------
@@ -146,7 +147,7 @@ def test_resolve_ladder_init_config_has_local_and_senior(tmp_path: Path) -> None
     main(["init", "--repo", str(tmp_path)])
     cfg = load_config(tmp_path)
     ladder = _resolve_ladder(_flags(), cfg, _run_dir(tmp_path))
-    assert [tier for tier, _ in ladder] == ["local", "senior"]
+    assert [tier for tier, _ in ladder] == ["worker", "senior"]
     assert all(isinstance(w, ScriptWorker) for _, w in ladder)
 
 
@@ -154,7 +155,7 @@ def test_resolve_ladder_local_only_when_no_senior(tmp_path: Path) -> None:
     _write_cfg(tmp_path, _LOCAL_ONLY)
     cfg = load_config(tmp_path)
     ladder = _resolve_ladder(_flags(), cfg, _run_dir(tmp_path))
-    assert [tier for tier, _ in ladder] == ["local"]
+    assert [tier for tier, _ in ladder] == ["worker"]
     worker = ladder[0][1]
     assert isinstance(worker, ScriptWorker)
     assert worker.script == Path("/m/local.sh")
@@ -181,7 +182,7 @@ def test_resolve_ladder_no_config_fails_loudly(tmp_path: Path) -> None:
 def test_resolve_concurrency_is_local_slots(tmp_path: Path) -> None:
     _write_cfg(tmp_path, _LOCAL_ONLY)
     cfg = load_config(tmp_path)
-    assert _resolve_concurrency(_flags(), cfg) == 3  # = roles.local.slots
+    assert _resolve_concurrency(_flags(), cfg) == 3  # = roles.worker.slots
 
 
 def test_resolve_concurrency_no_config_fails_loudly() -> None:
@@ -227,6 +228,6 @@ def test_init_config_drives_a_run(git_repo: Path) -> None:
     code = main(
         ["run", str(job), "--repo", str(git_repo), "--run-id", "scaffold-run"],
         planner=planner,
-        ladder=[("local", OwnershipWorker())],
+        ladder=[("worker", OwnershipWorker())],
     )
     assert code == 0

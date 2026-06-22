@@ -1,7 +1,7 @@
 """Script-backed worker transport: a role behind a file-contract subprocess.
 
 The role-split boundary: grindstone knows only a *role* name
-(`local` / `senior`) reached through a script. It never learns the transport
+(`worker` / `senior`) reached through a script. It never learns the transport
 (`pi` / cloud) or the model behind the role, the script owns transport, model
 identity, GPU arbitration, the pin file (``.pi/settings.json``) and the killable
 process group. ``ScriptWorker`` builds the prompt (orchestration: *what* to ask,
@@ -35,7 +35,7 @@ from grindstone.worker import (
 class ScriptWorker:
     """``WorkerTransport`` backed by a role-request script behind a file contract.
 
-    ``script`` is the absolute path to ``local_request.sh`` / ``senior_request.sh``;
+    ``script`` is the absolute path to ``worker_request.sh`` / ``senior_request.sh``;
     ``stop_script`` is the explicit ``stop.sh`` path used to reap the group on
     timeout (resolved by the CLI via ``models_script``, NOT assumed beside the role
     script: a role can resolve from a preset/override dir that ships no ``stop.sh``).

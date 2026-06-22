@@ -48,7 +48,7 @@ FQ = "P1/E1/T1"
 
 
 def _ladder(*workers: WorkerTransport) -> list[tuple[str, WorkerTransport]]:
-    names = ["local", "cloud", "senior"]
+    names = ["worker", "cloud", "senior"]
     return [(names[i], w) for i, w in enumerate(workers)]
 
 
@@ -79,7 +79,7 @@ def _epoch_state(run_dir: RunDir) -> EpochState:
 def test_first_attempt_success(git_repo: Path, run_dir: RunDir, toy_task: ImplementTask) -> None:
     outcome = _run_impl(git_repo, run_dir, toy_task, _ladder(make_ok_worker()))
     [task] = outcome.tasks
-    assert (task.status, task.attempts, task.tier) == ("done", 1, "local")
+    assert (task.status, task.attempts, task.tier) == ("done", 1, "worker")
     record = run_dir.resolve(f"{FQ}/handoff.json")
     assert record.is_file()
     handoff = parse_handoff(json.loads(record.read_text()))
@@ -470,7 +470,7 @@ def test_artifact_out_with_subdir_published_from_full_path(
 def _local_senior(
     local: WorkerTransport, senior: WorkerTransport
 ) -> list[tuple[str, WorkerTransport]]:
-    return [("local", local), ("senior", senior)]
+    return [("worker", local), ("senior", senior)]
 
 
 def test_research_starts_on_senior_tier(git_repo: Path, run_dir: RunDir) -> None:
@@ -522,7 +522,7 @@ def test_artifact_mode_starts_on_local_tier(git_repo: Path, run_dir: RunDir) -> 
         run_dir, args=artifact_epoch(task), mode="artifact",
         ladder=_local_senior(local, senior), repo=git_repo, tier0_attempts=2,
     )
-    assert outcome.tasks[0].tier == "local"
+    assert outcome.tasks[0].tier == "worker"
 
 
 def test_research_falls_back_to_local_without_senior(
@@ -538,10 +538,10 @@ def test_research_falls_back_to_local_without_senior(
     local = HandoffWorker(payload, files={"notes.md": "x"})
     outcome = run_one_epoch(
         run_dir, args=artifact_epoch(task), mode="research",
-        ladder=[("local", local)], repo=git_repo, tier0_attempts=2,
+        ladder=[("worker", local)], repo=git_repo, tier0_attempts=2,
     )
     assert outcome.tasks[0].status == "done"
-    assert outcome.tasks[0].tier == "local"
+    assert outcome.tasks[0].tier == "worker"
 
 
 # --- taste routing: a VISUAL implement/review epoch builds on the senior tier --
@@ -577,7 +577,7 @@ def test_non_visual_implement_routes_to_local_tier(
         ladder=_local_senior(make_ok_worker(), make_ok_worker()),
         repo=git_repo, tier0_attempts=2,
     )
-    assert outcome.tasks[0].tier == "local"
+    assert outcome.tasks[0].tier == "worker"
 
 
 def test_visual_review_still_routes_to_senior_tier(
@@ -611,10 +611,10 @@ def test_visual_implement_falls_back_to_local_without_senior(
     # crashing (mirrors research's senior-less fallback).
     outcome = run_one_epoch(
         run_dir, args=_visual_implement(toy_task), mode="implement",
-        ladder=[("local", make_ok_worker())], repo=git_repo, tier0_attempts=2,
+        ladder=[("worker", make_ok_worker())], repo=git_repo, tier0_attempts=2,
     )
     assert outcome.tasks[0].status == "done"
-    assert outcome.tasks[0].tier == "local"
+    assert outcome.tasks[0].tier == "worker"
 
 
 def test_artifact_out_is_published_to_the_log_key(
@@ -833,7 +833,7 @@ def test_review_gate_not_appended_for_artifact_modes(run_dir: RunDir) -> None:
 def test_pi_settings_dropped_pre_commit_and_scope_exempt(
     git_repo: Path, run_dir: RunDir, toy_task: ImplementTask
 ) -> None:
-    # The worker script (local_request.sh) drops a per-cwd .pi/settings.json pinning spawned
+    # The worker script (worker_request.sh) drops a per-cwd .pi/settings.json pinning spawned
     # subagents to the parent model. Like handoff.json/check_handoff.py/review.md
     # it is orchestration metadata: the core strips it (and the now-empty .pi/
     # dir) before commit, so it never enters the diff nor trips the ownership
@@ -850,7 +850,7 @@ def test_pi_settings_dropped_pre_commit_and_scope_exempt(
         run_dir,
         args=implement_epoch(toy_task),
         mode="implement",
-        ladder=[("local", _DropsPiSettings())],
+        ladder=[("worker", _DropsPiSettings())],
         repo=git_repo,
     )
     assert outcome.tasks[0].status == "done"
@@ -880,7 +880,7 @@ def test_pi_dir_kept_when_worker_leaves_other_content(
         run_dir,
         args=implement_epoch(toy_task),
         mode="implement",
-        ladder=[("local", _LeavesExtraPiContent())],
+        ladder=[("worker", _LeavesExtraPiContent())],
         repo=git_repo,
         tier0_attempts=1,
     )

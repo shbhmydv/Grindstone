@@ -75,7 +75,7 @@ def _craft_inflight_single(repo: Path, run_dir: RunDir) -> None:
         mode="implement",
         status="running",
         tier_index=0,
-        tier_name="local",
+        tier_name="worker",
         tier_attempt=1,
         attempt=1,
         scratch=str(run_dir.root / "worktrees" / "T1" / "attempt-1"),
@@ -105,7 +105,7 @@ def test_resume_burns_inflight_and_completes(git_repo: Path, run_dir: RunDir) ->
         run_dir,
         args=implement_epoch(make_toy_task()),
         mode="implement",
-        ladder=[("local", make_ok_worker())],
+        ladder=[("worker", make_ok_worker())],
         repo=git_repo,
     )
     assert outcome.status == "completed"
@@ -131,7 +131,7 @@ def test_resume_monotonic_seq(git_repo: Path, run_dir: RunDir) -> None:
         run_dir,
         args=implement_epoch(make_toy_task()),
         mode="implement",
-        ladder=[("local", make_ok_worker())],
+        ladder=[("worker", make_ok_worker())],
         repo=git_repo,
     )
     seqs = [e.seq for e in read_events(run_dir.events_path)]
@@ -196,7 +196,7 @@ def test_kill_mid_epoch_then_resume(tmp_path: Path) -> None:
         run_dir,
         args=implement_epoch(t1, t2),
         mode="implement",
-        ladder=[("local", make_ok_worker(out_file="f2.txt"))],
+        ladder=[("worker", make_ok_worker(out_file="f2.txt"))],
         repo=repo,
     )
     assert outcome.status == "completed"

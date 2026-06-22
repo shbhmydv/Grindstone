@@ -5,12 +5,13 @@ These drive the entry scripts as real subprocesses with a STUB
 GPU, or model binary is ever touched. The scripts are the checked artifact of this
 slice; these tests are the gate.
 
-Layout after the rig split: the shipped Claude rig lives in ``models/default/``
-(tracked), the codex planner preset in ``models/codex/`` (tracked), and the
-operator's personal pi/opencode/codex scripts in ``models/override/`` (GITIGNORED).
-Tests for an override script ``skip`` when it is absent (a fresh clone has no
-override rig), so the suite stays green everywhere while still covering the
-operator's scripts on a rig that ships them.
+Layout after the rig restructure: the shipped Claude rig lives in
+``models/claude/`` (tracked), the codex planner preset in ``models/codex/``
+(tracked), the backend-agnostic shared helpers in ``models/_common/`` (tracked),
+and the operator's personal pi/opencode/codex scripts in ``models/personal/``
+(GITIGNORED). Tests for a personal script ``skip`` when it is absent (a fresh
+clone has no personal rig), so the suite stays green everywhere while still
+covering the operator's scripts on a rig that ships them.
 """
 
 from __future__ import annotations
@@ -24,30 +25,31 @@ from pathlib import Path
 import pytest
 
 MODELS_DIR = Path(__file__).resolve().parents[2] / "models"
-DEFAULT_DIR = MODELS_DIR / "default"
+CLAUDE_DIR = MODELS_DIR / "claude"
 CODEX_DIR = MODELS_DIR / "codex"
-OVERRIDE_DIR = MODELS_DIR / "override"
+COMMON_DIR = MODELS_DIR / "_common"
+PERSONAL_DIR = MODELS_DIR / "personal"
 
-# Operator's personal rig (gitignored): pi local, opencode senior, codex gates.
-LOCAL = OVERRIDE_DIR / "local_request.sh"
-SENIOR = OVERRIDE_DIR / "senior_request.sh"
-VISION = OVERRIDE_DIR / "vision_review.sh"
-POLISH = OVERRIDE_DIR / "codex_polish.sh"
-# Tracked presets: codex planner + generic helpers.
+# Operator's personal rig (gitignored): pi worker, opencode senior, codex gates.
+LOCAL = PERSONAL_DIR / "worker_request.sh"
+SENIOR = PERSONAL_DIR / "senior_request.sh"
+VISION = PERSONAL_DIR / "vision_review.sh"
+POLISH = PERSONAL_DIR / "codex_polish.sh"
+# Tracked presets: codex planner + the backend-agnostic shared helper.
 PLANNER = CODEX_DIR / "planner_request.sh"
-STOP = DEFAULT_DIR / "stop.sh"
+STOP = COMMON_DIR / "stop.sh"
 # Shipped default Claude rig (tracked).
-DEFAULT_PLANNER = DEFAULT_DIR / "planner_request.sh"
-DEFAULT_LOCAL = DEFAULT_DIR / "local_request.sh"
-DEFAULT_SENIOR = DEFAULT_DIR / "senior_request.sh"
+DEFAULT_PLANNER = CLAUDE_DIR / "planner_request.sh"
+DEFAULT_LOCAL = CLAUDE_DIR / "worker_request.sh"
+DEFAULT_SENIOR = CLAUDE_DIR / "senior_request.sh"
 SCHEMA = Path(__file__).resolve().parents[2] / "schemas" / "vision_verdict.json"
 
 
 def _require(script: Path) -> None:
-    """Skip when ``script`` is absent (the operator's models/override is gitignored,
+    """Skip when ``script`` is absent (the operator's models/personal is gitignored,
     so a fresh clone has no personal rig to exercise)."""
     if not script.is_file():
-        pytest.skip(f"{script} not present (models/override is gitignored)")
+        pytest.skip(f"{script} not present (models/personal is gitignored)")
 
 
 def _make_stub(dir_: Path, name: str, body: str) -> None:
@@ -63,7 +65,7 @@ def _env_with_stub_path(stub_dir: Path) -> dict[str, str]:
     return env
 
 
-# --- local_request.sh --------------------------------------------------------
+# --- worker_request.sh --------------------------------------------------------
 
 
 def test_local_request_relays_handoff_and_writes_handle(tmp_path: Path) -> None:
@@ -533,7 +535,7 @@ def test_vision_review_missing_arg_errors(tmp_path: Path) -> None:
     assert "missing required" in res.stderr
 
 
-# --- codex_polish.sh (override) ----------------------------------------------
+# --- codex_polish.sh (personal) ----------------------------------------------
 
 
 def _polish_inputs(tmp_path: Path) -> tuple[Path, Path]:
@@ -895,7 +897,7 @@ def test_stop_is_noop_on_missing_handle(tmp_path: Path) -> None:
 
 # --- default/ Claude rig (tracked: planner + local + senior) ------------------
 # These exercise the shipped default scripts with a STUB `claude` on PATH. They
-# run everywhere (the default rig is tracked, unlike models/override).
+# run everywhere (the default rig is tracked, unlike models/personal).
 
 
 def test_default_planner_captures_stdout_to_out_file(tmp_path: Path) -> None:

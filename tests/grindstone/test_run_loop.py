@@ -35,7 +35,7 @@ from tests.grindstone.conftest import (
 
 
 def _ladder() -> list[tuple[str, OwnershipWorker]]:
-    return [("local", OwnershipWorker())]
+    return [("worker", OwnershipWorker())]
 
 
 def test_evaluate_checks_artifact_bare_filename(tmp_path: Path) -> None:

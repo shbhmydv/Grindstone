@@ -16,10 +16,10 @@ them. Where prose here and the schema disagree, the schema wins.
 The planner is a **stateless one-shot call**. There is no warm planner instance
 and no planner-held state; Grindstone reconstructs the full input from durable
 state on every call, so model drift has nowhere to accumulate. The shipped default
-adapter (`models/default/planner_request.sh`) drives Claude (Opus) via `claude -p`
+adapter (`models/claude/planner_request.sh`) drives Claude (Opus) via `claude -p`
 read-only; a bundled `codex exec` alternative lives at `models/codex/planner_request.sh`
 (opt in with `grindstone init --rig codex`), and the role is swappable behind the
-script via `models/override/`.
+script via `models/personal/` (consulted for the implicit default rig).
 
 Grindstone invokes the planner at exactly two kinds of moment:
 
@@ -139,19 +139,20 @@ giant epoch with a single giant task cannot be diagnosed when it fails.
 
 The mode also picks the **tier**: `research` / `review` (and any `visual` epoch)
 start on the stronger **senior** tier; `implement` / `artifact` start on the
-local rig (see §5). So a phase skeleton is also a *routing* decision: put the
-judgment on senior and the production on local. These are gentle defaults, not
+**worker** tier (the local rig, see §5). So a phase skeleton is also a *routing*
+decision: put the
+judgment on senior and the production on the worker tier. These are gentle defaults, not
 mandates: a small job is fine as a single epoch. But for heavy or judgment-laden
 work, splitting pays off: each tier does what it is best (and cheapest) at, and
 a non-implement epoch's `artifact_out` persists to the keyed log, so it becomes a
 downstream epoch's `inputs`. That keyed-log handoff is how findings flow from a
-senior investigation into a local build or write-up.
+senior investigation into a worker build or write-up.
 
 Splitting is driven by **two independent axes**: a **tier change** (judgment vs.
 production, above) and a **data dependency or checkpoint**. The second matters
 even when the tier does not change: if step B consumes step A's `artifact_out`,
 or a meaningful gate sits between them, B belongs in its **own epoch** even when
-both are local `implement` work. Be *conservative* splitting parallel tasks
+both are worker `implement` work. Be *conservative* splitting parallel tasks
 within an epoch (§5), but *liberal* splitting sequential steps across epochs: each
 boundary is a free planner checkpoint and a deterministic gate. Do not, however,
 invent artificial steps; every epoch costs a planner call, bounded by
@@ -160,20 +161,20 @@ invent artificial steps; every epoch costs a planner call, bounded by
 Good shapes (compose freely; these are nudges, not a fixed menu):
 
 - **Heavy implementation** → `research` (map the area + constraints, on senior,
-  cited) → `implement` (build it, on local, consuming the research artifact as an
+  cited) → `implement` (build it, on the worker tier, consuming the research artifact as an
   input) → `review` (on senior, re-derive a sample of the result's claims and
   reconcile them against the inputs, not merely confirm the expected sections
   exist).
 - **Report / triage / migration plan** → `research` (investigate + classify, on
   senior, cited) → `artifact` (write the final report from the findings, on
-  local). Do not collapse the judgment into a single local `artifact` epoch when
+  local). Do not collapse the judgment into a single worker `artifact` epoch when
   the analysis is the hard part, which silently downgrades it off senior.
 - **UI / polish** → `research` (gather the design intent + tokens) → `implement`
   with `visual: true` (build on senior) → a phase `exit_criterion` that builds +
   screenshots the UI and then `vision_review`s it (the taste gate, §5).
 
 Counter-example: framing a judgment job as "produce `report.md`" makes it look
-like local production and routes it off senior. If the analysis is the point, say
+like worker production and routes it off senior. If the analysis is the point, say
 so: use a `research` epoch first.
 
 ## 4. Phases
@@ -257,9 +258,9 @@ Mode-specific:
 An `implement` / `review` / `artifact` epoch may set `visual: true` (default
 `false`) on its args when its deliverable is **front-end / UI / visual / polish**
 output: anything judged by how it *looks*. A visual epoch starts its workers on
-the stronger taste-building **senior** tier instead of the local default. (The
+the stronger taste-building **senior** tier instead of the worker default. (The
 senior is a text model; the genuine image judgment is the vision-review gate
-below. A rig with no senior tier falls back to local so a visual epoch grinds
+below. A rig with no senior tier falls back to the worker tier so a visual epoch grinds
 rather than crash.) Omit the flag for backend / logic / plain-text work.
 
 ### Checks
@@ -303,7 +304,7 @@ only two of them:
    add **structural facts** on top of the floor: a command's exit code, file
    existence. A content-grep is rejected (above).
 3. **Semantic `criteria`** (you, natural language). Judged by an **agentic
-   verification pass** (the local tier, adversarial, told to find gaps and default
+   verification pass** (the worker tier, adversarial, told to find gaps and default
    to FAIL), **not** by a shell command. After an epoch clears its floor, that
    pass reads the produced artifacts against your `criteria` and writes a verdict;
    if a criterion is unmet, the epoch is **failed** and routed to you as a

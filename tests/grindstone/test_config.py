@@ -4,8 +4,8 @@ loader over the per-role schema.
 A minimal Pydantic loader with explicit unknown-key rejection, no schema
 framework. Missing config is ``None`` (CLI fails loudly toward init); present
 config parses to a frozen typed object; an unknown key, a missing required role
-(``planner`` / ``local``), or a bad ``slots`` / ``timeout_s`` is a hard error
-(no silent typo-eats-config). ``senior`` is optional = a local-only ladder.
+(``planner`` / ``worker``), or a bad ``slots`` / ``timeout_s`` is a hard error
+(no silent typo-eats-config). ``senior`` is optional = a worker-only ladder.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from grindstone.config import (
 )
 
 _PLANNER = "  planner: {script: /m/planner.sh, slots: 1, timeout_s: 600}\n"
-_LOCAL = "  local: {script: /m/local.sh, slots: 2, timeout_s: 1800}\n"
+_LOCAL = "  worker: {script: /m/local.sh, slots: 2, timeout_s: 1800}\n"
 
 
 def _write(repo: Path, text: str) -> None:
@@ -44,9 +44,9 @@ def test_minimal_local_only_config(tmp_path: Path) -> None:
     assert isinstance(cfg, GrindstoneConfig)
     assert cfg.roles.planner.script == Path("/m/planner.sh")
     assert cfg.roles.planner.slots == 1
-    assert cfg.roles.local.script == Path("/m/local.sh")
-    assert cfg.roles.local.slots == 2
-    assert cfg.roles.local.timeout_s == 1800
+    assert cfg.roles.worker.script == Path("/m/local.sh")
+    assert cfg.roles.worker.slots == 2
+    assert cfg.roles.worker.timeout_s == 1800
     assert cfg.roles.senior is None  # optional: a rig with no cloud tier
 
 
@@ -97,7 +97,7 @@ def test_missing_local_is_rejected(tmp_path: Path) -> None:
 def test_missing_required_role_field_is_rejected(tmp_path: Path) -> None:
     _write(
         tmp_path,
-        "roles:\n" + _PLANNER + "  local: {script: /m/local.sh, slots: 2}\n",  # no timeout_s
+        "roles:\n" + _PLANNER + "  worker: {script: /m/local.sh, slots: 2}\n",  # no timeout_s
     )
     with pytest.raises(ValueError):
         load_config(tmp_path)
@@ -106,7 +106,7 @@ def test_missing_required_role_field_is_rejected(tmp_path: Path) -> None:
 def test_slots_below_one_is_rejected(tmp_path: Path) -> None:
     _write(
         tmp_path,
-        "roles:\n" + _PLANNER + "  local: {script: /m/local.sh, slots: 0, timeout_s: 1}\n",
+        "roles:\n" + _PLANNER + "  worker: {script: /m/local.sh, slots: 0, timeout_s: 1}\n",
     )
     with pytest.raises(ValueError):
         load_config(tmp_path)
@@ -115,7 +115,7 @@ def test_slots_below_one_is_rejected(tmp_path: Path) -> None:
 def test_non_positive_timeout_is_rejected(tmp_path: Path) -> None:
     _write(
         tmp_path,
-        "roles:\n" + _PLANNER + "  local: {script: /m/local.sh, slots: 1, timeout_s: 0}\n",
+        "roles:\n" + _PLANNER + "  worker: {script: /m/local.sh, slots: 1, timeout_s: 0}\n",
     )
     with pytest.raises(ValueError):
         load_config(tmp_path)
@@ -447,111 +447,163 @@ def test_infra_repair_unknown_key_rejected(tmp_path: Path) -> None:
 
 
 def _bundled_roles() -> str:
-    planner = MODELS_DIR / "default" / "planner_request.sh"
-    local = MODELS_DIR / "default" / "local_request.sh"
+    planner = MODELS_DIR / "claude" / "planner_request.sh"
+    worker = MODELS_DIR / "claude" / "worker_request.sh"
     return (
         "roles:\n"
         f"  planner: {{script: {planner}, slots: 1, timeout_s: 600}}\n"
-        f"  local: {{script: {local}, slots: 2, timeout_s: 1800}}\n"
+        f"  worker: {{script: {worker}, slots: 2, timeout_s: 1800}}\n"
     )
 
 
 def test_rce_guard_accepts_every_rig_subdir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The move to default/ + codex/ + override/ subdirs keeps every script UNDER
-    # MODELS_DIR, so the RCE guard accepts all three layers unchanged.
+    # The codex/ + claude/ + personal/ subdirs all keep every script UNDER
+    # MODELS_DIR, so the RCE guard accepts every layer unchanged.
     monkeypatch.delenv(ALLOW_REPO_SCRIPTS_ENV, raising=False)
     planner = MODELS_DIR / "codex" / "planner_request.sh"
-    local = MODELS_DIR / "override" / "local_request.sh"
-    senior = MODELS_DIR / "default" / "senior_request.sh"
+    worker = MODELS_DIR / "personal" / "worker_request.sh"
+    senior = MODELS_DIR / "claude" / "senior_request.sh"
     _write(
         tmp_path,
         "roles:\n"
         f"  planner: {{script: {planner}, slots: 1, timeout_s: 600}}\n"
-        f"  local: {{script: {local}, slots: 2, timeout_s: 1800}}\n"
+        f"  worker: {{script: {worker}, slots: 2, timeout_s: 1800}}\n"
         f"  senior: {{script: {senior}, slots: 2, timeout_s: 3600}}\n",
     )
     cfg = load_config(tmp_path)
     assert cfg is not None
-    validate_script_paths(cfg)  # default/ + codex/ + override/ -> no raise
+    validate_script_paths(cfg)  # codex/ + claude/ + personal/ -> no raise
 
 
-# --- models_script resolver: override > preset > default ------------------------
+# --- models_script resolver: explicit=exact (claude floor, never personal); -----
+# --- implicit=personal-or-shipped; _common is the shared-helper floor -----------
 
 
-def _fake_models(root: Path, *, default: tuple[str, ...], codex: tuple[str, ...] = (),
-                 override: tuple[str, ...] = ()) -> None:
-    """Build a fake models/ tree under ``root`` with the named scripts per rig."""
+def _fake_models(
+    root: Path,
+    *,
+    claude: tuple[str, ...] = (),
+    codex: tuple[str, ...] = (),
+    personal: tuple[str, ...] = (),
+    common: tuple[str, ...] = (),
+) -> None:
+    """Build a fake models/ tree under ``root`` with the named scripts per subdir."""
 
-    for sub, names in (("default", default), ("codex", codex), ("override", override)):
+    for sub, names in (
+        ("claude", claude),
+        ("codex", codex),
+        ("personal", personal),
+        ("_common", common),
+    ):
         (root / sub).mkdir(parents=True, exist_ok=True)
         for name in names:
             (root / sub / name).write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
 
 
-def test_models_script_falls_back_to_default(
+def test_models_script_falls_back_to_claude_floor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The implicit default with no personal/ rig: the shipped claude/ floor.
     monkeypatch.setattr("grindstone.config.MODELS_DIR", tmp_path)
-    _fake_models(tmp_path, default=("planner_request.sh",))
+    _fake_models(tmp_path, claude=("planner_request.sh",))
     resolved = models_script("planner_request.sh")
-    assert resolved == (tmp_path / "default" / "planner_request.sh").resolve()
+    assert resolved == (tmp_path / "claude" / "planner_request.sh").resolve()
     assert resolved.is_absolute()
 
 
-def test_models_script_override_beats_default(
+def test_models_script_implicit_personal_beats_claude(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # rig=None: the operator's personal/ rig shadows the shipped claude/ floor.
     monkeypatch.setattr("grindstone.config.MODELS_DIR", tmp_path)
-    _fake_models(tmp_path, default=("local_request.sh",), override=("local_request.sh",))
-    assert models_script("local_request.sh") == (
-        tmp_path / "override" / "local_request.sh"
+    _fake_models(
+        tmp_path,
+        claude=("worker_request.sh",),
+        personal=("worker_request.sh",),
+    )
+    assert models_script("worker_request.sh") == (
+        tmp_path / "personal" / "worker_request.sh"
     ).resolve()
 
 
-def test_models_script_rig_inserts_middle_layer(
+def test_models_script_explicit_rig_beats_claude(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("grindstone.config.MODELS_DIR", tmp_path)
     _fake_models(
         tmp_path,
-        default=("planner_request.sh",),
+        claude=("planner_request.sh",),
         codex=("planner_request.sh",),
     )
-    # rig=codex wins over default...
+    # An explicit rig wins over the claude/ floor...
     assert models_script("planner_request.sh", rig="codex") == (
         tmp_path / "codex" / "planner_request.sh"
     ).resolve()
-    # ...but rig=None ignores the codex layer entirely.
+    # ...but rig=None ignores the codex layer entirely (claude floor, no personal).
     assert models_script("planner_request.sh") == (
-        tmp_path / "default" / "planner_request.sh"
+        tmp_path / "claude" / "planner_request.sh"
     ).resolve()
 
 
-def test_models_script_override_beats_rig(
+def test_models_script_explicit_rig_never_consults_personal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # THE KEY REGRESSION: an explicitly selected rig must NEVER be shadowed by the
+    # gitignored personal/ rig. rig=codex resolves codex/, even though personal/
+    # ALSO carries the script (a config asking for codex gets codex, reproducibly).
     monkeypatch.setattr("grindstone.config.MODELS_DIR", tmp_path)
     _fake_models(
         tmp_path,
-        default=("planner_request.sh",),
+        claude=("planner_request.sh",),
         codex=("planner_request.sh",),
-        override=("planner_request.sh",),
+        personal=("planner_request.sh",),
     )
     assert models_script("planner_request.sh", rig="codex") == (
-        tmp_path / "override" / "planner_request.sh"
+        tmp_path / "codex" / "planner_request.sh"
     ).resolve()
+
+
+def test_models_script_explicit_rig_falls_through_to_claude_floor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An explicit rig that lacks the script falls to the claude/ floor (NOT
+    # personal/), so a rig-specific config still finds the shipped default.
+    monkeypatch.setattr("grindstone.config.MODELS_DIR", tmp_path)
+    _fake_models(
+        tmp_path,
+        claude=("senior_request.sh",),
+        personal=("senior_request.sh",),
+    )
+    assert models_script("senior_request.sh", rig="codex") == (
+        tmp_path / "claude" / "senior_request.sh"
+    ).resolve()
+
+
+def test_models_script_shared_helper_found_in_common_both_modes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A backend-agnostic helper present ONLY in _common/ (e.g. stop.sh) resolves
+    # via the shared-helper floor under BOTH the implicit and an explicit rig.
+    monkeypatch.setattr("grindstone.config.MODELS_DIR", tmp_path)
+    _fake_models(tmp_path, claude=("planner_request.sh",), common=("stop.sh",))
+    expected = (tmp_path / "_common" / "stop.sh").resolve()
+    assert models_script("stop.sh") == expected  # implicit
+    assert models_script("stop.sh", rig="codex") == expected  # explicit
 
 
 def test_models_script_missing_everywhere_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("grindstone.config.MODELS_DIR", tmp_path)
-    _fake_models(tmp_path, default=("planner_request.sh",))
+    _fake_models(tmp_path, claude=("planner_request.sh",))
     with pytest.raises(FileNotFoundError) as exc:
         models_script("vision_review.sh")
-    assert "vision_review.sh" in str(exc.value)
+    msg = str(exc.value)
+    assert "vision_review.sh" in msg
+    # the error lists the dirs searched (personal/claude/_common for the implicit)
+    assert "personal" in msg and "claude" in msg and "_common" in msg
 
 
 def test_role_script_outside_models_is_rejected(

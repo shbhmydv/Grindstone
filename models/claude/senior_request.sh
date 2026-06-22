@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # senior_request.sh, the DEFAULT `senior` worker role: the escalation tier. Runs
 # Claude (Opus) headless via `claude -p` one-shot IN the task worktree, with edit
-# + exec permissions, same grindstone contract as local_request.sh. Senior handles
+# + exec permissions, same grindstone contract as worker_request.sh. Senior handles
 # research/review escalations and visual epochs, so it leans on deeper
 # investigation (Claude's built-in web search/fetch tools, available under full
 # permissions) and independent re-derivation.
 #
 # This is the shipped default rig: a fresh cloner with Claude Code installed runs
 # with zero setup. An operator's own senior tier (e.g. a cloud agent with a
-# different web-search stack) goes in models/override/senior_request.sh (gitignored,
+# different web-search stack) goes in models/personal/senior_request.sh (gitignored,
 # highest priority).
 #
 # The agent writes handoff.json into the worktree (the ONLY result channel); we
@@ -18,9 +18,9 @@
 set -euo pipefail
 
 # Portable timeout prefix (resolves `timeout`, else `gtimeout`, else none).
-source "$(dirname "$0")/_timeout_prefix.sh"
+source "$(dirname "$0")/../_common/_timeout_prefix.sh"
 # guarantee_handoff: synthesize a FAILED handoff if the agent left none.
-source "$(dirname "$0")/_handoff_guarantee.sh"
+source "$(dirname "$0")/../_common/_handoff_guarantee.sh"
 
 # Model identity is THIS script's concern. Override via $GRINDSTONE_SENIOR_MODEL.
 model="${GRINDSTONE_SENIOR_MODEL:-opus}"

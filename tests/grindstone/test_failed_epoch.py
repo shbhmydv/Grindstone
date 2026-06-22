@@ -59,7 +59,7 @@ def _unpassable_skeleton(cmd: str = "test -f never_exists.txt") -> dict[str, obj
 
 
 def _ladder() -> list[tuple[str, OwnershipWorker]]:
-    return [("local", OwnershipWorker())]
+    return [("worker", OwnershipWorker())]
 
 
 # --- Part A: gate observability -----------------------------------------------
@@ -202,7 +202,7 @@ def test_failed_epoch_active_forbids_other_tools() -> None:
 
 
 def _failing_ladder() -> list[tuple[str, FailingWorker]]:
-    return [("local", FailingWorker())]
+    return [("worker", FailingWorker())]
 
 
 def test_failed_epoch_drives_retry_then_completes(git_repo: Path, run_dir: RunDir) -> None:
@@ -221,7 +221,7 @@ def test_failed_epoch_drives_retry_then_completes(git_repo: Path, run_dir: RunDi
         ]
     )
     outcome = run_grind(
-        run_dir, job_path="job.md", planner=planner, ladder=[("local", swap)],
+        run_dir, job_path="job.md", planner=planner, ladder=[("worker", swap)],
         repo=git_repo, tier0_attempts=1,
     )
     assert outcome.status == "completed"
@@ -273,7 +273,7 @@ def test_failed_epoch_escalate_senior_routes_to_senior(git_repo: Path, run_dir: 
     )
     outcome = run_grind(
         run_dir, job_path="job.md",
-        planner=planner, ladder=[("local", local), ("senior", senior)],
+        planner=planner, ladder=[("worker", local), ("senior", senior)],
         repo=git_repo, tier0_attempts=1,
     )
     assert outcome.status == "completed"
@@ -348,7 +348,7 @@ def test_budget_exhausted_by_failed_epoch_retry_progresses(
         ]
     )
     outcome = run_grind(
-        run_dir, job_path="job.md", planner=planner, ladder=[("local", swap)],
+        run_dir, job_path="job.md", planner=planner, ladder=[("worker", swap)],
         repo=git_repo, tier0_attempts=1,
     )
     assert outcome.status == "completed"
@@ -379,7 +379,7 @@ def test_budget_exhausted_by_failed_epoch_escalate_senior_progresses(
     )
     outcome = run_grind(
         run_dir, job_path="job.md",
-        planner=planner, ladder=[("local", local), ("senior", senior)],
+        planner=planner, ladder=[("worker", local), ("senior", senior)],
         repo=git_repo, tier0_attempts=1,
     )
     assert outcome.status == "completed"

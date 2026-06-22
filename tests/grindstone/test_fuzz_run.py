@@ -99,7 +99,7 @@ def test_fuzz_run_always_terminates_bounded(tmp_path: Path, seed: int) -> None:
         run_dir,
         job_path="job.md",
         planner=_FuzzPlanner(seed),
-        ladder=[("local", _SeededWorker(seed))],
+        ladder=[("worker", _SeededWorker(seed))],
         repo=None,  # artifact-only fuzz: no git, no integration
         sleep_fn=lambda _delay: None,  # never touch the wall clock
         max_planner_calls=MAX_PLANNER_CALLS,
@@ -165,7 +165,7 @@ def test_fuzz_run_multiphase_terminates_bounded(tmp_path: Path, seed: int) -> No
         run_dir,
         job_path="job.md",
         planner=_MultiPhasePlanner(seed),
-        ladder=[("local", _SeededWorker(seed))],
+        ladder=[("worker", _SeededWorker(seed))],
         repo=None,
         sleep_fn=lambda _delay: None,
         max_planner_calls=MAX_PLANNER_CALLS,

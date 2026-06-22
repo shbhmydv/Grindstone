@@ -91,7 +91,7 @@ class _PipelineWorker:
 def _two_tier(
     local: _PipelineWorker, senior: _PipelineWorker
 ) -> list[tuple[str, _PipelineWorker]]:
-    return [("local", local), ("senior", senior)]
+    return [("worker", local), ("senior", senior)]
 
 
 def _state(run_dir: RunDir) -> RunState:

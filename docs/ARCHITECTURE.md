@@ -25,25 +25,29 @@ each through a request **script** behind a file contract. It never learns the
 transport, model identity, or GPU assignment hiding behind a script; those live
 entirely in `models/`.
 
-| role | what it does | shipped default adapter (`models/default/`) |
+| role | what it does | shipped default adapter (`models/claude/`) |
 |---|---|---|
 | **planner** | plans one epoch at a time as a constrained tool-call | `planner_request.sh` → Claude (Opus) via `claude -p`, read-only |
-| **local** | the on-rig grinders that fan out across an epoch's tasks | `local_request.sh` → Claude (Opus) via `claude -p` in the worktree |
+| **worker** | the on-rig grinders that fan out across an epoch's tasks | `worker_request.sh` → Claude (Opus) via `claude -p` in the worktree |
 | **senior** | optional escalation / web-research / taste tier | `senior_request.sh` → Claude (Opus) via `claude -p`, web search on |
 
-`models/` is layered as a rig stack: `default/` is the tracked Claude rig a fresh
-clone runs with zero setup; `codex/` is a bundled alternative (a `codex exec`
-planner, opt in via `grindstone init --rig codex`); and `override/` (gitignored)
-is the operator's personal per-file rig, which wins where present. `init` resolves
-each role to the first existing of `override/` > `<rig>/` > `default/` and bakes
-the absolute path into `.grindstone/config.yaml`. `stop.sh` + `_timeout_prefix.sh`
-are shared kill/timeout helpers under `default/`. Two optional scripts back the
-taste features when a rig supplies them: `vision_review.sh` (the screenshot-judge
-gate) and `codex_polish.sh` (the final-polish pass). All scripts are **reference
+`models/` is layered as a rig stack: `claude/` is the tracked Claude rig (the
+shipped floor) a fresh clone runs with zero setup; `codex/` is a bundled
+alternative (a `codex exec` planner, opt in via `grindstone init --rig codex`);
+and `personal/` (gitignored) is the operator's personal per-file rig. Resolution
+splits on whether a rig is named: an explicit `--rig codex` searches `codex/`
+then the `claude/` floor (never `personal/`, so a selected rig is exact and
+reproducible), while the implicit default searches `personal/` then `claude/`,
+letting the operator's scripts win where present. Either way `init` bakes the
+absolute resolved path into `.grindstone/config.yaml`. `stop.sh` +
+`_timeout_prefix.sh` are backend-agnostic kill/timeout helpers under `_common/`,
+the shared-helper floor under both modes. Two optional scripts back the taste
+features when a rig supplies them: `vision_review.sh` (the screenshot-judge gate)
+and `codex_polish.sh` (the final-polish pass). All scripts are **reference
 adapters**: point them at your own backends, or drop a replacement into
-`override/`. The per-repo `.grindstone/config.yaml` names each role's script plus
-its `slots` (per-role concurrency) and `timeout_s`; `planner` + `local` are
-required, `senior` is optional (its absence means a local-only escalation ladder).
+`personal/`. The per-repo `.grindstone/config.yaml` names each role's script plus
+its `slots` (per-role concurrency) and `timeout_s`; `planner` + `worker` are
+required, `senior` is optional (its absence means a worker-only escalation ladder).
 
 `grindstone/config.py` loads that YAML into a frozen, unknown-key-rejecting
 Pydantic object, and refuses any configured `script:` path that does not resolve
@@ -102,7 +106,7 @@ A task gets up to three attempts on its starting tier, then one attempt per
 higher ladder rung; exhausting the ladder marks it FAILED and the epoch
 continues. The planner picks the *mode*; the core maps mode → starting tier
 (`research`/`review`, and any `visual` epoch, start on the senior tier when one
-exists; everything else starts local).
+exists; everything else starts on the worker tier).
 
 ### The handoff disk contract
 
@@ -167,8 +171,8 @@ by *who owns each*, and a failure is classified before it is charged to anyone.
 ### The end-of-epoch agentic verification pass
 
 After every task in an epoch clears its deterministic floor and the epoch would
-otherwise complete, *if* the epoch carries any `criteria` and a local tier is
-wired, the core runs one **adversarial** verification pass on the **local** tier
+otherwise complete, *if* the epoch carries any `criteria` and a worker tier is
+wired, the core runs one **adversarial** verification pass on the **worker** tier
 (`grindstone/verify.py`). It runs in a worktree of the epoch's integration tip
 with dependencies materialized, is a *separate* invocation from the worker (given
 only the epoch goal + criteria + the produced artifacts, told to find gaps and
@@ -182,7 +186,7 @@ route through `handle_failed_epoch` (the same machinery as a task-failure epoch)
 so the planner sees the unmet criteria and disposes: `retry` with the gaps as
 feedback, `escalate_senior`, or `halt`. The pass is gated by `verify_epochs`
 (default on) and the senior `review` epoch stays the deeper phase/run-level pass;
-this local pass is the cheap per-epoch semantic filter.
+this worker pass is the cheap per-epoch semantic filter.
 
 ### The automatic infra-repair loop
 
@@ -240,7 +244,7 @@ existing run is byte-unchanged.
   ordinary failed-epoch path.
 - **`verify_epochs:`** a bool (default **`true`**) toggling the end-of-epoch
   agentic pass. The pass never runs (and never errors) when an epoch has no
-  `criteria` or there is no local tier; set `false` to disable it entirely (the
+  `criteria` or there is no worker tier; set `false` to disable it entirely (the
   deterministic floor + planner `review` epochs still gate).
 
 ## The run-dir layout
@@ -309,7 +313,7 @@ queries under `grindstone/_repomap_queries/` are pure data vendored from aider
 Grindstone can build and judge work that is evaluated by how it *looks*:
 
 - **The `visual` flag** routes a UI/visual epoch's build to the **senior** tier
-  (the stronger taste-builder) instead of the local default.
+  (the stronger taste-builder) instead of the worker default.
 - **The `vision_review` gate** is a deterministic phase check: after a `cmd`
   check builds and screenshots the UI into the tip worktree, a `vision_review`
   check shows that screenshot to a vision model (via the rig's `vision_review.sh`)

@@ -127,7 +127,7 @@ def test_infra_gate_failure_auto_repairs_and_run_proceeds(
         run_dir,
         job_path="job.md",
         planner=planner,
-        ladder=[("local", local), ("senior", senior)],
+        ladder=[("worker", local), ("senior", senior)],
         repo=git_repo,
         infra_repair=InfraRepairConfig(attempts=2),
     )
@@ -243,7 +243,7 @@ def test_semantic_gap_opens_failed_epoch_retry_closes_it(
         run_dir,
         job_path="job.md",
         planner=planner,
-        ladder=[("local", worker)],
+        ladder=[("worker", worker)],
         repo=git_repo,
         verifier=verifier,
     )

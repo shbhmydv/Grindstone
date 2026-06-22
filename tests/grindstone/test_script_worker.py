@@ -40,7 +40,7 @@ def _request(scratch: Path, *, task_id: str = "P1/E1/T1", attempt: int = 1) -> W
 def test_success_relays_handoff_and_passes_contract_args(tmp_path: Path) -> None:
     argv_file = tmp_path / "argv.txt"
     script = _make_script(
-        tmp_path / "local_request.sh",
+        tmp_path / "worker_request.sh",
         f"""set -euo pipefail
 printf '%s\\n' "$@" > "{argv_file}"
 worktree="" handle=""
@@ -87,7 +87,7 @@ exit 0
 
 def test_nonzero_rate_limit_stderr_maps_to_rate_limited(tmp_path: Path) -> None:
     script = _make_script(
-        tmp_path / "local_request.sh",
+        tmp_path / "worker_request.sh",
         'echo "Error: rate limit exceeded" >&2\nexit 1\n',
     )
     worker = ScriptWorker(
@@ -99,7 +99,7 @@ def test_nonzero_rate_limit_stderr_maps_to_rate_limited(tmp_path: Path) -> None:
 
 def test_nonzero_other_stderr_maps_to_transport_error(tmp_path: Path) -> None:
     script = _make_script(
-        tmp_path / "local_request.sh",
+        tmp_path / "worker_request.sh",
         'echo "some unexpected failure" >&2\nexit 1\n',
     )
     worker = ScriptWorker(
@@ -129,7 +129,7 @@ exit 0
 """,
     )
     script = _make_script(
-        tmp_path / "local_request.sh",
+        tmp_path / "worker_request.sh",
         """set -euo pipefail
 handle=""
 while [[ $# -gt 0 ]]; do
@@ -160,7 +160,7 @@ def test_semaphore_bounds_concurrency(tmp_path: Path) -> None:
     maxfile.write_text("0", encoding="utf-8")
 
     script = _make_script(
-        tmp_path / "local_request.sh",
+        tmp_path / "worker_request.sh",
         f"""set -euo pipefail
 worktree="" handle=""
 while [[ $# -gt 0 ]]; do
@@ -215,11 +215,11 @@ def test_stop_script_is_the_explicit_path_not_a_sibling(tmp_path: Path) -> None:
     # The role script can resolve from a preset/override dir with no sibling
     # stop.sh, so stop.sh is passed EXPLICITLY (resolved by the CLI), never assumed
     # beside the role script.
-    script = tmp_path / "override" / "local_request.sh"
+    script = tmp_path / "personal" / "worker_request.sh"
     script.parent.mkdir()
     script.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     script.chmod(script.stat().st_mode | stat.S_IXUSR)
-    stop = tmp_path / "default" / "stop.sh"
+    stop = tmp_path / "_common" / "stop.sh"
     worker = ScriptWorker(
         script=script, stop_script=stop, slots=1, timeout_s=1.0, log_root=tmp_path
     )
@@ -229,7 +229,7 @@ def test_stop_script_is_the_explicit_path_not_a_sibling(tmp_path: Path) -> None:
 
 def test_log_artifacts_land_under_log_root_not_run_dir(tmp_path: Path) -> None:
     script = _make_script(
-        tmp_path / "local_request.sh",
+        tmp_path / "worker_request.sh",
         """set -euo pipefail
 handle="" worktree=""
 while [[ $# -gt 0 ]]; do

@@ -7,10 +7,10 @@ error, never a silently-ignored default, because a config that half-applies is
 worse than no config.
 
 The config knows only *roles*, never models or transports: each role
-(``planner`` / ``local`` / ``senior``) names a request **script** behind the
+(``planner`` / ``worker`` / ``senior``) names a request **script** behind the
 file contract (the script owns transport, model identity, GPU arbitration and
 the killable process group, see ``models/``), plus its concurrency ``slots``
-and wall-clock ``timeout_s``. ``planner`` + ``local`` are required; ``senior``
+and wall-clock ``timeout_s``. ``planner`` + ``worker`` are required; ``senior``
 is optional, a rig with no cloud tier runs a local-only escalation ladder.
 
 The CLI consults this loader on ``run`` / ``resume``: present config supplies
@@ -35,34 +35,54 @@ _CONFIG_REL = Path(".grindstone") / "config.yaml"
 MODELS_DIR = Path(__file__).resolve().parents[1] / "models"
 
 #: The tracked base rig: the shipped Claude (Opus) scripts a fresh cloner runs with
-#: zero setup. ``models_script`` always falls back here.
-_DEFAULT_RIG = "default"
+#: zero setup. ``models_script`` always falls back here (the floor).
+_CLAUDE_FLOOR = "claude"
 
-#: The operator's personal rig (gitignored): a per-file shadow with the HIGHEST
-#: priority, so a local pi/GPU/codex script overrides the shipped default.
-_OVERRIDE_RIG = "override"
+#: The operator's personal rig (gitignored): a per-file shadow consulted ONLY for
+#: the implicit default (``rig=None``), never for an explicitly selected rig.
+_PERSONAL_RIG = "personal"
+
+#: Backend-agnostic shared helpers (``stop.sh``, the sourced ``_*.sh`` prefixes):
+#: the lowest fallback under every resolution, so a helper present only here is
+#: still found whether a rig is selected or not.
+_COMMON_DIR = "_common"
 
 
 def models_script(name: str, rig: str | None = None) -> Path:
     """Resolve a bundled request script ``name`` to its absolute path.
 
-    The first existing of, in priority order:
+    Two resolution modes, by whether a rig is EXPLICITLY selected:
 
-    1. ``models/override/<name>`` (the operator's personal rig, gitignored);
-    2. ``models/<rig>/<name>`` (a named preset, e.g. ``codex``), only when ``rig``
-       is given;
-    3. ``models/default/<name>`` (the tracked base rig).
+    * ``rig`` given (explicit): search ``[rig, "claude", "_common"]`` -- exact,
+      reproducible, NEVER shadowed by the gitignored ``personal/``. A test (or a
+      ``--rig codex`` run) that asks for rig X gets rig X's script or the shipped
+      floor, never the operator's personal script.
+    * ``rig`` is ``None`` (implicit default): search ``["personal", "claude",
+      "_common"]`` -- the operator's personal rig wins where present, else the
+      shipped Claude floor.
 
-    Every candidate sits under ``MODELS_DIR``, so the resolved path passes the
-    ``validate_script_paths`` RCE guard unchanged. Returns an absolute, resolved
-    path; raises ``FileNotFoundError`` (listing the dirs searched) when no rig
-    supplies the script.
+    ``_common`` is the shared-helper floor under both modes (``stop.sh`` and the
+    sourced prefixes live there). The search list is de-duped, so ``rig="claude"``
+    does not double-search. Every candidate sits under ``MODELS_DIR``, so the
+    resolved path passes the ``validate_script_paths`` RCE guard unchanged.
+    Returns an absolute, resolved path; raises ``FileNotFoundError`` (listing the
+    dirs searched) when no layer supplies the script.
+
+    Explicit = exact (reproducible, never shadowed by gitignored ``personal/``);
+    implicit = personal-or-shipped; ``_common`` is the shared-helper floor.
     """
 
+    if rig is not None:
+        order = [rig, _CLAUDE_FLOOR, _COMMON_DIR]
+    else:
+        order = [_PERSONAL_RIG, _CLAUDE_FLOOR, _COMMON_DIR]
+
     searched: list[Path] = []
-    for sub in (_OVERRIDE_RIG, rig, _DEFAULT_RIG):
-        if sub is None:
+    seen: set[str] = set()
+    for sub in order:
+        if sub in seen:
             continue
+        seen.add(sub)
         candidate = MODELS_DIR / sub / name
         searched.append(candidate)
         if candidate.is_file():
@@ -110,15 +130,15 @@ class RoleConfig(BaseModel):
 
 
 class RolesConfig(BaseModel):
-    """The role set: required ``planner`` + ``local``, optional ``senior``.
+    """The role set: required ``planner`` + ``worker``, optional ``senior``.
 
     ``senior`` absent = a rig with no cloud tier → the escalation ladder is
-    local-only.
+    worker-only (the local rig grinds every tier).
     """
 
     model_config = _FROZEN
     planner: RoleConfig
-    local: RoleConfig
+    worker: RoleConfig
     senior: RoleConfig | None = None
 
 
@@ -398,7 +418,7 @@ def validate_script_paths(cfg: GrindstoneConfig) -> None:
         return
     candidates: list[tuple[str, Path]] = [
         ("roles.planner.script", cfg.roles.planner.script),
-        ("roles.local.script", cfg.roles.local.script),
+        ("roles.worker.script", cfg.roles.worker.script),
     ]
     if cfg.roles.senior is not None:
         candidates.append(("roles.senior.script", cfg.roles.senior.script))

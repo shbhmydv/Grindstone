@@ -21,7 +21,7 @@
 # This is the shipped default rig: a fresh cloner with Claude Code installed runs
 # with zero setup. The alternative codex-based planner lives at models/codex/ and
 # is opt-in via `grindstone init --rig codex`; an operator's own planner goes in
-# models/override/ (gitignored, highest priority).
+# models/personal/ (gitignored, highest priority).
 #
 # Grindstone passes the target repo, a prompt file, an --out path, a handle-out
 # path, a timeout and (in self-validate mode) a --workdir. We propagate claude's
@@ -30,7 +30,7 @@
 set -euo pipefail
 
 # Portable timeout prefix (resolves `timeout`, else `gtimeout`, else none).
-source "$(dirname "$0")/_timeout_prefix.sh"
+source "$(dirname "$0")/../_common/_timeout_prefix.sh"
 
 # Model identity is THIS script's concern. The owner's decision is Opus for every
 # role; `opus` is the alias for the latest Opus. Override for your own rig via

@@ -10,7 +10,7 @@
 set -euo pipefail
 
 # Portable timeout prefix (resolves `timeout`, else `gtimeout`, else none).
-source "$(dirname "$0")/../default/_timeout_prefix.sh"
+source "$(dirname "$0")/../_common/_timeout_prefix.sh"
 
 repo="" prompt="" out="" handle_out="" timeout=""
 while [[ $# -gt 0 ]]; do

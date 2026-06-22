@@ -264,7 +264,7 @@ def _outcome_from_cursor(identity: TaskIdentity, cursor: TaskCursorState) -> Tas
     return TaskOutcome(
         identity=identity,
         status=status,
-        tier=cursor.tier_name or "local",
+        tier=cursor.tier_name or "worker",
         attempts=cursor.attempt,
         handoff=None,
         handoff_key=f"{identity.fq}/handoff.json" if status == "done" else None,

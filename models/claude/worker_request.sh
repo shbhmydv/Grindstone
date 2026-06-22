@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# local_request.sh, the DEFAULT `local` worker role. Runs Claude (Opus) headless
+# worker_request.sh, the DEFAULT `worker` worker role. Runs Claude (Opus) headless
 # via `claude -p` one-shot IN the task worktree, with edit + exec permissions so
 # it can modify files, run the done_when checks, and write handoff.json.
 #
 # This is the shipped default rig: a fresh cloner with Claude Code installed runs
 # with zero setup. An operator's own local worker (e.g. a local-GPU model) goes in
-# models/override/local_request.sh (gitignored, highest priority).
+# models/personal/worker_request.sh (gitignored, highest priority).
 #
 # Grindstone passes only a worktree, a prompt file, a log dir, a handle-out path
 # and a timeout; it never learns the transport or the model behind the role. The
@@ -15,9 +15,9 @@
 set -euo pipefail
 
 # Portable timeout prefix (resolves `timeout`, else `gtimeout`, else none).
-source "$(dirname "$0")/_timeout_prefix.sh"
+source "$(dirname "$0")/../_common/_timeout_prefix.sh"
 # guarantee_handoff: synthesize a FAILED handoff if the agent left none.
-source "$(dirname "$0")/_handoff_guarantee.sh"
+source "$(dirname "$0")/../_common/_handoff_guarantee.sh"
 
 # Model identity is THIS script's concern. The owner's decision is Opus for every
 # role. Override for your own rig via $GRINDSTONE_LOCAL_MODEL (any `claude --model`
@@ -32,13 +32,13 @@ while [[ $# -gt 0 ]]; do
     --log-dir)    log_dir="$2";  shift 2 ;;
     --handle-out) handle_out="$2"; shift 2 ;;
     --timeout)    timeout="$2";  shift 2 ;;
-    *) echo "local_request: unknown arg: $1" >&2; exit 2 ;;
+    *) echo "worker_request: unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
 for req in worktree prompt log_dir handle_out; do
   if [[ -z "${!req}" ]]; then
-    echo "local_request: missing required --${req//_/-}" >&2
+    echo "worker_request: missing required --${req//_/-}" >&2
     exit 2
   fi
 done
@@ -96,7 +96,7 @@ cat "$log_out" || true
 # so grindstone's transport raises RateLimited and backs off, never synthesize a
 # FAILED handoff over it (that would mask the retryable condition as a hard fail).
 if [[ "$rc" -ne 0 ]] && grep -qiE 'rate.?limit|429' "$log_err" 2>/dev/null; then
-  echo "local_request: claude exited $rc (model=$model, rate-limited)" >&2
+  echo "worker_request: claude exited $rc (model=$model, rate-limited)" >&2
   exit "$rc"
 fi
 
@@ -108,6 +108,6 @@ fi
 guarantee_handoff "$worktree" "$prompt_text" "$log_out" "$log_err" "$rc"
 
 if [[ "$rc" -ne 0 ]]; then
-  echo "local_request: claude exited $rc (model=$model); synthesized/kept a FAILED handoff" >&2
+  echo "worker_request: claude exited $rc (model=$model); synthesized/kept a FAILED handoff" >&2
 fi
 exit 0

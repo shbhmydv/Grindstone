@@ -35,7 +35,7 @@ from tests.grindstone.conftest import (
 
 pytestmark = pytest.mark.real
 
-# The role script (models/local_request.sh) owns transport/model/GPU; the test
+# The role script (models/worker_request.sh) owns transport/model/GPU; the test
 # only points at it. parents[2] = repo root (this file is <root>/tests/grindstone/).
 _MODELS_DIR = Path(__file__).resolve().parents[2] / "models"
 DEFAULT_ENDPOINT = "http://localhost:8082"
@@ -82,8 +82,8 @@ def test_real_pi_three_task_epoch(tmp_path: Path) -> None:
     run_dir = create_run_dir(repo, "real-gate")
     tasks = [_task(*spec) for spec in _SPEC]
     worker = ScriptWorker(
-        script=_MODELS_DIR / "override" / "local_request.sh",
-        stop_script=_MODELS_DIR / "default" / "stop.sh",
+        script=_MODELS_DIR / "personal" / "worker_request.sh",
+        stop_script=_MODELS_DIR / "_common" / "stop.sh",
         slots=2,
         timeout_s=1800.0,
         log_root=run_dir.root / "worker_logs",
@@ -94,7 +94,7 @@ def test_real_pi_three_task_epoch(tmp_path: Path) -> None:
         run_dir,
         args=implement_epoch(*tasks),
         mode="implement",
-        ladder=[("local", worker)],
+        ladder=[("worker", worker)],
         repo=repo,
         concurrency=2,
     )

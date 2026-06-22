@@ -53,7 +53,7 @@ def test_fuzz_epoch_always_terminates(tmp_path: Path, seed: int) -> None:
         run_dir,
         args=implement_epoch(*tasks),
         mode="implement",
-        ladder=[("local", _tier(seed, 0, 3)), ("cloud", _tier(seed, 50, 1))],
+        ladder=[("worker", _tier(seed, 0, 3)), ("cloud", _tier(seed, 50, 1))],
         repo=repo,
         concurrency=2,
     )
