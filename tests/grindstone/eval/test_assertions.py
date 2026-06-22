@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import pytest
 
-from grindstone.contracts.models import EpochDecision, parse_decision
+from grindstone.contracts.models import EpochDecision, Handoff, parse_decision, parse_handoff
 from tests.grindstone.conftest import (
+    handoff_payload,
     implement_decision,
     impl_task,
     research_decision,
@@ -22,6 +23,10 @@ from tests.grindstone.eval import _assertions as A
 
 def _decision(payload: dict[str, object]) -> EpochDecision:
     return parse_decision(payload)
+
+
+def _handoff(**overrides: object) -> Handoff:
+    return parse_handoff(handoff_payload(**overrides))  # type: ignore[arg-type]
 
 
 def _impl_task(tid: str, *globs: str) -> dict[str, object]:
@@ -117,6 +122,59 @@ def test_every_implement_task_within_vacuous_off_implement() -> None:
     A.assert_every_implement_task_within(
         _decision(research_decision(artifact_task("T1"))), max_files=1
     )
+
+
+# --- handoff oracles (the worker-boundary analogue) ----------------------------
+
+
+def test_handoff_conforms_accepts_valid_done() -> None:
+    h = _handoff(task_id="P1/E1/T1")
+    A.assert_handoff_conforms(h, mode="implement", task_id="P1/E1/T1")
+    assert A.handoff_gate_errors(h, mode="implement", task_id="P1/E1/T1") == []
+
+
+def test_handoff_conforms_rejects_task_id_mismatch() -> None:
+    h = _handoff(task_id="P1/E1/T1")
+    errors = A.handoff_gate_errors(h, mode="implement", task_id="P1/E1/T2")
+    assert any("dispatched id" in e for e in errors)
+    with pytest.raises(AssertionError):
+        A.assert_handoff_conforms(h, mode="implement", task_id="P1/E1/T2")
+
+
+def test_handoff_conforms_enforces_research_citation_floor() -> None:
+    # A research handoff with NO citations trips the production mode floor.
+    h = _handoff(task_id="P1/E1/T1", citations=[])
+    errors = A.handoff_gate_errors(h, mode="research", task_id="P1/E1/T1")
+    assert any("citation" in e for e in errors)
+    # The SAME handoff is fine under implement (no citation floor there).
+    A.assert_handoff_conforms(h, mode="implement", task_id="P1/E1/T1")
+
+
+def test_assert_handoff_status_matches_and_rejects() -> None:
+    A.assert_handoff_status(_handoff(status="DONE"), "DONE")
+    with pytest.raises(AssertionError):
+        A.assert_handoff_status(_handoff(status="FAILED"), "DONE")
+
+
+def test_assert_handoff_citations_present() -> None:
+    A.assert_handoff_citations_present(_handoff(citations=[{"file": "a.py"}]))
+    with pytest.raises(AssertionError):
+        A.assert_handoff_citations_present(_handoff(citations=[]))
+
+
+def test_assert_what_changed_shape_accepts_typed_entries() -> None:
+    payload = handoff_payload(task_id="P1/E1/T1")
+    payload["what_changed"] = [{"kind": "file", "ref": "greeting.txt"}]
+    A.assert_what_changed_shape(parse_handoff(payload))
+
+
+def test_assert_handoff_done_when_passed_pass_and_fail() -> None:
+    ok = handoff_payload(task_id="P1/E1/T1")
+    A.assert_handoff_done_when_passed(parse_handoff(ok))
+    bad = handoff_payload(task_id="P1/E1/T1")
+    bad["checks"] = [{"check": "test -f x", "exit_code": 1}]
+    with pytest.raises(AssertionError):
+        A.assert_handoff_done_when_passed(parse_handoff(bad))
 
 
 # --- assert_scenario_selected --------------------------------------------------

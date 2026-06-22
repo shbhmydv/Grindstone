@@ -17,13 +17,19 @@ from __future__ import annotations
 
 import json
 
+from grindstone.contracts.gate import handoff_schema_errors
 from grindstone.contracts.models import (
     EpochDecision,
+    Handoff,
     ImplementDecision,
     ProposeSkeletonDecision,
     RevisePhasesDecision,
 )
-from grindstone.contracts.semantics import implement_task_size_violations
+from grindstone.contracts.semantics import (
+    HandoffMode,
+    handoff_violations,
+    implement_task_size_violations,
+)
 from grindstone.planner import (
     DEFAULT_LOCAL_MAX_TASK_FILES,
     DEFAULT_SENIOR_MAX_TASK_FILES,
@@ -144,6 +150,93 @@ def assert_every_implement_task_within(decision: EpochDecision, max_files: int) 
         list(decision.args.tasks), max_files=max_files
     )
     assert not violations, f"implement task(s) over the size cap: {violations}"
+
+
+# --- handoff oracles (the worker-boundary analogue of the decision oracles) ----
+#
+# These are PURE over a typed ``Handoff`` and reuse the PRODUCTION handoff gate
+# (``handoff_schema_errors`` + ``handoff_violations``, the exact pair task_loop's
+# ``_collect_handoff`` applies) so an eval assertion sees the same verdict the
+# worker would. They are unit-tested against SYNTHETIC handoffs in
+# ``test_assertions.py`` (NOT eval-marked), so the oracle is trusted before any
+# live worker run leans on it.
+
+
+def handoff_gate_errors(
+    handoff: Handoff, *, mode: HandoffMode, task_id: str
+) -> list[str]:
+    """Re-run the production handoff gate (schema + semantics) over a typed handoff.
+
+    The handoff is already type-valid (it parsed), but the gate still applies: the
+    wire-schema structural rules (``handoff_schema_errors`` over the JSON envelope)
+    plus the SEMANTIC rules (``handoff_violations``: byte cap, mode citation floor,
+    task_id match). Reuses both production functions, so the band is exactly the
+    gate's, never a re-implementation that could drift.
+    """
+
+    # exclude_none mirrors the CANONICAL wire form the worker writes (and the
+    # production gate / check_handoff validate): the schema's integer fields reject
+    # an explicit null, so a dumped-with-None optional (citation.line,
+    # occupancy.peak_context_tokens) would spuriously fail the schema.
+    payload = handoff.model_dump(mode="json", exclude_none=True)
+    errors = list(handoff_schema_errors(payload))
+    errors.extend(handoff_violations(handoff, mode=mode, expected_task_id=task_id))
+    return errors
+
+
+def assert_handoff_conforms(
+    handoff: Handoff, *, mode: HandoffMode, task_id: str
+) -> None:
+    """Assert the handoff passes the production gate for ``mode`` + ``task_id``."""
+
+    errors = handoff_gate_errors(handoff, mode=mode, task_id=task_id)
+    assert not errors, f"handoff did not conform to the gate: {errors}"
+
+
+def assert_handoff_status(handoff: Handoff, expected: str = "DONE") -> None:
+    """Assert the handoff's terminal status is exactly ``expected``."""
+
+    assert handoff.status == expected, (
+        f"expected handoff status {expected!r}, got {handoff.status!r} "
+        f"(not_done={handoff.not_done}, state={handoff.resulting_state!r})"
+    )
+
+
+def assert_handoff_citations_present(handoff: Handoff) -> None:
+    """Assert the handoff grounds itself in >= 1 citation.
+
+    The mode citation FLOOR (research/review require one) is enforced by the gate;
+    this is the stricter band the worker corpus asserts directly: an honest handoff
+    that did real work cites the files it touched/read, whatever the mode."""
+
+    assert handoff.citations, "handoff carries no citations"
+
+
+def assert_what_changed_shape(handoff: Handoff) -> None:
+    """Assert every ``what_changed`` entry is a typed change with a non-empty ref.
+
+    A typed ``Handoff`` already guarantees the ``kind`` enum + ref min-length, so
+    this is defense in depth that pins the corpus' expectation explicitly: each
+    entry names a real kind (file/interface/artifact) and a non-empty ref, never a
+    free-prose string (the S2 RCA the schema now forbids)."""
+
+    for entry in handoff.what_changed:
+        assert entry.kind in {"file", "interface", "artifact"}, (
+            f"what_changed kind {entry.kind!r} not a valid change kind"
+        )
+        assert entry.ref.strip(), "what_changed entry has an empty ref"
+
+
+def assert_handoff_done_when_passed(handoff: Handoff) -> None:
+    """Assert the handoff's own ``checks`` echo every done_when as passing (exit 0).
+
+    The worker echoes each done_when result; a DONE handoff that echoes a non-zero
+    exit is internally inconsistent. (The harness ALSO re-runs the real done_when
+    out-of-band, the authoritative gate; this oracle pins the worker's self-report.)
+    """
+
+    failed = [c.check for c in handoff.checks if c.exit_code != 0]
+    assert not failed, f"handoff echoes failing done_when checks: {failed}"
 
 
 def assert_scenario_selected(
