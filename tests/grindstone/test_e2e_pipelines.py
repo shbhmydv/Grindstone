@@ -36,6 +36,7 @@ from tests.grindstone.conftest import (
     complete_decision,
     impl_task,
     implement_decision,
+    phase_complete_decision,
     phase_dict,
     research_decision,
     review_decision,
@@ -148,6 +149,7 @@ def test_research_to_artifact_split_pipeline(git_repo: Path, run_dir: RunDir) ->
                 ),
                 title="investigate",
             ),
+            phase_complete_decision("findings.md"),  # ends P1 (keyed-log artifact)
             artifact_decision(
                 _artifact_task(
                     "T1",
@@ -157,6 +159,7 @@ def test_research_to_artifact_split_pipeline(git_repo: Path, run_dir: RunDir) ->
                 ),
                 title="write report",
             ),
+            phase_complete_decision("report.md"),  # ends P2
             complete_decision(check_cmd("true")),
         ]
     )
@@ -198,7 +201,9 @@ def test_research_implement_review_pipeline(git_repo: Path, run_dir: RunDir) -> 
                 ),
                 title="map",
             ),
+            phase_complete_decision("design.md"),  # ends P1 (keyed-log artifact)
             implement_decision(impl_task("T1", "feature.py"), title="build"),
+            phase_complete_decision("feature.py"),  # ends P2 (committed file at tip)
             review_decision(
                 {
                     "id": "T1",
@@ -210,6 +215,7 @@ def test_research_implement_review_pipeline(git_repo: Path, run_dir: RunDir) -> 
                 },
                 title="review",
             ),
+            phase_complete_decision("verdict.md"),  # ends P3
             complete_decision(check_cmd("true")),
         ]
     )

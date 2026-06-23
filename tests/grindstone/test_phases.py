@@ -22,6 +22,7 @@ from tests.grindstone.conftest import (
     complete_decision,
     impl_task,
     implement_decision,
+    phase_complete_decision,
     phase_dict,
     revise_decision,
     skeleton_decision,
@@ -52,7 +53,7 @@ class _Recording:
 # --- criteria-driven advancement + per-phase epoch-index reset (rulings 1) -----
 
 
-def test_phases_advance_on_criteria_and_reset_epoch_index(
+def test_phases_advance_on_phase_complete_and_reset_epoch_index(
     git_repo: Path, run_dir: RunDir
 ) -> None:
     g1 = [check_cmd("test -f f1.txt")]
@@ -64,7 +65,9 @@ def test_phases_advance_on_criteria_and_reset_epoch_index(
                 phase_dict("P2", title="verify", exit_criterion=g2),
             ),
             implement_decision(impl_task("T1", "f1.txt")),
+            phase_complete_decision("f1.txt"),  # planner ends P1 (deliverable exists)
             implement_decision(impl_task("T1", "f2.txt")),
+            phase_complete_decision("f2.txt"),  # planner ends P2
             complete_decision(check_cmd("test -f f1.txt"), check_cmd("test -f f2.txt")),
         ]
     )
@@ -80,36 +83,54 @@ def test_phases_advance_on_criteria_and_reset_epoch_index(
     assert epochs == [("P1", "E1"), ("P2", "E1")]
 
 
-def test_phase_passes_only_when_criterion_met(git_repo: Path, run_dir: RunDir) -> None:
-    # P1 gates on a file the single epoch DOES create -> it passes; the run then
-    # advances to the trivially-true P2 in the same preamble pass (multi-advance).
+def test_green_floor_does_not_auto_pass_phase_on_entry(
+    git_repo: Path, run_dir: RunDir
+) -> None:
+    """The P3 regression: a phase whose build-health floor is ALREADY green on
+    entry must NOT auto-pass with zero epochs. The planner is still consulted and
+    plans an epoch; the phase ends only when the planner emits phase_complete."""
+
+    # P1's floor (`true`) is green from the very first preamble, yet the phase must
+    # not skip: the scripted planner gets a real boundary, plans an epoch, and only
+    # then completes the phase by citing the deliverable it built.
     planner = MockPlanner(
         script=[
             skeleton_decision(
-                phase_dict("P1", exit_criterion=[check_cmd("test -f f1.txt")]),
+                phase_dict("P1", exit_criterion=[check_cmd("true")]),
                 phase_dict("P2", exit_criterion=[check_cmd("true")]),
             ),
-            implement_decision(impl_task("T1", "f1.txt")),
-            complete_decision(check_cmd("test -f f1.txt")),
+            implement_decision(impl_task("T1", "f1.txt")),  # P1 is NOT skipped
+            phase_complete_decision("f1.txt"),
+            implement_decision(impl_task("T1", "f2.txt")),
+            phase_complete_decision("f2.txt"),
+            complete_decision(check_cmd("true")),
         ]
     )
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner, ladder=_ladder(), repo=git_repo
     )
     assert outcome.status == "completed"
-    # After the single implement epoch, P1 passes and P2 (true) passes too.
-    assert _run_state(run_dir).passed_phase_ids == ["P1", "P2"]
+    events = read_events(run_dir.events_path)
+    # Both phases actually RAN an epoch (zero-epoch auto-pass is impossible now).
+    epochs = [(e.phase_id, e.epoch_id) for e in events if e.event == "epoch_started"]
+    assert epochs == [("P1", "E1"), ("P2", "E1")]
+    assert [e.phase_id for e in events if e.event == "phase_passed"] == ["P1", "P2"]
 
 
 # --- last phase passing does NOT auto-complete (ruling 1) ----------------------
 
 
 def test_last_phase_pass_does_not_auto_complete(git_repo: Path, run_dir: RunDir) -> None:
-    # Both phases' criteria are already satisfied at run start, so BOTH pass in
-    # the first preamble, yet the run only completes once the planner emits
-    # complete_run (the planner stays in the loop; evidence is the certificate).
+    # Even with both phases' floors already green at run start, NOTHING passes on
+    # entry: the planner must phase_complete each, and the run completes only on its
+    # explicit complete_run (the planner stays in the loop; evidence is the cert).
     planner = MockPlanner(
-        script=[two_phase_skeleton(), complete_decision(check_cmd("true"))]
+        script=[
+            two_phase_skeleton(),
+            phase_complete_decision("README.md"),  # ends P1 (README.md exists at tip)
+            phase_complete_decision("README.md"),  # ends P2
+            complete_decision(check_cmd("true")),
+        ]
     )
     outcome = run_grind(
         run_dir, job_path="job.md", planner=planner, ladder=_ladder(), repo=git_repo
@@ -117,9 +138,91 @@ def test_last_phase_pass_does_not_auto_complete(git_repo: Path, run_dir: RunDir)
     assert outcome.status == "completed"
     events = read_events(run_dir.events_path)
     assert [e.phase_id for e in events if e.event == "phase_passed"] == ["P1", "P2"]
-    # skeleton + complete only: no epoch, no auto-complete on the last pass.
-    assert outcome.planner_calls == 2
+    # No epoch ran; the planner drove every phase boundary explicitly.
     assert outcome.epochs_run == 0
+
+
+# --- phase_complete grounding: missing deliverables bounce, do NOT halt --------
+
+
+def test_phase_complete_missing_deliverable_bounces_back_to_planner(
+    git_repo: Path, run_dir: RunDir
+) -> None:
+    """A phase_complete that cites a deliverable which does NOT exist at the tip is
+    REJECTED and bounced back into planning (the same self-correction shape as a
+    failed complete_run), NOT a halt. The planner re-emits with a real path and the
+    phase ends."""
+
+    rec = _Recording(
+        MockPlanner(
+            script=[
+                two_phase_skeleton(),
+                implement_decision(impl_task("T1", "f1.txt")),
+                # First completion cites a path that was never built -> rejected,
+                # re-ask. The run does not halt; the planner gets feedback and fixes it.
+                phase_complete_decision("ghost.txt"),
+                phase_complete_decision("f1.txt"),  # the real deliverable -> ends P1
+                phase_complete_decision("f1.txt"),  # ends P2 (f1.txt still at tip)
+                complete_decision(check_cmd("test -f f1.txt")),
+            ]
+        )
+    )
+    outcome = run_grind(
+        run_dir, job_path="job.md", planner=rec, ladder=_ladder(), repo=git_repo
+    )
+    assert outcome.status == "completed"  # never halted on the missing citation
+    events = read_events(run_dir.events_path)
+    assert [e.phase_id for e in events if e.event == "phase_passed"] == ["P1", "P2"]
+    # The rejected completion was re-asked WITHIN the same boundary (the bounce-back,
+    # the same self-correction shape as a failed complete_run, never a terminal halt):
+    # the very next prompt carried the missing-path feedback in an <errors> block.
+    assert any(
+        "<errors>" in p and "ghost.txt" in p and "does not exist" in p
+        for p in rec.prompts
+    )
+    # No escalation/halt was emitted; the run reached its own complete_run.
+    assert "run_escalated" not in [e.event for e in events]
+
+
+def test_red_floor_blocks_completion_drives_fix_epoch(
+    git_repo: Path, run_dir: RunDir
+) -> None:
+    """A RED build-health floor does not prevent the planner from being consulted,
+    but the planner (seeing the red floor) plans a FIX epoch rather than completing;
+    once the fix turns the floor green it phase_complete's. The phase ends only after
+    the floor is healthy AND the planner judges it done."""
+
+    # P1's floor needs gate.txt. The first epoch creates the WRONG file (floor still
+    # red); the planner reads the FAIL, plans a fix epoch that creates gate.txt
+    # (floor green), then completes the phase.
+    rec = _Recording(
+        MockPlanner(
+            script=[
+                skeleton_decision(
+                    phase_dict("P1", exit_criterion=[check_cmd("test -f gate.txt")]),
+                    phase_dict("P2", exit_criterion=[check_cmd("true")]),
+                ),
+                implement_decision(impl_task("T1", "wrong.txt")),  # floor stays RED
+                implement_decision(impl_task("T2", "gate.txt")),   # FIX epoch -> floor GREEN
+                phase_complete_decision("gate.txt"),               # now legal -> ends P1
+                phase_complete_decision("gate.txt"),               # ends P2
+                complete_decision(check_cmd("test -f gate.txt")),
+            ]
+        )
+    )
+    outcome = run_grind(
+        run_dir, job_path="job.md", planner=rec, ladder=_ladder(), repo=git_repo
+    )
+    assert outcome.status == "completed"
+    events = read_events(run_dir.events_path)
+    # Two P1 epochs ran (the fix was needed); the floor moved RED -> GREEN across them.
+    p1_epochs = [e.epoch_id for e in events if e.event == "epoch_started" and e.phase_id == "P1"]
+    assert p1_epochs == ["E1", "E2"]
+    # The boundary after the first (wrong) epoch showed the planner a RED floor.
+    assert "[FAIL] cmd `test -f gate.txt`" in rec.prompts[2]
+    # The boundary after the fix epoch showed a GREEN floor (completion now grounded).
+    assert "[PASS] cmd `test -f gate.txt`" in rec.prompts[3]
+    assert [e.phase_id for e in events if e.event == "phase_passed"] == ["P1", "P2"]
 
 
 # --- budgets + phase escalation + revise recovery (ruling 2) -------------------
@@ -203,6 +306,7 @@ def test_tail_surfaces_phase_status_and_integration_tip(
                     phase_dict("P2", exit_criterion=[check_cmd("test -f f2.txt")]),
                 ),
                 implement_decision(impl_task("T1", "f1.txt")),
+                phase_complete_decision("f1.txt"),  # planner ends P1 -> advance to P2
                 complete_decision(check_cmd("test -f f1.txt")),
             ]
         )
@@ -211,15 +315,21 @@ def test_tail_surfaces_phase_status_and_integration_tip(
 
     # The first call (skeleton) carries no phase status (no skeleton yet).
     assert "<phase_status>" not in rec.prompts[0]
-    # Second call: P1 active, its criterion freshly evaluated as FAIL.
+    # Second call: P1 active, its build-health floor freshly evaluated as FAIL.
     p1 = rec.prompts[1]
     assert "<phase_status>" in p1
     assert "current_phase: P1" in p1
+    assert "build_health_floor" in p1
     assert "[FAIL] cmd `test -f f1.txt`" in p1
     assert "<integration_tip" in p1
-    # Third call: P1 passed + advanced to P2; the tip listing references f1.txt
-    # (a name, never its body).
-    p2 = rec.prompts[2]
+    # Third call: still P1 (the floor passed after the epoch built f1.txt, but the
+    # phase has NOT auto-advanced); the planner sees the green floor and decides.
+    p1_again = rec.prompts[2]
+    assert "current_phase: P1" in p1_again
+    assert "[PASS] cmd `test -f f1.txt`" in p1_again
+    # Fourth call: P1 phase_complete'd -> advanced to P2; the tip listing references
+    # f1.txt (a name, never its body).
+    p2 = rec.prompts[3]
     assert "current_phase: P2" in p2
     assert "passed_phases: P1" in p2
     tip = p2.split("<integration_tip", 1)[1].split("</integration_tip>", 1)[0]

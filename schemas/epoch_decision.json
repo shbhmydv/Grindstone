@@ -16,6 +16,7 @@
         "artifact",
         "revise_phases",
         "handle_failed_epoch",
+        "phase_complete",
         "escalate_run",
         "complete_run"
       ]
@@ -42,6 +43,10 @@
     {
       "if": { "properties": { "tool": { "const": "handle_failed_epoch" } } },
       "then": { "properties": { "args": { "$ref": "#/$defs/handle_failed_epoch_args" } } }
+    },
+    {
+      "if": { "properties": { "tool": { "const": "phase_complete" } } },
+      "then": { "properties": { "args": { "$ref": "#/$defs/phase_complete_args" } } }
     },
     {
       "if": { "properties": { "tool": { "const": "escalate_run" } } },
@@ -270,6 +275,22 @@
           }
         }
       ]
+    },
+    "phase_complete_args": {
+      "type": "object",
+      "description": "Judge the CURRENT phase complete against its goal. Legal only once the build-health floor is green and the phase's deliverables exist. Carries the concrete deliverable artifacts that satisfy the phase goal; the core re-checks each one EXISTS (existence only, not a quality judgement) before the phase ends, and bounces the decision back to planning if any is missing.",
+      "required": ["summary", "deliverables"],
+      "additionalProperties": false,
+      "properties": {
+        "summary": { "type": "string", "minLength": 1, "maxLength": 2048, "description": "Why the phase goal is satisfied by the cited deliverables." },
+        "deliverables": {
+          "description": "Concrete repo-relative deliverable artifact paths that satisfy the phase goal; each is existence-checked in the integration-tip tree before the phase passes. No wildcard globs: enumerate the concrete files.",
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "minItems": 1,
+          "maxItems": 32
+        }
+      }
     },
     "escalate_run_args": {
       "type": "object",

@@ -444,6 +444,16 @@ def revise_decision(*phases: dict[str, object], reason: str = "rescope") -> dict
     return {"schema_version": "1", "tool": "revise_phases", "args": {"reason": reason, "phases": list(phases)}}
 
 
+def phase_complete_decision(
+    *deliverables: str, summary: str = "phase deliverables are in place"
+) -> dict[str, object]:
+    return {
+        "schema_version": "1",
+        "tool": "phase_complete",
+        "args": {"summary": summary, "deliverables": list(deliverables)},
+    }
+
+
 def escalate_decision(reason: str = "cannot proceed") -> dict[str, object]:
     return {"schema_version": "1", "tool": "escalate_run", "args": {"reason": reason}}
 

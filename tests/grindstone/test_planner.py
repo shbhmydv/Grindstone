@@ -637,6 +637,25 @@ def test_gate_position_legality() -> None:
     assert any("must be propose_skeleton" in e for e in res2.errors)
 
 
+def test_gate_accepts_phase_complete_once_skeleton_exists() -> None:
+    import json
+
+    # phase_complete is a legal steady-state decision once a skeleton exists, and the
+    # core gate parses it (the deliverable EXISTENCE grounding runs later, at dispatch).
+    dec = {
+        "schema_version": "1",
+        "tool": "phase_complete",
+        "args": {"summary": "phase deliverables built", "deliverables": ["src/a.ts"]},
+    }
+    res = _gate(json.dumps(dec), skeleton_exists=True)
+    assert res.errors == []
+    assert res.decision is not None and res.decision.tool == "phase_complete"
+    # ...but it is illegal as the FIRST decision (before any skeleton).
+    res0 = _gate(json.dumps(dec), skeleton_exists=False)
+    assert res0.decision is None
+    assert any("must be propose_skeleton" in e for e in res0.errors)
+
+
 # --- size gate (Part 4B): the deterministic decomposition floor ----------------
 
 

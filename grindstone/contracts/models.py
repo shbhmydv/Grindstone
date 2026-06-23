@@ -221,6 +221,22 @@ HandleFailedEpochArgs = Annotated[
 ]
 
 
+class PhaseCompleteArgs(_Frozen):
+    """The planner's judgement that the CURRENT phase is complete (deliverable met).
+
+    ``summary`` says why the phase goal is satisfied; ``deliverables`` are the
+    concrete repo-relative artifact paths that satisfy it, each existence-checked
+    in the integration-tip tree before the phase ends (existence only, NOT a
+    quality judgement). The path list is bounded like ``ImplementTask`` ``file_ownership``;
+    a missing cited path bounces the decision back into planning, never halts."""
+
+    summary: Annotated[str, StringConstraints(min_length=1, max_length=2048)]
+    deliverables: Annotated[
+        list[Annotated[str, StringConstraints(min_length=1, max_length=256)]],
+        Field(min_length=1, max_length=32),
+    ]
+
+
 class EscalateRunArgs(_Frozen):
     reason: Annotated[str, StringConstraints(min_length=1, max_length=2048)]
     needed_from_human: (
@@ -278,6 +294,12 @@ class HandleFailedEpochDecision(_Frozen):
     args: HandleFailedEpochArgs
 
 
+class PhaseCompleteDecision(_Frozen):
+    schema_version: Literal["1"]
+    tool: Literal["phase_complete"]
+    args: PhaseCompleteArgs
+
+
 class EscalateRunDecision(_Frozen):
     schema_version: Literal["1"]
     tool: Literal["escalate_run"]
@@ -299,6 +321,7 @@ EpochDecision = Annotated[
         ArtifactDecision,
         RevisePhasesDecision,
         HandleFailedEpochDecision,
+        PhaseCompleteDecision,
         EscalateRunDecision,
         CompleteRunDecision,
     ],

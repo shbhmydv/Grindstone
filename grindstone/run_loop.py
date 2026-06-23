@@ -65,6 +65,7 @@ from grindstone.contracts.models import (
     ImplementEpochArgs,
     ImplementTask,
     Phase,
+    PhaseCompleteDecision,
     ProposeSkeletonDecision,
     RetryFailedEpochArgs,
     RevisePhasesDecision,
@@ -625,75 +626,38 @@ def _tip_listing(store: _RunStateStore, repo: Path | None) -> tuple[list[str], i
     return files[:TIP_LISTING_CAP], len(files)
 
 
-def _advance_phases(
-    journal: JournalWriter,
+def _evaluate_floor(
     store: _RunStateStore,
     run_dir: RunDir,
     repo: Path | None,
-    passed: set[str],
-    started: set[str],
     vision_reviewer: VisionReviewer | None,
     prepare: PrepareConfig | None,
     floor: FloorConfig | None,
 ) -> list[tuple[str, bool]]:
-    """Evaluate the current phase and advance through every satisfied one.
+    """Evaluate the current phase's build-health FLOOR in a tip worktree.
 
-    Each loop: evaluate the current phase's exit criterion in a tip worktree
-    (ruling 1). All checks pass -> ``phase_passed`` (guarded on recorded state so
-    resume never double-emits, ruling 6) and, unless this is the LAST phase,
-    advance to the next (``phase_started``, counters reset, ruling 1). The last
-    phase passing does NOT auto-complete, the planner still owns ``complete_run``.
-    Returns the CURRENT phase's per-check results once advancement settles.
+    The phase's ``exit_criterion`` is now a NECESSARY-but-not-sufficient build-health
+    floor (plus the repo's config floor): a regression SIGNAL fed to the planner, NOT
+    a completion gate. This function ONLY computes the per-check pass/fail; it never
+    emits ``phase_passed`` and never advances a phase. Phase completion is a judgement
+    the planner makes (the ``phase_complete`` decision), gated by a cheap deterministic
+    deliverable-existence grounding (``_ground_phase_complete``), so a green floor can
+    no longer auto-pass a phase (the P3 skip) and the planner is always consulted.
     """
 
     skeleton = store.state.skeleton
     assert skeleton is not None
-    # Advance by POSITION, resolved from the cursor ONCE: re-looking-up the current
-    # id each pass would resolve a DUPLICATE phase id backward and hang forever (the
-    # validator rejects dup ids, but the loop stays safe regardless). The skeleton
-    # is stable here, _advance_phases never revises it.
-    idx = _phase_index(skeleton, store.state.current_phase_id)
-    while True:
-        phase = skeleton[idx]
-        results = evaluate_checks(
-            phase.exit_criterion,
-            repo=repo,
-            ref=_eval_ref(store, repo),
-            run_dir=run_dir,
-            scratch_name="_phase_eval",
-            vision_reviewer=vision_reviewer,
-            prepare=prepare,
-            floor=floor,
-        )
-        if not all(ok for _, ok in results):
-            return results
-        # A pending failed epoch (a B6 task/gate failure OR a G4 semantic-verification
-        # failure) MUST be disposed of by the planner before the phase advances. The
-        # deterministic gate can pass while a semantic criterion is still unmet, so
-        # advancing here would CLEAR the pending disposition (counters reset below)
-        # and let an incomplete epoch slip the phase. Hold at the current phase, do
-        # not emit phase_passed, and let the failed-epoch boundary run first.
-        if store.state.pending_failed_epoch is not None:
-            return results
-        if phase.id not in passed:
-            journal.emit(lambda s: PhasePassed(seq=s, ts=_now(), phase_id=phase.id))
-            passed.add(phase.id)
-            store.update(passed_phase_ids=_passed_in_order(skeleton, passed))
-        if idx + 1 >= len(skeleton):
-            return results  # last phase passed: no auto-advance, no auto-complete
-        idx += 1
-        nxt = skeleton[idx]
-        store.update(
-            current_phase_id=nxt.id,
-            phase_epoch_index=0,
-            phase_budget_used=0,
-            phase_escalation_active=False,
-            phase_failed_epochs=0,
-            pending_failed_epoch=None,
-        )
-        if nxt.id not in started:
-            journal.emit(lambda s: PhaseStarted(seq=s, ts=_now(), phase_id=nxt.id))
-            started.add(nxt.id)
+    phase = skeleton[_phase_index(skeleton, store.state.current_phase_id)]
+    return evaluate_checks(
+        phase.exit_criterion,
+        repo=repo,
+        ref=_eval_ref(store, repo),
+        run_dir=run_dir,
+        scratch_name="_phase_eval",
+        vision_reviewer=vision_reviewer,
+        prepare=prepare,
+        floor=floor,
+    )
 
 
 def _phase_preamble(
@@ -707,19 +671,27 @@ def _phase_preamble(
     prepare: PrepareConfig | None,
     floor: FloorConfig | None,
 ) -> _PhaseContext:
-    """Advance phases, fire a one-shot ``phase_escalated`` on budget exhaustion,
-    and assemble the cumulative-state tail context (rulings 1-3)."""
+    """Evaluate the floor, fire a one-shot ``phase_escalated`` on budget exhaustion,
+    and assemble the cumulative-state tail context (rulings 1-3).
 
-    results = _advance_phases(
-        journal, store, run_dir, repo, passed, started, vision_reviewer, prepare, floor
+    No longer auto-passes/advances phases (the P3 skip): the floor is a planner
+    SIGNAL, and a phase passes only via an accepted ``phase_complete`` decision
+    (``_complete_phase``). Budget escalation now fires when the budget is exhausted
+    while the phase is STILL OPEN (not yet completed by the planner), regardless of
+    the floor colour: the planner has spent its epochs without completing the phase,
+    so the only legal moves become revise_phases / escalate_run.
+    """
+
+    results = _evaluate_floor(
+        store, run_dir, repo, vision_reviewer, prepare, floor
     )
     skeleton = store.state.skeleton
     assert skeleton is not None
     phase = skeleton[_phase_index(skeleton, store.state.current_phase_id)]
-    current_failed = any(not ok for _, ok in results)
+    phase_open = phase.id not in passed
     budget_used = store.state.phase_budget_used
     if (
-        current_failed
+        phase_open
         and budget_used >= phase.epoch_budget
         and not store.state.phase_escalation_active
     ):
@@ -738,6 +710,83 @@ def _phase_preamble(
         tip_total=tip_total,
     )
     return _PhaseContext(info, escalation_active)
+
+
+# --- phase completion: planner-owned, grounded by deliverable existence --------
+
+
+def _ground_phase_complete(
+    store: _RunStateStore,
+    run_dir: RunDir,
+    repo: Path | None,
+    deliverables: Sequence[str],
+) -> list[str]:
+    """The cheap deterministic grounding of a ``phase_complete`` decision.
+
+    Existence-only, run ONCE per phase at the planner's "done" moment (NOT per
+    epoch). A cited deliverable EXISTS when it is EITHER a tracked file at the
+    integration tip (an implement phase's committed file) OR a published keyed-log
+    artifact (a research/review/artifact phase's ``artifact_out``, resolved by exact
+    key or bare filename exactly as an ``artifact_exists`` check would). Returns the
+    MISSING citations (empty = all present, the phase may end). Quality is NOT this
+    check's job, it never opens a file or judges content. Traversal-safe by
+    construction: the tip side is a set-membership test against ``git ls-tree``
+    (tracked paths only) and the keyed-log side goes through ``run_dir.find_artifact``
+    (which rejects bad grammar / traversal), so a cited ``../x`` or absolute path is
+    simply absent from both and reported missing, default-to-reject on anything
+    malformed."""
+
+    tracked = (
+        set(wt.list_tree(repo, store.state.last_integration_branch or "HEAD"))
+        if repo is not None
+        else set()
+    )
+    missing: list[str] = []
+    for d in deliverables:
+        if d in tracked:
+            continue
+        if run_dir.find_artifact(d) is not None:
+            continue
+        missing.append(d)
+    return missing
+
+
+def _complete_phase(
+    journal: JournalWriter,
+    store: _RunStateStore,
+    passed: set[str],
+    started: set[str],
+) -> None:
+    """Pass the CURRENT phase (the planner judged it complete + grounding held).
+
+    Emits ``phase_passed`` (idempotent-guarded on the recorded ``passed`` set so a
+    resume never double-emits, ruling 6) and, unless this is the LAST phase, advances
+    to the next (``phase_started``, per-phase counters reset, ruling 1). The last
+    phase passing does NOT auto-complete the RUN: the planner still owns the final
+    ``complete_run`` (its evidence is the certificate)."""
+
+    skeleton = store.state.skeleton
+    assert skeleton is not None
+    idx = _phase_index(skeleton, store.state.current_phase_id)
+    phase = skeleton[idx]
+    if phase.id not in passed:
+        journal.emit(lambda s: PhasePassed(seq=s, ts=_now(), phase_id=phase.id))
+        passed.add(phase.id)
+        store.update(passed_phase_ids=_passed_in_order(skeleton, passed))
+    if idx + 1 >= len(skeleton):
+        return  # last phase passed: no auto-advance, the planner owns complete_run
+    nxt = skeleton[idx + 1]
+    store.update(
+        current_phase_id=nxt.id,
+        phase_epoch_index=0,
+        phase_budget_used=0,
+        phase_escalation_active=False,
+        phase_failed_epochs=0,
+        pending_failed_epoch=None,
+    )
+    if nxt.id not in started:
+        journal.emit(lambda s: PhaseStarted(seq=s, ts=_now(), phase_id=nxt.id))
+        started.add(nxt.id)
 
 
 # --- one planner boundary: transport retries + re-ask ladder -------------------
@@ -1127,6 +1176,31 @@ def _plan_boundary_loop(
                     )
                 reasks += 1
                 reask_errors = ["evidence check failed: " + f for f in failures]
+                continue
+
+        if isinstance(decision, PhaseCompleteDecision):
+            # The planner judged the CURRENT phase complete. Ground it cheaply
+            # (existence-only, once per phase): every cited deliverable must be a
+            # tracked file at the integration tip. A missing citation REJECTS the
+            # completion and bounces it back into THIS planning loop with the exact
+            # missing paths, the same self-correction shape as a failed complete_run
+            # evidence check, never a halt. Quality stays with the per-task critic.
+            missing = _ground_phase_complete(
+                store, run_dir, repo, decision.args.deliverables
+            )
+            if missing:
+                if reasks >= MAX_REASKS:
+                    return _Boundary(
+                        "escalate",
+                        reason="phase_complete cited missing deliverables after 2 "
+                        "re-asks: " + "; ".join(missing),
+                    )
+                reasks += 1
+                reask_errors = [
+                    "phase_complete cited a deliverable that does not exist at the "
+                    "integration tip: " + d
+                    for d in missing
+                ]
                 continue
         return _Boundary("decision", decision=decision)
 
@@ -2094,6 +2168,13 @@ def _drive(
             assert outcome is not None
             last_epoch = outcome
             last_epoch_rows = flatten_last_epoch(run_dir, outcome)
+            continue
+        if isinstance(decision, PhaseCompleteDecision):
+            # The boundary already grounded the cited deliverables (they exist at the
+            # tip); pass the current phase + advance (or, on the last phase, leave the
+            # run for the planner's complete_run). This is the ONLY way a phase passes
+            # now, a green floor never auto-passes (the P3 skip is impossible).
+            _complete_phase(journal, store, passed_phases, started_phases)
             continue
         if isinstance(decision, EscalateRunDecision):
             return _escalate(journal, store, decision.args.reason)

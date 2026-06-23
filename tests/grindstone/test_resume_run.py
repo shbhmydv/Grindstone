@@ -42,6 +42,7 @@ from tests.grindstone.conftest import (
     handle_failed_epoch_halt,
     impl_task,
     implement_decision,
+    phase_complete_decision,
     phase_dict,
     reap_kill_target,
     tracked_files,
@@ -294,10 +295,12 @@ def test_kill_mid_phase_transition_then_resume(tmp_path: Path) -> None:
     pre_events = read_events(run_dir.events_path)
     assert _phase_passed_count(pre_events, "P1") == 1  # already on disk pre-kill
 
-    # Resume: the re-issued P2 call lands, P2's criterion is met, the run finishes.
+    # Resume: the re-issued P2 call lands, P2's epoch builds f2.txt, the planner
+    # phase_complete's P2, then completes the run.
     planner = MockPlanner(
         script=[
             implement_decision(impl_task("T1", "f2.txt")),
+            phase_complete_decision("f2.txt"),
             complete_decision(check_cmd("test -f f1.txt"), check_cmd("test -f f2.txt")),
         ]
     )

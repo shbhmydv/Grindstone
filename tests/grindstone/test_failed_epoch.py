@@ -37,6 +37,7 @@ from tests.grindstone.conftest import (
     handle_failed_epoch_retry,
     impl_task,
     implement_decision,
+    phase_complete_decision,
     phase_dict,
     revise_decision,
     skeleton_decision,
@@ -344,6 +345,9 @@ def test_budget_exhausted_by_failed_epoch_retry_progresses(
             _budget1_skeleton(),
             implement_decision(impl_task("T1", "f1.txt")),  # fails, budget(1) now spent
             handle_failed_epoch_retry("create f1.txt at repo root"),  # MUST be legal
+            # The retry rebuilt f1.txt: phase_complete is legal EVEN under budget
+            # escalation (the deliverable now exists), and ends P1 -> the flag clears.
+            phase_complete_decision("f1.txt"),
             complete_decision(check_cmd("test -f f1.txt")),
         ]
     )
@@ -356,8 +360,8 @@ def test_budget_exhausted_by_failed_epoch_retry_progresses(
     assert "invalid decision" not in reason and "phase escalation in force" not in reason
     handled = [e for e in read_events(run_dir.events_path) if isinstance(e, FailedEpochHandled)]
     assert handled and handled[0].action == "retry"
-    # The budget-escalation flag fired but did NOT linger to block the later
-    # complete_run, it reset when P1 advanced to P2 after the successful retry.
+    # The budget-escalation flag fired but did NOT linger to block completion, it
+    # reset when P1 advanced to P2 after the planner phase_complete'd the retry.
     assert _run_state(run_dir).phase_escalation_active is False
 
 
@@ -374,6 +378,7 @@ def test_budget_exhausted_by_failed_epoch_escalate_senior_progresses(
             _budget1_skeleton(),
             implement_decision(impl_task("T1", "f1.txt")),  # fails on local AND senior
             handle_failed_epoch_escalate("local cannot; senior please"),  # MUST be legal
+            phase_complete_decision("f1.txt"),  # senior rebuilt it -> ends P1
             complete_decision(check_cmd("test -f f1.txt")),
         ]
     )

@@ -113,6 +113,7 @@ TOOL_NAMES: frozenset[str] = frozenset(
         "artifact",
         "revise_phases",
         "handle_failed_epoch",
+        "phase_complete",
         "escalate_run",
         "complete_run",
     }
@@ -230,7 +231,15 @@ THIS call's situation. These CORE rules hold for EVERY decision:
   epoch_decision schema. No prose, no second object, no commentary.
 - The first decision of a run MUST be propose_skeleton. After that, every call
   is an epoch boundary: choose one of implement / research / review / artifact
-  (1-8 independent fan-out tasks), revise_phases, escalate_run, or complete_run.
+  (1-8 independent fan-out tasks), phase_complete, revise_phases, escalate_run,
+  or complete_run.
+- YOU own phase completion. A phase's exit_criterion is a build-health FLOOR (a
+  regression signal shown to you each call), NOT an auto-pass gate: a green floor
+  NEVER ends a phase on its own. A phase ends ONLY when YOU emit phase_complete,
+  judging its GOAL met against the cumulative repo state, and citing the concrete
+  deliverables that satisfy it. The core re-checks those deliverables EXIST (not
+  their quality) and ends the phase; if the floor is red OR the deliverables are
+  not yet built, plan the NEXT epoch (a FIX epoch when the floor is red) instead.
 - You define exit criteria and done_when as DETERMINISTIC STRUCTURAL checks (a
   command with an expected exit code, or a required artifact log key). They are
   for structural facts ONLY: the project's own build / test / type-check
@@ -293,6 +302,7 @@ The keys schema_version, tool, args are ALL mandatory. Do NOT use the shorthand
   (`senior`:true routes THAT task to the senior tier for judgment/taste/synthesis; default false runs it locally. `file_ownership` must enumerate CONCRETE files, no wildcard globs.)
 - revise_phases:    {"reason":..,"phases":[..]}  (the PHASE STRUCTURE is wrong; replaces the current phase onward, never completed phases)
 - handle_failed_epoch: {"action":"retry","hint":..,"escalate_tier"?:bool} | {"action":"escalate_senior","diagnosis":..} | {"action":"halt","reason":..}  (legal ONLY when an epoch has failed and is awaiting disposition)
+- phase_complete:   {"summary":..,"deliverables":[concrete repo-relative path..]}  (judge the CURRENT phase complete; the cited deliverables are re-checked to EXIST at the tip before the phase ends, a missing one bounces back to you)
 - escalate_run:     {"reason":..,"needed_from_human"?}
 - complete_run:     {"summary":..,"evidence":[check..]}
 A check is {"cmd":..,"expect_exit"?:int} or {"artifact_exists":"<log key>"} or
@@ -631,7 +641,10 @@ def _phase_status_block(phase_id: str | None, phase: PhaseTailInfo) -> str:
         "<phase_status>\n"
         f"current_phase: {phase_id or 'none'}, {phase.title}\n"
         f"epoch_budget: {phase.budget_used}/{phase.budget} epochs used\n"
-        "exit_criterion (deterministic, evaluated by the state machine):\n"
+        "build_health_floor (deterministic, evaluated by the state machine; a "
+        "regression SIGNAL, not an auto-pass gate, a RED check means plan a FIX "
+        "epoch, a GREEN floor does NOT end the phase, you end it with "
+        "phase_complete):\n"
         f"{checks}\n"
         f"passed_phases: {passed}\n"
         "</phase_status>\n"
@@ -898,8 +911,14 @@ def normalize_tool_call(payload: object) -> object:
 
 
 #: Tools that resolve a phase-escalation demand (S4 ruling 2): re-scope the
-#: current phase, or hand the whole run to a human.
-_ESCALATION_TOOLS: frozenset[str] = frozenset({"revise_phases", "escalate_run"})
+#: current phase, hand the whole run to a human, OR (when the work actually got
+#: done despite the budget) complete the phase. ``phase_complete`` is legal here
+#: because budget exhaustion only blocks SPENDING MORE budget; if the deliverables
+#: now exist the phase is genuinely finished and completing it is the correct
+#: resolution (the grounding check still re-verifies the cited deliverables exist).
+_ESCALATION_TOOLS: frozenset[str] = frozenset(
+    {"revise_phases", "escalate_run", "phase_complete"}
+)
 
 
 def _position_legality(

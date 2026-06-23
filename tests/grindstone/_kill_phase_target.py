@@ -1,10 +1,10 @@
 """Subprocess entrypoint for the kill-mid-PHASE-TRANSITION signature test (S4
-ruling 6; not collected). Drives ``run_grind`` with a planner that completes
-phase P1 (its epoch satisfies P1's exit criterion), lets the core fire
-``phase_passed(P1)`` + advance to P2, then BLOCKS at a file sentinel on the
-NEXT planner call (now in P2). The parent SIGKILLs once the transition is on
-disk, then resumes, proving criteria are re-evaluated idempotently (no
-duplicate ``phase_passed`` for the already-passed P1).
+ruling 6; not collected). Drives ``run_grind`` with a planner that builds phase
+P1's deliverable then EXPLICITLY phase_complete's it (the only way a phase passes
+now), letting the core fire ``phase_passed(P1)`` + advance to P2, then BLOCKS at a
+file sentinel on the NEXT planner call (now in P2). The parent SIGKILLs once the
+transition is on disk, then resumes, proving the floor is re-evaluated idempotently
+(no duplicate ``phase_passed`` for the already-passed P1).
 """
 
 from __future__ import annotations
@@ -26,13 +26,15 @@ from tests.grindstone.conftest import (  # noqa: E402
     impl_task,
     implement_decision,
     init_git_repo,
+    phase_complete_decision,
     phase_dict,
     skeleton_decision,
 )
 
 
 class _PhasePlanner:
-    """Scripted for skeleton + the P1 epoch; the THIRD call (in P2) blocks."""
+    """Scripted for skeleton + the P1 epoch + the P1 phase_complete; the FOURTH
+    call (in P2) blocks."""
 
     def __init__(self, ready: Path, release: Path) -> None:
         self.ready = ready
@@ -44,6 +46,7 @@ class _PhasePlanner:
                 phase_dict("P2", title="verify", exit_criterion=[check_cmd("test -f f2.txt")]),
             ),
             implement_decision(impl_task("T1", "f1.txt")),
+            phase_complete_decision("f1.txt"),  # ends P1 -> advance to P2
         ]
 
     def plan(self, prompt: str, *, workdir: Path | None = None) -> str:

@@ -55,9 +55,20 @@ escalate_run / complete_run.
   exit criteria, a missing or mis-scoped phase), NOT that one epoch's work
   failed. Do NOT use revise_phases to react to a failed epoch, the state machine
   asks you a separate, focused handle_failed_epoch decision for that.
+- phase_complete ENDS the current phase. Each call, JUDGE the current phase
+  against its GOAL using the `<phase_status>` floor result + the cumulative repo
+  state (read the integration tip / repo_map / handoffs in `<workspace>` when the
+  signals are thin). If the floor is RED, do NOT complete: plan a FIX epoch that
+  makes the failing build-health check green again. If the floor is GREEN but the
+  phase's deliverables are not all built yet, plan the NEXT work epoch. Only when
+  the floor is green AND you judge the deliverable complete, emit phase_complete
+  with `deliverables` listing the CONCRETE repo-relative files that satisfy the
+  goal (enumerate them, no wildcard globs). The core re-checks each one EXISTS at
+  the tip (existence only, not quality); a missing path bounces back to you to
+  fix the citation or build it. A green floor never ends a phase by itself, you do.
 - escalate_run only when you genuinely cannot proceed. complete_run only when
-  the whole job is done; its `evidence` checks are re-run deterministically and
-  rejected if they fail.
+  the whole job is done (every phase already phase_complete'd); its `evidence`
+  checks are re-run deterministically and rejected if they fail.
 
 Decomposition is THREE distinct skills, one per level; this scenario is LEVELS 2
 and 3. Apply them in order, and keep them separate, the bias and unit of work

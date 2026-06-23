@@ -30,8 +30,19 @@ Decomposition is THREE distinct skills, one per level; this scenario is LEVEL 1.
   decisions), judgment/taste/synthesis on the SENIOR tier, mechanical/factual work
   on the WORKER tier (the local rig), so phasing is also a routing choice (shape
   phases so judgment and production land in separate, separately-tiered tasks).
+- A phase's GOAL lives in its `title` (and the job spec it derives from); its
+  `exit_criterion` is the build-health FLOOR, the deterministic check(s) that prove
+  the build is still HEALTHY (it compiles, tests pass, the bundle exports). The
+  floor is NECESSARY but NOT SUFFICIENT: a green floor does NOT end a phase. You
+  end a phase yourself with phase_complete when you judge its GOAL met (the
+  deliverables exist), so do NOT try to encode "the deliverable is complete" as an
+  exit_criterion, a generic build-health check (`tsc`, `expo export`) can pass
+  before the phase's real work is built, which would be a hollow signal. Keep the
+  floor a small, genuine build-health check; carry the deliverable bar in the phase
+  title and the tasks' `criteria`.
 
-Example first decision (note: TWO phases minimum; checks are STRUCTURAL only):
+Example first decision (note: TWO phases minimum; the exit_criterion is the
+build-health FLOOR, structural only, never the deliverable-completeness gate):
   {"schema_version":"1","tool":"propose_skeleton","args":{"phases":[
-    {"id":"P1","title":"Build","exit_criterion":[{"cmd":"test -f out.txt","expect_exit":0}],"epoch_budget":2},
-    {"id":"P2","title":"Verify","exit_criterion":[{"cmd":"npm test --silent","expect_exit":0}],"epoch_budget":1}]}}
+    {"id":"P1","title":"Build the parser","exit_criterion":[{"cmd":"npm test --silent","expect_exit":0}],"epoch_budget":2},
+    {"id":"P2","title":"Verify end-to-end","exit_criterion":[{"cmd":"npm run e2e --silent","expect_exit":0}],"epoch_budget":1}]}}
