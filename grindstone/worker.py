@@ -23,6 +23,7 @@ from grindstone.contracts.models import (
     ArtifactExistsCheck,
     ArtifactTask,
     CmdCheck,
+    EpochVerdict,
     ImplementTask,
 )
 from grindstone.contracts.semantics import HANDOFF_MAX_BYTES, HandoffMode
@@ -194,20 +195,30 @@ VERDICT_FILENAME = "verdict.json"
 
 @dataclass(frozen=True)
 class VerificationBrief:
-    """The focused brief the end-of-epoch verification pass is dispatched with (G4).
+    """The focused brief one TASK's agentic verification pass is dispatched with.
 
-    ``epoch_goal`` is the epoch title/rationale; ``criteria`` is each task's
-    natural-language acceptance statement (aggregated across the epoch); ``artifacts``
-    is a per-task pointer to what was produced (the handoff state PLUS, for an
-    artifact-mode task, the absolute PATH to the relocated deliverable the verifier must
-    READ), so the verifier judges the REAL artifacts on disk, never a byte-capped
-    paraphrase embedded in the prompt. The verifier is adversarial, hunts for gaps,
-    defaults to FAIL on uncertainty, and writes ``verdict.json`` only.
+    ``epoch_goal`` is the task goal (its altitude); ``criteria`` is that ONE task's
+    natural-language acceptance statements; ``artifacts`` is a pointer to what the
+    task produced (the handoff state PLUS, for an artifact-mode task, the absolute
+    PATH to the relocated deliverable the verifier must READ), so the verifier judges
+    the REAL artifact on disk, never a byte-capped paraphrase embedded in the prompt.
+    The verifier is a FRESH same-tier critic, adversarial, hunts for gaps, defaults to
+    FAIL on uncertainty, and writes ``verdict.json`` only.
+
+    ``prior_verdict`` is the convergence anchor: on a RE-verification (a retry of a
+    task whose prior agentic verification failed) it carries the verifier's OWN prior
+    verdict (its per-criterion judgements + gaps), so the re-verification CONFIRMS the
+    previously-failed criteria are now closed and REGRESSION-checks the previously-
+    passed ones, keeping the gap set monotonically shrinking (it cannot oscillate /
+    invent fresh nitpicks). ``None`` on the FIRST verification (full fresh judgment).
+    It is the verifier's own output, NEVER the builder's context, so independence is
+    preserved.
     """
 
     epoch_goal: str
     criteria: list[str]
     artifacts: list[str]
+    prior_verdict: "EpochVerdict | None" = None
 
 
 class WorkerTransport(Protocol):
@@ -559,6 +570,44 @@ judge you, a false DONE is always caught.
 """
 
 
+def _prior_verdict_block(prior: "EpochVerdict | None") -> str:
+    """The convergence anchor block: this verifier's OWN prior verdict (pure).
+
+    Rendered ONLY on a re-verification (a retry of a task whose prior agentic
+    verification failed). It pins the verifier to its prior judgement so the gap set
+    converges and cannot oscillate: previously-FAILED criteria must be CONFIRMED
+    closed (re-checked against the now-updated work), previously-PASSED criteria must
+    be REGRESSION-checked (still met, not re-litigated). It is the verifier's own
+    output, never the builder's context, so the independent-critic stance holds.
+    Empty string on the first verification (no anchor -> full fresh judgement)."""
+
+    if prior is None:
+        return ""
+    passed = [j.criterion for j in prior.per_criterion if j.met]
+    failed = [j.criterion for j in prior.per_criterion if not j.met]
+    passed_lines = "\n".join(f"  - {c}" for c in passed) or "  (none)"
+    failed_lines = "\n".join(f"  - {c}" for c in failed) or "  (none)"
+    gaps = "\n".join(f"  - {g}" for g in prior.gaps) or "  (none recorded)"
+    return f"""
+<prior_verdict>
+You ALREADY verified an earlier attempt at this same task and marked it NOT done.
+The builder has since revised the work to close your gaps. This is a CONVERGENT
+re-verification anchored to YOUR prior judgement, not a fresh re-litigation:
+- Criteria you previously marked MET (regression-check these still hold, do NOT
+  re-open a settled pass or invent a new objection to it):
+{passed_lines}
+- Criteria you previously marked NOT met (confirm whether the revision now CLOSES
+  each of these against the actual files):
+{failed_lines}
+- The gaps you reported last time (judge ONLY whether each is now closed):
+{gaps}
+Your new gap list must be a SUBSET of the unresolved items above. Do not add a fresh
+criterion or a new nitpick that was not in your prior verdict; a previously-passed
+criterion stays passed unless the revision genuinely BROKE it (a real regression you
+can point at in a file). The gap set must shrink, never grow.
+</prior_verdict>"""
+
+
 def build_verification_prompt(
     request: WorkerRequest, brief: "VerificationBrief"
 ) -> str:
@@ -581,9 +630,10 @@ def build_verification_prompt(
 
     criteria = "\n".join(f"  - {c}" for c in brief.criteria) or "  (none)"
     artifacts = "\n".join(f"  - {a}" for a in brief.artifacts) or "  (none reported)"
+    prior = _prior_verdict_block(brief.prior_verdict)
     return f"""<verification id="{request.task_id}">
 This is an ADVERSARIAL VERIFICATION pass, not a feature task. You did NOT write this
-work. Judge whether the epoch's acceptance criteria are met by the ACTUAL artifacts
+work. Judge whether the task's acceptance criteria are met by the ACTUAL artifacts
 in this worktree. Do NOT edit anything. Read the real files; never trust a summary.
 </verification>
 
@@ -596,6 +646,7 @@ Each statement below is an acceptance criterion. For EACH one, decide whether th
 artifacts in this worktree actually satisfy it:
 {criteria}
 </criteria>
+{prior}
 
 <produced_artifacts>
 What the epoch's tasks reported producing. Each entry is a POINTER, not the content:

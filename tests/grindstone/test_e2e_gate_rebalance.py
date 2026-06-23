@@ -28,15 +28,14 @@ import json
 
 from grindstone.config import InfraRepairConfig
 from grindstone.events import (
-    EpochVerificationFailed,
-    FailedEpochHandled,
     InfraRepairDispatched,
+    TaskVerificationFailed,
     read_events,
 )
 from grindstone.mock_planner import MockPlanner
 from grindstone.rundir import RunDir
 from grindstone.run_loop import RunState, run_grind
-from grindstone.verify import WorkerEpochVerifier
+from grindstone.verify import WorkerTaskVerifier
 from grindstone.worker import VERDICT_FILENAME, WorkerRequest
 
 from pathlib import Path
@@ -46,7 +45,6 @@ from tests.grindstone.conftest import (
     OwnershipWorker,
     check_cmd,
     complete_decision,
-    handle_failed_epoch_retry,
     implement_decision,
     phase_dict,
     skeleton_decision,
@@ -188,11 +186,13 @@ class _SwapVerifier:
     def __init__(self) -> None:
         self.calls = 0
         self.seen_criteria: list[list[str]] = []
+        self.seen_prior: list[bool] = []
 
     def run(self, request: WorkerRequest) -> None:
         assert request.verification is not None, "verifier got a non-verification request"
         self.calls += 1
         self.seen_criteria.append(list(request.verification.criteria))
+        self.seen_prior.append(request.verification.prior_verdict is not None)
         passed = self.calls > 1
         payload = {
             "pass": passed,
@@ -218,24 +218,22 @@ class _UniqueContentWorker:
         OwnershipWorker(content=f"v{self._calls}\n").run(request)
 
 
-def test_semantic_gap_opens_failed_epoch_retry_closes_it(
+def test_semantic_gap_closes_inside_task_ladder_no_planner_roundtrip(
     git_repo: Path, run_dir: RunDir
 ) -> None:
-    """The floor passes but the agentic verdict marks a criterion unmet: a failed
-    epoch opens and routes to handle_failed_epoch with the gap as feedback; the
-    planner retries; the re-verification passes and the run completes. The gap
-    reached the planner input (it rode the failed-epoch block as the retry hint),
-    and the same criteria reached the verifier on both passes."""
+    """The floor passes but the per-task agentic verdict marks a criterion unmet: the
+    task's OWN retry ladder repairs it incrementally (a chainable failure, same
+    worktree), the re-verification (anchored to the prior verdict) passes on attempt 2,
+    and the run completes WITHOUT a planner handle_failed_epoch round-trip. The semantic
+    gap is closed inside the task ladder; the epoch never fails. The same criteria reach
+    the verifier on both passes; the second pass carries the prior verdict as the anchor."""
 
-    verifier = WorkerEpochVerifier(_SwapVerifier())
+    verifier = WorkerTaskVerifier(_SwapVerifier())
     worker = _UniqueContentWorker()
     planner = MockPlanner(
         script=[
             _semantic_skeleton(),
             implement_decision(_impl_with_criteria("T1", "f1.txt", ["map the Pink ramp"])),
-            # The planner disposes the semantic failure by retrying, threading the
-            # verdict's gap back as the corrective hint (the gaps reached its input).
-            handle_failed_epoch_retry(f"close the gap: {_SEMANTIC_FAIL_GAP}"),
             complete_decision(check_cmd("test -f f1.txt")),
         ]
     )
@@ -245,28 +243,26 @@ def test_semantic_gap_opens_failed_epoch_retry_closes_it(
         planner=planner,
         ladder=[("worker", worker)],
         repo=git_repo,
-        verifier=verifier,
+        verifiers={"worker": verifier},
     )
     assert outcome.status == "completed", outcome
     kinds = [e.event for e in read_events(run_dir.events_path)]
-    # The semantic failure (NOT a task/gate failure) opened, was handled by retry,
-    # and the re-verification passed before completion.
-    assert "epoch_verification_failed" in kinds
-    assert "epoch_failed" not in kinds  # never charged as a task/gate failure
-    assert kinds.index("epoch_verification_failed") < kinds.index("run_completed")
-    # The verdict's concrete gap was surfaced on the failed-epoch event.
-    vf = [e for e in read_events(run_dir.events_path) if isinstance(e, EpochVerificationFailed)]
-    assert vf and vf[0].gaps == [_SEMANTIC_FAIL_GAP]
-    # The planner disposed it with a retry (not a halt / escalate).
-    handled = [e for e in read_events(run_dir.events_path) if isinstance(e, FailedEpochHandled)]
-    assert handled and handled[0].action == "retry"
-    # The gap reached the planner: it appears verbatim in the retry hint the planner
-    # chose (the failed-epoch block carried it into the planner's decision input).
-    assert any(_SEMANTIC_FAIL_GAP in (e.detail or "") for e in handled)
-    # The criteria reached the verifier on the first (fail) and second (pass) runs.
+    # The semantic gap surfaced as a TASK-level verification failure, then passed on the
+    # incremental retry; the epoch never failed and the planner never saw a disposition.
+    assert "task_verification_failed" in kinds
+    assert "task_verification_passed" in kinds
+    assert "epoch_failed" not in kinds  # closed inside the task ladder, not an epoch fail
+    assert "failed_epoch_handled" not in kinds  # no planner handle_failed_epoch round-trip
+    assert kinds.index("task_verification_failed") < kinds.index("run_completed")
+    # The concrete gap was surfaced on the task-level verification-failed event.
+    tvf = [e for e in read_events(run_dir.events_path) if isinstance(e, TaskVerificationFailed)]
+    assert tvf and tvf[0].gaps == [_SEMANTIC_FAIL_GAP]
+    # The criteria reached the verifier on the first (fail) and second (pass) runs; the
+    # SECOND pass carried the prior verdict as the convergence anchor (the first did not).
     fake = verifier._transport  # type: ignore[attr-defined]
     assert isinstance(fake, _SwapVerifier)
     assert fake.calls == 2
     assert fake.seen_criteria == [["map the Pink ramp"], ["map the Pink ramp"]]
+    assert fake.seen_prior == [False, True]
     # No pending failed epoch lingers; the run finished clean.
     assert _run_state(run_dir).pending_failed_epoch is None

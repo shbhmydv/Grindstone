@@ -33,7 +33,7 @@ from grindstone.mock_planner import MockPlanner
 from grindstone.rundir import RunDir
 from grindstone.run_loop import RunState, resume_grind
 from grindstone.task_loop import TaskCursorState, TaskIdentity
-from grindstone.verify import WorkerEpochVerifier
+from grindstone.verify import WorkerTaskVerifier
 
 from tests.grindstone.conftest import (
     OwnershipWorker,
@@ -165,22 +165,24 @@ def _craft_running_epoch(repo: Path, run_dir: RunDir) -> dict[str, object]:
 
 
 def test_resume_running_epoch_verifies_inflight_epoch(git_repo: Path, run_dir: RunDir) -> None:
-    """Hole #2 (running_epoch branch): an epoch finished by resume_epoch OUTSIDE the
-    drive loop must still have its criteria verified. Here the resume finishes the
-    in-flight epoch, then the G4 pass runs and a FAIL verdict routes the gap through
-    handle_failed_epoch (before the fix the in-flight epoch's criteria were never judged)."""
+    """A running_epoch resume finishes the in-flight epoch through resume_epoch; the
+    resumed task must still be agentically VERIFIED at its tier. Here the verifier always
+    fails, so the resumed task's verification fails, its retry ladder exhausts, the task
+    FAILS, the epoch fails, and the gap routes through handle_failed_epoch (per-task
+    verification, so the in-flight task's criteria are never silently skipped)."""
 
     _craft_running_epoch(git_repo, run_dir)
     gaps = ["f1.txt is wrong"]
     planner = MockPlanner(script=[handle_failed_epoch_halt("unverified gap")])
     outcome = resume_grind(
         run_dir, planner=planner, ladder=[("worker", OwnershipWorker())], repo=git_repo,
-        verifier=WorkerEpochVerifier(_VerifierWorker(passed=False, gaps=gaps)),
+        verifiers={"worker": WorkerTaskVerifier(_VerifierWorker(passed=False, gaps=gaps))},
     )
     assert outcome.status == "escalated"
     kinds = [e.event for e in read_events(run_dir.events_path)]
-    assert "epoch_verification_started" in kinds  # the in-flight epoch WAS verified
-    assert "epoch_verification_failed" in kinds
+    assert "task_verification_started" in kinds  # the in-flight task WAS verified
+    assert "task_verification_failed" in kinds
+    assert "epoch_failed" in kinds  # the unsatisfiable criterion failed the task -> epoch
 
 
 # --- signature test: SIGKILL mid-planner-call, then resume ---------------------

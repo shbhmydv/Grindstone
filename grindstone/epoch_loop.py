@@ -43,7 +43,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import threading
 import time
-from typing import Callable, Literal, Sequence, cast
+from typing import Callable, Literal, Mapping, Sequence, cast
 
 from pydantic import BaseModel, ConfigDict
 
@@ -69,6 +69,7 @@ from grindstone.task_loop import (
     pending_cursor,
     run_task,
 )
+from grindstone.verify import TaskVerifier
 from grindstone.worker import Task, WorkerTransport
 
 EpochArgs = ImplementEpochArgs | ArtifactEpochArgs
@@ -323,6 +324,7 @@ def _fan_out(
     force_senior: bool,
     prepare: PrepareConfig | None,
     sleep_fn: SleepFn,
+    verifiers: Mapping[str, TaskVerifier] | None,
     epoch_hint: str | None = None,
 ) -> dict[str, TaskOutcome]:
     """Run ``to_run`` tasks concurrently; return outcomes keyed by short task id."""
@@ -348,6 +350,7 @@ def _fan_out(
             prepare=prepare,
             epoch_hint=epoch_hint,
             sleep_fn=sleep_fn,
+            verifiers=verifiers,
         )
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
@@ -513,6 +516,7 @@ def run_epoch(
     epoch_hint: str | None = None,
     force_senior: bool = False,
     sleep_fn: SleepFn = time.sleep,
+    verifiers: Mapping[str, TaskVerifier] | None = None,
 ) -> EpochOutcome:
     """Run ONE epoch (fresh start) to a terminal EpochOutcome.
 
@@ -586,6 +590,7 @@ def run_epoch(
         prepare=prepare,
         epoch_hint=epoch_hint,
         sleep_fn=sleep_fn,
+        verifiers=verifiers,
     )
     if not epoch_done_predicate(store.state):
         raise RuntimeError("epoch loop ended before the done-predicate held")
@@ -613,6 +618,7 @@ def resume_epoch(
     tier0_attempts: int = TIER0_ATTEMPTS,
     prepare: PrepareConfig | None = None,
     sleep_fn: SleepFn = time.sleep,
+    verifiers: Mapping[str, TaskVerifier] | None = None,
 ) -> EpochOutcome:
     """Re-enter a killed epoch from ``state.json`` against a caller-owned journal.
 
@@ -669,6 +675,7 @@ def resume_epoch(
         force_senior=False,
         prepare=prepare,
         sleep_fn=sleep_fn,
+        verifiers=verifiers,
     )
     outcomes.update(live)
     if not epoch_done_predicate(store.state):

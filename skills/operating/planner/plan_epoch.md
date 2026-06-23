@@ -98,6 +98,16 @@ differ at each level:
   cheaply IN the worker (it bakes against them before handoff), not by an expensive
   rebuild. Express structural facts as the project's own commands / file-existence;
   content/semantic acceptance rides `criteria`.
+- SCOPE `criteria` to the task's OWN deliverable, at the task's altitude. A
+  research/plan task's criteria gate the APPROACH: the decisions made, the
+  file-ownership/plan it lays out, and that the plan is COMPLETE for what comes next,
+  NOT build-level exhaustiveness. Do not demand a plan enumerate every one of 30+
+  hex values, or carry a `test:e2e` script, or prove a build runs: that is
+  build-epoch acceptance and belongs to the implement task that ships those files.
+  An implement task's criteria are the structural + content acceptance of THAT
+  task's own files (e.g. "tokens.ts exports the full M3 scale"), nothing broader.
+  Each criterion is judged by a fresh same-tier critic against that one task's
+  work, so an over-broad criterion only manufactures a gap the task cannot close.
 - Tasks within an epoch run in PARALLEL and MUST NOT consume each other's
   outputs. Anything where one task needs another's result is SEQUENTIAL work,
   put it in a later epoch (or phase), never in a sibling task of the same epoch.

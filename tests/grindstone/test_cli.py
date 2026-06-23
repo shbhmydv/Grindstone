@@ -198,7 +198,7 @@ def test_resume_passes_verifier_like_run(
 
     monkeypatch.setattr(cli, "resume_grind", _spy)
     main(["resume", "rv", "--repo", str(git_repo)], planner=MockPlanner(script=[]), ladder=_ladder())
-    assert captured["verifier"] is not None
+    assert captured["verifiers"] is not None
 
 
 def test_resume_no_verifier_when_verify_epochs_off(
@@ -227,7 +227,7 @@ def test_resume_no_verifier_when_verify_epochs_off(
 
     monkeypatch.setattr(cli, "resume_grind", _spy)
     main(["resume", "rnv", "--repo", str(git_repo)], planner=MockPlanner(script=[]), ladder=_ladder())
-    assert captured["verifier"] is None
+    assert captured["verifiers"] is None
 
 
 # --- resume: terminal run is idempotent through main ---------------------------

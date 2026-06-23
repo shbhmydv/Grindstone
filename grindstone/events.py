@@ -207,34 +207,6 @@ class InfraRepairExhausted(_Event):
     reason: str
 
 
-class EpochVerificationStarted(_Event):
-    # The end-of-epoch agentic verification pass (G4) began: the epoch cleared its
-    # deterministic floor and carries criteria, so the local tier judges them against
-    # the produced artifacts in a tip worktree. ``criteria`` is how many were judged.
-    event: Literal["epoch_verification_started"] = "epoch_verification_started"
-    phase_id: str
-    epoch_id: str
-    criteria: int
-
-
-class EpochVerificationPassed(_Event):
-    # The verification pass judged EVERY criterion met by the actual artifacts; the
-    # epoch's semantic gate is clear and the run proceeds.
-    event: Literal["epoch_verification_passed"] = "epoch_verification_passed"
-    phase_id: str
-    epoch_id: str
-
-
-class EpochVerificationFailed(_Event):
-    # The verification pass found an unmet criterion (or could not produce a valid
-    # verdict, a fail-safe). The epoch is routed through the failed-epoch machinery
-    # with the gaps as the planner-facing reason. ``gaps`` names what was unmet.
-    event: Literal["epoch_verification_failed"] = "epoch_verification_failed"
-    phase_id: str
-    epoch_id: str
-    gaps: list[str]
-
-
 class TaskDispatched(_Event):
     event: Literal["task_dispatched"] = "task_dispatched"
     epoch_id: str
@@ -274,6 +246,37 @@ class HandoffRejected(_Event):
     reason: str
 
 
+class TaskVerificationStarted(_Event):
+    # One task's agentic verification began: the task cleared its deterministic floor
+    # (handoff + scope + grounding) and carries criteria, so a FRESH same-tier critic
+    # judges them against the produced artifact in the task's scratch. ``criteria`` is
+    # how many were judged; ``tier`` is the tier that built (and verifies) the task.
+    event: Literal["task_verification_started"] = "task_verification_started"
+    epoch_id: str
+    task_id: str
+    criteria: int
+    tier: str
+
+
+class TaskVerificationPassed(_Event):
+    # The task's verification judged EVERY criterion met by the actual artifact; the
+    # task's semantic gate is clear and it counts as DONE.
+    event: Literal["task_verification_passed"] = "task_verification_passed"
+    epoch_id: str
+    task_id: str
+
+
+class TaskVerificationFailed(_Event):
+    # The task's verification found an unmet criterion (or could not produce a valid
+    # verdict, a fail-safe). It routes into the task's OWN retry ladder as a chainable
+    # failure (incremental repair against the prior-verdict anchor); ``gaps`` names what
+    # was unmet, fed to the repair worker as the corrective.
+    event: Literal["task_verification_failed"] = "task_verification_failed"
+    epoch_id: str
+    task_id: str
+    gaps: list[str]
+
+
 Event = Annotated[
     Union[
         RunStarted,
@@ -299,14 +302,14 @@ Event = Annotated[
         InfraRepairDispatched,
         InfraRepairResolved,
         InfraRepairExhausted,
-        EpochVerificationStarted,
-        EpochVerificationPassed,
-        EpochVerificationFailed,
         TaskDispatched,
         TaskRetried,
         TaskEscalated,
         TaskDone,
         TaskFailed,
+        TaskVerificationStarted,
+        TaskVerificationPassed,
+        TaskVerificationFailed,
         HandoffRejected,
     ],
     Field(discriminator="event"),
@@ -585,14 +588,16 @@ def replay(events: list[Event]) -> RunTree:
             epoch.ended_ts = ev.ts
         elif isinstance(ev, FailedEpochHandled):
             epochs_by_id[ev.epoch_id].status = f"failed ({ev.action})"
-        elif isinstance(ev, EpochVerificationStarted):
-            epochs_by_id[ev.epoch_id].status = "verifying"
-        elif isinstance(ev, EpochVerificationPassed):
-            epochs_by_id[ev.epoch_id].status = "verified"
-        elif isinstance(ev, EpochVerificationFailed):
-            epoch = epochs_by_id[ev.epoch_id]
-            epoch.status = "verification_failed"
-            epoch.ended_ts = ev.ts
+        elif isinstance(ev, TaskVerificationStarted):
+            _task(epochs_by_id[ev.epoch_id], ev.task_id).status = "verifying"
+        elif isinstance(ev, TaskVerificationPassed):
+            _task(epochs_by_id[ev.epoch_id], ev.task_id).status = "verified"
+        elif isinstance(ev, TaskVerificationFailed):
+            # The per-task agentic verdict found a gap; surface it as the task note
+            # (the retry ladder will try to close it on the next attempt).
+            task = _task(epochs_by_id[ev.epoch_id], ev.task_id)
+            task.status = "verification_failed"
+            task.note = "; ".join(ev.gaps) if ev.gaps else None
         elif isinstance(ev, TaskDispatched):
             task = _task(epochs_by_id[ev.epoch_id], ev.task_id)
             task.status = "dispatched"

@@ -50,7 +50,7 @@ from grindstone.script_polish import ScriptPolisher
 from grindstone.script_vision import ScriptVisionReviewer, VisionReviewer
 from grindstone.script_worker import ScriptWorker
 from grindstone.tui import watch
-from grindstone.verify import EpochVerifier, WorkerEpochVerifier
+from grindstone.verify import TaskVerifier, WorkerTaskVerifier
 
 #: Per-run planner-call ceiling when the config does not set one. This is a
 #: runaway-spin BACKSTOP, not a quota ration: the codex subscription has ample
@@ -316,20 +316,27 @@ def _resolve_vision_reviewer(cfg: GrindstoneConfig | None) -> VisionReviewer | N
     return ScriptVisionReviewer(script=script, timeout_s=DEFAULT_VISION_TIMEOUT_S)
 
 
-def _resolve_verifier(ladder: Ladder, cfg: GrindstoneConfig | None) -> EpochVerifier | None:
-    """The G4 end-of-epoch verifier: the WORKER tier wrapped as a ``WorkerEpochVerifier``.
+def _resolve_verifiers(
+    ladder: Ladder, cfg: GrindstoneConfig | None
+) -> dict[str, TaskVerifier] | None:
+    """The tier-aware per-task verifiers: ``{tier_name: WorkerTaskVerifier}``.
 
-    Default ON (``verify_epochs`` true): the verification pass runs whenever an epoch
-    carries ``criteria`` AND a worker tier exists. ``None`` (the pass is disabled)
-    when the config opts out (``verify_epochs: false``) or there is no ``worker`` tier;
-    the run loop then skips the pass entirely (it still never errors with no criteria)."""
+    Each task is verified at the tier that BUILT it (a ``senior`` task by the senior
+    verifier, every other by the local ``worker`` verifier), so the critic is at the
+    builder's strength, never a weaker model gatekeeping a stronger one. Every ladder
+    tier gets its own ``WorkerTaskVerifier`` wrapping that tier's transport; the verifier
+    dispatch is a SEPARATE fresh invocation (no inherited builder session), so it stays
+    an independent critic. Default ON (``verify_epochs`` true): the pass runs whenever a
+    task carries ``criteria``. ``None`` (the pass is disabled for every tier) when the
+    config opts out (``verify_epochs: false``) or the ladder is empty; the task loop then
+    skips the agentic pass and the deterministic floor alone gates."""
 
     if cfg is not None and not cfg.verify_epochs:
         return None
-    for name, transport in ladder:
-        if name == "worker":
-            return WorkerEpochVerifier(transport)
-    return None
+    verifiers: dict[str, TaskVerifier] = {
+        name: WorkerTaskVerifier(transport) for name, transport in ladder
+    }
+    return verifiers or None
 
 
 def _resolve_final_polish(cfg: GrindstoneConfig | None) -> FinalPolish | None:
@@ -440,7 +447,7 @@ def _cmd_run(
             final_polish=_resolve_final_polish(cfg),
             prepare=cfg.prepare if cfg is not None else None,
             floor=cfg.floor if cfg is not None else None,
-            verifier=_resolve_verifier(ladder, cfg),
+            verifiers=_resolve_verifiers(ladder, cfg),
             infra_repair=cfg.infra_repair if cfg is not None else None,
             max_failed_epochs_per_phase=_resolve_failed_epoch_cap(cfg),
             local_max_task_files=_resolve_task_file_bounds(cfg)[0],
@@ -505,7 +512,7 @@ def _cmd_resume(
         final_polish=_resolve_final_polish(cfg),
         prepare=cfg.prepare if cfg is not None else None,
         floor=cfg.floor if cfg is not None else None,
-        verifier=_resolve_verifier(ladder, cfg),
+        verifiers=_resolve_verifiers(ladder, cfg),
         infra_repair=cfg.infra_repair if cfg is not None else None,
         max_failed_epochs_per_phase=_resolve_failed_epoch_cap(cfg),
         local_max_task_files=_resolve_task_file_bounds(cfg)[0],

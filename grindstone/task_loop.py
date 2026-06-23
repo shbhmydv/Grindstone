@@ -35,7 +35,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Literal, Sequence
+from typing import Callable, Literal, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict
 
@@ -49,6 +49,7 @@ from grindstone.contracts.models import (
     ArtifactTask,
     Check,
     CmdCheck,
+    EpochVerdict,
     Handoff,
     ImplementTask,
     VisionReviewCheck,
@@ -64,9 +65,13 @@ from grindstone.events import (
     TaskEscalated,
     TaskFailed,
     TaskRetried,
+    TaskVerificationFailed,
+    TaskVerificationPassed,
+    TaskVerificationStarted,
 )
 from grindstone.repomap import WORKER_SUBTREE_TOKENS, build_repo_map
 from grindstone.rundir import RunDir
+from grindstone.verify import TaskVerifier, VerificationError
 from grindstone import worktree as wt
 from grindstone.worker import (
     MAX_SESSION_LIMIT_WAITS,
@@ -77,6 +82,7 @@ from grindstone.worker import (
     RateLimited,
     SessionLimited,
     Task,
+    VerificationBrief,
     WorkerRequest,
     WorkerTransport,
 )
@@ -236,6 +242,13 @@ def _now() -> str:
 
 #: The senior tier's name in the ladder; a ``senior`` task starts here when present.
 _SENIOR_TIER = "senior"
+
+#: Prefix on a failed-attempt reason whose source is the AGENTIC verification (not the
+#: deterministic floor). The run loop matches on it to surface the unmet criteria in the
+#: planner's ``<semantic_gaps>`` block distinctly from a floor failure. Shared so the
+#: producer (``_verify_task``) and the consumer (run_loop's failed-epoch context) never
+#: drift on the literal.
+VERIFICATION_REASON_PREFIX = "verification failed: "
 
 #: Max out-of-scope paths NAMED in a rejection reason before the rest are summed
 #: as ``... and <K> more``. A worker that materializes a dependency tree could
@@ -721,6 +734,127 @@ def _load_domain_skills(repo: Path | None, task: Task) -> dict[str, str]:
     return out
 
 
+class _VerificationGap(_AttemptFailed):
+    """A chainable attempt failure whose source is the AGENTIC verification (not the
+    deterministic floor): it carries the verifier's ``verdict`` so the grind loop can
+    thread it as the NEXT attempt's convergence anchor (``prior_verdict``). A floor
+    rejection has no verdict, so the anchor is only set/updated on this subclass."""
+
+    def __init__(self, reason: str, *, detail: str, verdict: EpochVerdict) -> None:
+        super().__init__(reason, detail=detail, chainable=True)
+        self.verdict = verdict
+
+
+def _task_artifact_pointer(
+    task: Task, handoff: Handoff, scratch: Path
+) -> list[str]:
+    """The produced-artifact pointer fed to this task's verifier (its only handle).
+
+    The handoff's one-line ``resulting_state`` PLUS, for an artifact-mode task, the
+    absolute PATH (in the task scratch) to the produced deliverable, so the verifier
+    READS the real file rather than trusting the one-line state. For an implement task
+    the deliverable is the committed diff the verifier already sees in the worktree, so
+    only the state line is given. Delivered BY REFERENCE: a huge deliverable never
+    enters the brief, only its path does."""
+
+    state = handoff.resulting_state.strip() or "(no state recorded)"
+    out = [f"{task.id}: {state}"]
+    if isinstance(task, ArtifactTask):
+        produced = (scratch / task.artifact_out).resolve()
+        out.append(
+            f"{task.id} artifact `{task.artifact_out}` (the produced deliverable, READ "
+            f"its full content at this path): {produced}"
+        )
+    return out
+
+
+def _verify_task(
+    *,
+    identity: TaskIdentity,
+    task: Task,
+    handoff: Handoff,
+    scratch: Path,
+    run_dir: RunDir,
+    journal: JournalWriter,
+    verifier: TaskVerifier,
+    tier_name: str,
+    prior_verdict: EpochVerdict | None,
+) -> EpochVerdict:
+    """Verify ONE task against its OWN ``criteria`` at its tier; raise on a gap.
+
+    Runs AFTER the deterministic floor (handoff + scope + grounding all cleared) on a
+    task that carries ``criteria``. A FRESH same-tier critic (``verifier``) judges the
+    produced artifact in ``scratch`` and writes ``verdict.json``, relocated to the
+    task's keyed-log path so it reaches the planner by reference. On a re-verification
+    ``prior_verdict`` anchors the pass (confirm the failed criteria closed, regression-
+    check the passed ones), so the gap set converges. Returns the verdict on a PASS;
+    raises a CHAINABLE ``_AttemptFailed`` (the gap list as the corrective) on a fail, so
+    the retry ladder repairs the SAME worktree incrementally. A verifier that cannot
+    produce a valid verdict is a fail-safe CHAINABLE failure too (never a silent pass)."""
+
+    journal.emit(
+        lambda s: TaskVerificationStarted(
+            seq=s, ts=_now(), epoch_id=identity.epoch_id, task_id=identity.task_id,
+            criteria=len(task.criteria), tier=tier_name,
+        )
+    )
+    brief = VerificationBrief(
+        epoch_goal=task.goal,
+        criteria=list(task.criteria),
+        artifacts=_task_artifact_pointer(task, handoff, scratch),
+        prior_verdict=prior_verdict,
+    )
+    verdict_dest = run_dir.resolve(f"{identity.fq}/verdict.json")
+    try:
+        verdict = verifier.verify(
+            scratch=scratch,
+            brief=brief,
+            task_id=f"{identity.fq}/verify",
+            verdict_dest=verdict_dest,
+        )
+    except VerificationError as exc:
+        # The verifier could not produce a valid verdict: a fail-safe (never a silent
+        # pass). Route it as a CHAINABLE gap so the retry re-runs the work + re-verifies
+        # (the model may emit a valid verdict next attempt); the ladder cap bounds it.
+        gaps = [f"verification could not produce a valid verdict: {exc}"]
+        journal.emit(
+            lambda s: TaskVerificationFailed(
+                seq=s, ts=_now(), epoch_id=identity.epoch_id, task_id=identity.task_id,
+                gaps=gaps,
+            )
+        )
+        raise _AttemptFailed(
+            VERIFICATION_REASON_PREFIX + "; ".join(gaps),
+            detail="\n".join(gaps),
+            chainable=True,
+        ) from exc
+    if verdict.passed:
+        journal.emit(
+            lambda s: TaskVerificationPassed(
+                seq=s, ts=_now(), epoch_id=identity.epoch_id, task_id=identity.task_id,
+            )
+        )
+        return verdict
+    # A well-formed pass=false verdict is a SEMANTIC gap. Synthesize a gap list (prefer
+    # the verifier's own ``gaps``; else the unmet per-criterion statements) and route it
+    # into the task's retry ladder as a chainable failure: the prior verdict becomes the
+    # next attempt's convergence anchor (held by the caller), the gaps the corrective.
+    gaps = list(verdict.gaps) or [
+        f"criterion not met: {j.criterion}" for j in verdict.per_criterion if not j.met
+    ] or ["the verification marked the task not done (no specific gap given)"]
+    journal.emit(
+        lambda s: TaskVerificationFailed(
+            seq=s, ts=_now(), epoch_id=identity.epoch_id, task_id=identity.task_id,
+            gaps=gaps,
+        )
+    )
+    raise _VerificationGap(
+        VERIFICATION_REASON_PREFIX + _summarize_reason("; ".join(gaps)),
+        detail="\n".join(gaps),
+        verdict=verdict,
+    )
+
+
 def _dispatch_attempt(
     *,
     identity: TaskIdentity,
@@ -950,6 +1084,7 @@ def _grind(
     force_senior: bool,
     prepare: PrepareConfig | None,
     sleep_fn: SleepFn,
+    verifiers: Mapping[str, TaskVerifier] | None,
 ) -> TaskOutcome:
     """Drive the ladder from ``cursor`` to a terminal outcome.
 
@@ -976,6 +1111,15 @@ def _grind(
     # branch awaiting deletion once it is superseded (or at the terminal).
     chain_base: str | None = None
     stale_branch: str | None = None
+    # The convergence anchor for per-task agentic verification: the verifier's OWN
+    # prior verdict, set when a verification fails and fed to the NEXT attempt's
+    # verification so the gap set shrinks monotonically (target 4). Reset on a tier
+    # escalation (a fresh start has no prior verdict). None on the first verification.
+    prior_verdict: EpochVerdict | None = None
+    # The verifier matched to the tier that BUILDS this task (target 1: verify at the
+    # builder's tier). None when no verifier is wired for that tier, or the task has no
+    # criteria, in which case the agentic pass is skipped (the floor still gates).
+    verifier_for = verifiers or {}
 
     def write_cursor(
         status: Literal["running", "done", "failed"],
@@ -1059,7 +1203,33 @@ def _grind(
                     epoch_base=base,
                     prior_work_present=implement and chain_base is not None,
                 )
+                # Per-task agentic verification (targets 1-4): the deterministic floor
+                # just cleared (handoff + scope + grounding) on a task that carries
+                # criteria. Judge THAT task against ITS OWN criteria with a FRESH critic
+                # at the tier that built it; a gap raises a chainable _VerificationGap
+                # caught below, so the retry repairs this SAME worktree, anchored to the
+                # prior verdict so the gap set converges. Skipped (the floor alone gates)
+                # when the task has no criteria or no verifier is wired for its tier.
+                verifier = verifier_for.get(tier_name)
+                if task.criteria and verifier is not None:
+                    _verify_task(
+                        identity=identity,
+                        task=task,
+                        handoff=handoff,
+                        scratch=scratch,
+                        run_dir=run_dir,
+                        journal=journal,
+                        verifier=verifier,
+                        tier_name=tier_name,
+                        prior_verdict=prior_verdict,
+                    )
             except _AttemptFailed as failure:
+                # A failed AGENTIC verification carries its verdict: thread it as the
+                # NEXT attempt's convergence anchor (target 4). A floor rejection is not
+                # a _VerificationGap, so the anchor is left unchanged (and the work it
+                # rejected never reached verification).
+                if isinstance(failure, _VerificationGap):
+                    prior_verdict = failure.verdict
                 # Reference-not-embed: the FULL failure detail is persisted to a
                 # file under the run dir and the NEXT attempt's worker prompt
                 # (build_worker_prompt's <prior_failures>) carries only a one-line
@@ -1145,11 +1315,14 @@ def _grind(
 
         # Tier exhausted; climb if a higher rung exists. A higher tier starts CLEAN
         # from the epoch base, never inheriting the lower tier's partial work, so the
-        # incremental chain is reset and the kept lower-tier branch is deleted.
+        # incremental chain is reset and the kept lower-tier branch is deleted. The
+        # verification anchor is reset too: a higher-tier critic judges fresh, never
+        # bound by a lower tier's prior verdict (the convergence anchor is per tier).
         if implement and repo is not None and stale_branch is not None:
             wt.delete_branch(repo, stale_branch)
         chain_base = None
         stale_branch = None
+        prior_verdict = None
         if cursor.tier_index + 1 < len(ladder):
             next_tier = ladder[cursor.tier_index + 1][0]
             cursor.tier_index += 1
@@ -1210,6 +1383,7 @@ def run_task(
     prepare: PrepareConfig | None = None,
     epoch_hint: str | None = None,
     sleep_fn: SleepFn = time.sleep,
+    verifiers: Mapping[str, TaskVerifier] | None = None,
 ) -> TaskOutcome:
     """Grind ONE task to terminal against a shared journal (fan-out unit).
 
@@ -1258,6 +1432,7 @@ def run_task(
             force_senior=force_senior,
             prepare=prepare,
             sleep_fn=sleep_fn,
+            verifiers=verifiers,
         )
 
     # Resume: burn the in-flight attempt.
@@ -1295,4 +1470,5 @@ def run_task(
         force_senior=force_senior,
         prepare=prepare,
         sleep_fn=sleep_fn,
+        verifiers=verifiers,
     )

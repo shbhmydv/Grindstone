@@ -41,7 +41,7 @@ import sys
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Literal, Sequence, cast
+from typing import Any, Callable, Literal, Mapping, Sequence, cast
 
 from pydantic import BaseModel, ConfigDict
 
@@ -73,7 +73,7 @@ from grindstone.contracts.models import (
 )
 from grindstone.script_polish import Polisher
 from grindstone.script_vision import VisionReviewError, VisionReviewer
-from grindstone.verify import EpochVerifier, VerificationError
+from grindstone.verify import TaskVerifier
 from grindstone.contracts.semantics import HandoffMode
 from grindstone.domain_skills import load_domain_skill_index
 from grindstone.epoch_loop import EpochArgs, EpochOutcome, resume_epoch, run_epoch
@@ -81,9 +81,6 @@ from grindstone.journal import reap_sibling_journals, write_journal
 from grindstone.memory import load_digest
 from grindstone.events import (
     EpochFailed,
-    EpochVerificationFailed,
-    EpochVerificationPassed,
-    EpochVerificationStarted,
     FailedEpochHandled,
     FinalPolishApplied,
     FinalPolishSkipped,
@@ -128,10 +125,9 @@ from grindstone.planner import (
 )
 from grindstone.repomap import build_repo_map
 from grindstone.rundir import RunDir, atomic_write_json
-from grindstone.task_loop import TIER0_ATTEMPTS
+from grindstone.task_loop import TIER0_ATTEMPTS, VERIFICATION_REASON_PREFIX
 from grindstone.worker import (
     InfraRepairBrief,
-    VerificationBrief,
     WorkerRequest,
     WorkerTransport,
 )
@@ -139,6 +135,12 @@ from grindstone.worker import (
 RunStatus = Literal["awaiting_planner", "running_epoch", "completed", "escalated", "failed"]
 SleepFn = Callable[[float], None]
 Ladder = Sequence[tuple[str, WorkerTransport]]
+#: The tier-aware per-task verifier set: a map ``{tier_name: TaskVerifier}`` the run
+#: loop threads into the task loop, where each task is verified at the tier that BUILT
+#: it (a ``senior`` task by the senior verifier, every other by the local one). ``None``
+#: (or a tier absent from the map) disables the agentic pass for that tier; the
+#: deterministic floor still gates. Built by the CLI's ``_resolve_verifiers``.
+TaskVerifierMap = Mapping[str, TaskVerifier]
 
 #: Cap on the integration-tip file listing surfaced in the tail (ruling 3b):
 #: a reference, not a payload, the full count is always reported alongside.
@@ -214,17 +216,6 @@ class RunState(BaseModel):
     #: FAILED epochs disposed of within the CURRENT phase (the deterministic
     #: spin-loop cap, Part C); resets on phase advance AND revise.
     phase_failed_epochs: int = 0
-    #: The DURABLE marker that a just-completed epoch carrying ``criteria`` still owes
-    #: the G4 agentic verification pass (the originating ``decision`` + ``epoch_id``).
-    #: Set when ``_record_epoch`` flips the epoch to ``awaiting_planner``; CLEARED only
-    #: once verification reaches a terminal classification (a Passed/Failed event, an
-    #: infra-failure, or no criteria to judge). On resume, a set marker WITHOUT a
-    #: terminal verification event in the journal means a kill landed AFTER the epoch
-    #: persisted but BEFORE the gate finished -> the pass is RE-RUN before the next
-    #: planner boundary, so verification can never be skipped by loop position. A
-    #: verdict already produced + recorded (terminal event present) is reused, never
-    #: regenerated. ``None`` = nothing owes verification. Defaulted so older states load.
-    pending_verification: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -1221,6 +1212,7 @@ def _dispatch_epoch(
     tier0_attempts: int,
     prepare: PrepareConfig | None,
     sleep_fn: SleepFn,
+    verifiers: TaskVerifierMap | None,
     *,
     epoch_hint: str | None = None,
     force_senior: bool = False,
@@ -1260,6 +1252,7 @@ def _dispatch_epoch(
         epoch_hint=epoch_hint,
         force_senior=force_senior,
         sleep_fn=sleep_fn,
+        verifiers=verifiers,
     )
     _record_epoch(store, outcome, decision)
     return outcome
@@ -1280,16 +1273,13 @@ def _record_epoch(
 ) -> None:
     """Persist a completed epoch as ``awaiting_planner`` (the resume cursor).
 
-    An epoch that carries ``criteria`` AND did not fail its floor still owes the G4
-    agentic verification pass; record that as the DURABLE ``pending_verification``
-    marker (the originating decision + epoch id) so a kill in the window between this
-    persist and the verifier finishing cannot let the epoch skip its semantic gate.
-    The marker is cleared by ``_verify_epoch`` once the pass reaches a terminal
-    classification. An epoch with no criteria, or one whose floor failed (the
-    failed-epoch path owns it), owes no verification -> the marker is left clear."""
+    Agentic verification is now PER TASK, inside the epoch's own retry ladder (the
+    task loop), so a completed epoch owes no separate end-of-epoch gate: a task that
+    could not satisfy its criteria has already FAILED its ladder (and thus the epoch),
+    and a DONE task was verified before it was kept. Nothing is deferred past this
+    persist, so there is no verification marker to record."""
 
     new_branch = outcome.integration.branch or store.state.last_integration_branch
-    owes_verification = bool(_epoch_criteria(decision)) and not _epoch_failed(outcome)
     store.update(
         status="awaiting_planner",
         epoch_counter=store.state.epoch_counter + 1,
@@ -1297,15 +1287,6 @@ def _record_epoch(
         phase_budget_used=store.state.phase_budget_used + 1,
         last_integration_branch=new_branch,
         pending_decision=None,
-        pending_verification=(
-            {
-                "decision": decision.model_dump(mode="json"),
-                "phase_id": outcome.phase_id,
-                "epoch_id": outcome.epoch_id,
-            }
-            if owes_verification
-            else None
-        ),
     )
 
 
@@ -1326,19 +1307,27 @@ def _build_failed_epoch_info(
     phase_check_results: list[tuple[str, bool]],
     disposed_count: int,
     cap: int,
-    verification_gaps: list[str] | None = None,
 ) -> FailedEpochInfo:
     """Assemble the focused context a ``handle_failed_epoch`` decision needs.
 
     Failed tasks + their last reason; the phase exit checks that FAIL (label
     carries the captured command output, Part A); and the DONE tasks' handoff
     resulting_state, the workers' honest pass claim the planner weighs against
-    the still-failing gate (gate skepticism)."""
+    the still-failing gate (gate skepticism). ``verification_gaps`` is derived from
+    the failed tasks whose ladder ended on an AGENTIC-verification gap (the reason
+    leads with ``verification failed:``), surfaced separately so the planner's
+    ``<semantic_gaps>`` block names the unmet criteria, not just a task id."""
 
     failed_tasks = [
         (t.task_id, t.failure_reason or "no reason recorded")
         for t in outcome.tasks
         if t.status == "failed"
+    ]
+    verification_gaps = [
+        f"{t.task_id}: {(t.failure_reason or '')[len(VERIFICATION_REASON_PREFIX):].strip()}"
+        for t in outcome.tasks
+        if t.status == "failed"
+        and (t.failure_reason or "").startswith(VERIFICATION_REASON_PREFIX)
     ]
     failed_checks = [label for label, ok in phase_check_results if not ok]
     passing: list[tuple[str, str]] = []
@@ -1359,292 +1348,7 @@ def _build_failed_epoch_info(
         passing_handoffs=passing,
         disposed_count=disposed_count,
         cap=cap,
-        verification_gaps=list(verification_gaps or []),
-    )
-
-
-def _epoch_criteria(decision: EpochDecision) -> list[str]:
-    """Every task's natural-language ``criteria`` for an epoch, aggregated + deduped
-    (G4). Empty => the verification pass is SKIPPED entirely."""
-
-    if not isinstance(decision.args, (ImplementEpochArgs, ArtifactEpochArgs)):
-        return []
-    seen: dict[str, None] = {}
-    for task in decision.args.tasks:
-        for c in task.criteria:
-            seen.setdefault(c, None)
-    return list(seen)
-
-
-def _artifact_out_keys(decision: EpochDecision) -> dict[str, str]:
-    """Map each task id to its ``artifact_out`` log key for an artifact-mode epoch.
-
-    Empty for an implement epoch (its deliverable is the committed diff the verifier
-    already sees); empty when the decision is not an epoch tool."""
-
-    if not isinstance(decision.args, ArtifactEpochArgs):
-        return {}
-    return {t.id: t.artifact_out for t in decision.args.tasks}
-
-
-def _epoch_artifacts_summary(
-    outcome: EpochOutcome, run_dir: RunDir, decision: EpochDecision
-) -> list[str]:
-    """What the epoch produced, fed to the adversarial verifier (its only handle).
-
-    Each DONE task contributes its handoff ``resulting_state`` (a one-line pointer)
-    AND, when the task is an artifact-mode task, the relocated ``artifact_out``
-    deliverable's PATH (the absolute run-dir location ``artifact_exists`` resolves via
-    ``find_artifact``). The verifier runs in a fresh worktree of the committed
-    integration tip, so a research/artifact deliverable (which is NOT committed) is
-    invisible in the diff there: handing it the PATH (and telling it to READ the file)
-    lets it judge the real deliverable WITHOUT the content being byte-capped-and-embedded
-    into the prompt (the principle: agent inputs travel by reference, full content stays
-    on disk). The verifier worktree is under the run dir, so the absolute path is
-    readable from its cwd (same access argument as the failure files). A deliverable
-    ``artifact_exists`` just confirmed present resolves here too, so it is never reported
-    missing. An implement task's deliverable is the committed diff the verifier already
-    reads, so it contributes only the pointer.
-    """
-
-    out_keys = _artifact_out_keys(decision)
-    out: list[str] = []
-    for t in outcome.tasks:
-        if t.status != "done" or not t.handoff_key:
-            continue
-        try:
-            payload = json.loads(run_dir.resolve(t.handoff_key).read_text(encoding="utf-8"))
-            state = str(payload.get("resulting_state", "")).strip()
-        except (ValueError, OSError):
-            state = ""
-        out.append(f"{t.task_id}: {state or '(no state recorded)'}")
-        artifact_out = out_keys.get(t.task_id)
-        if artifact_out is None:
-            continue
-        path = run_dir.find_artifact(artifact_out)
-        if path is None:
-            out.append(
-                f"{t.task_id} artifact `{artifact_out}`: (relocated but unresolvable)"
-            )
-        else:
-            out.append(
-                f"{t.task_id} artifact `{artifact_out}` (relocated deliverable, READ "
-                f"its full content at this path): {path}"
-            )
-    return out
-
-
-#: Bounded verifier re-runs for a STRUCTURALLY-invalid verdict (G6 Part B). A verdict
-#: the verifier model cannot emit validly (bad JSON / missing field / still invalid
-#: after advisory truncation) is a verification-INFRASTRUCTURE problem, not a worker
-#: semantic gap, so the core re-runs the verifier this many times (the model may emit
-#: valid output on a retry) before escalating. A genuine well-formed ``pass=false``
-#: verdict is NEVER retried here: it is a semantic gap and routes through the
-#: failed-epoch machinery on the first verdict, exactly as before.
-VERIFIER_MAX_ATTEMPTS = 2
-
-
-@dataclass(frozen=True)
-class _VerificationInfraFailure:
-    """A verification-INFRASTRUCTURE failure (G6 Part B): the deterministic floor and
-    the worker handoff were honest, but the verification TOOLING could not produce a
-    valid verdict after the bounded re-runs, OR the integration tip could not be checked
-    out (unborn / unresolvable ref). Distinct from a semantic gap the planner can fix:
-    the core escalates the run with this clear message instead of mis-blaming the worker
-    via ``handle_failed_epoch``. A prepare/dependency-install failure is NOT this: that is
-    the COMMITTED work failing to build, a defect routed to the planner as a gap."""
-
-    message: str
-
-
-def _verify_epoch(
-    journal: JournalWriter,
-    store: _RunStateStore,
-    run_dir: RunDir,
-    repo: Path | None,
-    decision: EpochDecision,
-    outcome: EpochOutcome,
-    *,
-    verifier: EpochVerifier | None,
-    prepare: PrepareConfig | None,
-) -> list[str] | _VerificationInfraFailure | None:
-    """Run the end-of-epoch agentic verification pass (G4); classify the outcome.
-
-    SKIPPED (returns ``None``, no event) when the epoch carries no ``criteria`` or
-    there is no verifier (no local tier) or no repo. Otherwise: build a worktree of
-    the epoch's integration tip with deps materialized, dispatch the adversarial
-    verification pass on the local tier, relocate + re-validate ``verdict.json``.
-
-    Three classified returns:
-    - ``[]`` on a clean pass (every criterion met).
-    - a non-empty gap list (``list[str]``), routed through ``handle_failed_epoch`` to the
-      planner. Two sources: a well-formed ``pass=false`` verdict (the verifier found a
-      SEMANTIC gap), OR a prepare/dependency-install failure (the epoch's COMMITTED work
-      does not build in a clean environment, e.g. a peer-dep conflict). The latter is a
-      DEFECT the planner can fix (fix the manifest), not a tooling failure: its FULL
-      prepare output is persisted to a keyed-log path and the gap carries that PATH (read
-      by reference). Both fall through to the failed-epoch disposition (which climbs the
-      cap, so even an unfixable prepare failure terminates deterministically).
-    - a ``_VerificationInfraFailure`` ONLY for a genuine verifier-TOOLING failure the
-      planner cannot fix: the verifier could not produce a valid verdict after
-      ``VERIFIER_MAX_ATTEMPTS`` re-runs (G6 Part B), or the integration tip could not be
-      checked out (unborn / unresolvable ref). The floor passed and the worker is honest;
-      the caller escalates rather than charging the worker. A prepare failure is NOT this
-      (it IS the worker's work, so it routes as a gap above).
-
-    The deterministic floor already cleared (no task failed), so this pass can only
-    fail the epoch, never rubber-stamp it."""
-
-    criteria = _epoch_criteria(decision)
-    if verifier is None or repo is None or not criteria:
-        # No verification ran for this epoch (criteria-less / artifact-only / no local
-        # tier): clear the pending-verification marker (this epoch owes no pass) so resume
-        # does not try to re-verify a criteria-less epoch. There is no digest to clear:
-        # the digest now lives in the persisted verdict.json (read by reference), so an
-        # unverified epoch simply produces no verdict file.
-        store.update(pending_verification=None)
-        return None
-    args = _epoch_args(decision)  # non-empty criteria => an epoch tool (narrows type)
-    phase_id = store.state.current_phase_id or "P1"
-    journal.emit(
-        lambda s: EpochVerificationStarted(
-            seq=s, ts=_now(), phase_id=phase_id, epoch_id=outcome.epoch_id,
-            criteria=len(criteria),
-        )
-    )
-    ref = store.state.last_integration_branch or "HEAD"
-    worktree = run_dir.root / "worktrees" / f"_verify_{outcome.epoch_id}"
-    brief = VerificationBrief(
-        epoch_goal=f"{args.epoch_title}: {args.rationale}".strip(": "),
-        criteria=criteria,
-        artifacts=_epoch_artifacts_summary(outcome, run_dir, decision),
-    )
-    try:
-        wt.add_worktree_detached(repo, worktree, ref=ref)
-    except wt.GitError:
-        # No tip to verify against (unborn HEAD / unresolvable ref). The environment
-        # could not be set up: an infrastructure failure, not a worker semantic gap.
-        return _VerificationInfraFailure(
-            f"verification could not check out the integration tip ({ref!r}); "
-            f"the deterministic floor passed, the eval environment could not be built"
-        )
-    try:
-        try:
-            materialize_env(repo, worktree, prepare)
-        except PrepareError as exc:
-            # The epoch's COMMITTED manifest does not install in a clean environment
-            # (e.g. a package.json peer-dependency conflict makes `npm install` fail
-            # ERESOLVE). That is the worker's WORK being unbuildable, a DEFECT the
-            # planner can fix, NOT a verifier-tooling failure: route it as a SEMANTIC
-            # gap (through handle_failed_epoch), never a human dead-end escalation. The
-            # FULL prepare output is persisted to a keyed-log path so it reaches the
-            # planner BY REFERENCE (the gap carries the PATH, not the multi-KB body).
-            # The guidance is CAPABILITY-NEUTRAL: it steers the planner to resolve the
-            # conflict by ALIGNING compatible versions and explicitly warns against
-            # dropping a dependency the app needs (the lazy "make install pass" fix that
-            # silently kills a capability, e.g. removing react-dom to clear a conflict).
-            keyed = _persist_prepare_failure(run_dir, phase_id, outcome.epoch_id, str(exc))
-            return [
-                f"the epoch's committed code does not install in a clean environment: "
-                f"the prepare step failed (see {keyed}); fix the manifest so it installs "
-                f"cleanly WITHOUT dropping dependencies the app needs: resolve version "
-                f"conflicts by aligning compatible versions, not by removing packages"
-            ]
-        verdict = _verify_with_retries(
-            verifier, worktree, brief, phase_id, outcome, run_dir
-        )
-    finally:
-        wt.remove_worktree(repo, worktree)
-    if isinstance(verdict, _VerificationInfraFailure):
-        return verdict
-    # The full verdict (digest + per-criterion evidence + gaps) was relocated to its
-    # stable keyed-log path by the verifier adapter; it reaches the NEXT planner boundary
-    # BY REFERENCE via the <workspace> manifest (the planner reads verdict.json), so
-    # nothing is held in run state or embedded in a prompt. The relocated file is the
-    # durable record (re-read on resume, never regenerated); construction stays pure.
-    if verdict.passed:
-        journal.emit(
-            lambda s: EpochVerificationPassed(
-                seq=s, ts=_now(), phase_id=phase_id, epoch_id=outcome.epoch_id
-            )
-        )
-        # The Passed event is the DURABLE terminal record: clear the pending marker so
-        # resume reuses this verdict (sees the event) instead of re-verifying.
-        store.update(pending_verification=None)
-        return []
-    # A well-formed passed=false verdict is a SEMANTIC gap; synthesize a reason from
-    # the unmet criteria so the planner always sees WHAT was unmet.
-    gaps = list(verdict.gaps) or [
-        f"criterion not met: {j.criterion}"
-        for j in verdict.per_criterion
-        if not j.met
-    ] or ["the verification pass marked the epoch not done (no specific gap given)"]
-    return gaps
-
-
-def _verdict_log_key(phase_id: str, epoch_id: str) -> str:
-    """The keyed-log path the epoch's relocated ``verdict.json`` lands at.
-
-    A ``P*/E*/...`` key so the relocated verdict shows up in ``log_index()`` and thus in
-    the ``<workspace>`` manifest, where the planner reads it BY REFERENCE."""
-
-    return f"{phase_id}/{epoch_id}/verdict.json"
-
-
-def _persist_prepare_failure(
-    run_dir: RunDir, phase_id: str, epoch_id: str, output: str
-) -> str:
-    """Persist a verification prepare/dependency-install failure under a keyed-log path.
-
-    A ``P*/E*/prepare_failure.txt`` key so the relocated record shows up in
-    ``log_index()`` and thus in the ``<workspace>`` manifest, where the planner reads the
-    FULL failing output BY REFERENCE (the gap string carries this key, never the multi-KB
-    body). The full ``output`` (the failing cmd + its captured stdout/stderr, already in
-    the PrepareError text) is written verbatim, no byte cap. Returns the log key."""
-
-    key = f"{phase_id}/{epoch_id}/prepare_failure.txt"
-    dest = run_dir.resolve(key)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(output + "\n", encoding="utf-8")
-    return key
-
-
-def _verify_with_retries(
-    verifier: EpochVerifier,
-    worktree: Path,
-    brief: VerificationBrief,
-    phase_id: str,
-    outcome: EpochOutcome,
-    run_dir: RunDir,
-) -> EpochVerdict | _VerificationInfraFailure:
-    """Dispatch the verifier, re-running it on a STRUCTURAL failure (G6 Part B).
-
-    A ``VerificationError`` means the verifier model produced output that cannot be
-    parsed into a valid verdict (bad JSON / missing field / over the DoS size guard).
-    The model may emit valid output on a retry, so re-run it up to
-    ``VERIFIER_MAX_ATTEMPTS`` times. If a valid verdict still cannot be obtained, return
-    a ``_VerificationInfraFailure`` (the caller escalates) rather than charging the epoch
-    as a semantic gap. A well-formed verdict (pass true OR false) returns on the first
-    valid parse, after the adapter relocates the full ``verdict.json`` to its stable
-    keyed-log path (so the planner reads it by reference)."""
-
-    verdict_dest = run_dir.resolve(_verdict_log_key(phase_id, outcome.epoch_id))
-    last_error = ""
-    for _attempt in range(VERIFIER_MAX_ATTEMPTS):
-        try:
-            return verifier.verify(
-                worktree=worktree,
-                brief=brief,
-                task_id=f"{phase_id}/{outcome.epoch_id}/verify",
-                verdict_dest=verdict_dest,
-            )
-        except VerificationError as exc:
-            last_error = str(exc)
-    return _VerificationInfraFailure(
-        f"the verification pass could not produce a valid verdict after "
-        f"{VERIFIER_MAX_ATTEMPTS} attempts ({last_error}); the deterministic floor "
-        f"passed and the worker handoff was honest, so this is a verification-tooling "
-        f"failure, not a gap in the work"
+        verification_gaps=verification_gaps,
     )
 
 
@@ -1656,45 +1360,34 @@ def _maybe_open_failed_epoch(
     outcome: EpochOutcome,
     phase_ctx: _PhaseContext | None,
     cap: int,
-    *,
-    verification_gaps: list[str] | None = None,
 ) -> RunOutcome | None:
     """If the just-run epoch FAILED, open a focused failed-epoch disposition.
 
-    An epoch fails one of two ways: a task exhausted its retry ladder (the B6 path),
-    or it cleared its deterministic floor but the G4 agentic verification pass found a
-    semantic ``verification_gaps`` (an unmet acceptance criterion). EITHER routes
-    through the SAME machinery: increment the per-phase failed-epoch counter and, at
-    the deterministic cap, FORCE a halt-to-human regardless of the planner (Part C,
-    the spin-loop backstop); below the cap record the originating decision + the
-    failure context (incl. the gaps) in run state so the NEXT boundary is constrained
-    to handle_failed_epoch (Part B). Returns a terminal RunOutcome when the cap halts,
-    else ``None``."""
+    An epoch fails when a task exhausted its retry ladder, which now includes a task
+    whose per-task agentic verification could not be satisfied within the ladder (the
+    gap rides that task's ``failure_reason``). Either way: increment the per-phase
+    failed-epoch counter and, at the deterministic cap, FORCE a halt-to-human
+    regardless of the planner (Part C, the spin-loop backstop); below the cap record
+    the originating decision + the failure context (incl. any verification gaps,
+    derived from the failed tasks) in run state so the NEXT boundary is constrained to
+    handle_failed_epoch (Part B) and re-decomposes ONLY the failed tasks (DONE tasks
+    stay done). Returns a terminal RunOutcome when the cap halts, else ``None``."""
 
-    gaps = verification_gaps or []
-    if not _epoch_failed(outcome) and not gaps:
+    if not _epoch_failed(outcome):
         return None
     disposed = store.state.phase_failed_epochs + 1
     phase_id = store.state.current_phase_id or "P1"
-    if gaps:
-        journal.emit(
-            lambda s: EpochVerificationFailed(
-                seq=s, ts=_now(), phase_id=phase_id, epoch_id=outcome.epoch_id,
-                gaps=gaps,
-            )
+    failed_ids = [t.task_id for t in outcome.tasks if t.status == "failed"]
+    journal.emit(
+        lambda s: EpochFailed(
+            seq=s, ts=_now(), phase_id=phase_id, epoch_id=outcome.epoch_id,
+            failed_tasks=failed_ids,
         )
-    else:
-        failed_ids = [t.task_id for t in outcome.tasks if t.status == "failed"]
-        journal.emit(
-            lambda s: EpochFailed(
-                seq=s, ts=_now(), phase_id=phase_id, epoch_id=outcome.epoch_id,
-                failed_tasks=failed_ids,
-            )
-        )
+    )
     phase_checks = phase_ctx.info.check_results if phase_ctx is not None else []
     info = _build_failed_epoch_info(
         outcome, run_dir, phase_check_results=phase_checks,
-        disposed_count=disposed, cap=cap, verification_gaps=gaps,
+        disposed_count=disposed, cap=cap,
     )
     if disposed >= cap:
         reason = (
@@ -1708,10 +1401,7 @@ def _maybe_open_failed_epoch(
                 action="cap_halt", detail=reason,
             )
         )
-        store.update(
-            phase_failed_epochs=disposed, pending_failed_epoch=None,
-            pending_verification=None,
-        )
+        store.update(phase_failed_epochs=disposed, pending_failed_epoch=None)
         return _escalate(journal, store, reason)
     store.update(
         phase_failed_epochs=disposed,
@@ -1722,10 +1412,6 @@ def _maybe_open_failed_epoch(
             "passing_handoffs": info.passing_handoffs,
             "verification_gaps": info.verification_gaps,
         },
-        # The EpochVerificationFailed event (above, for the gap path) + the durable
-        # pending_failed_epoch are now the terminal record: clear the pending-
-        # verification marker so resume does not re-verify an already-disposed gap.
-        pending_verification=None,
     )
     return None
 
@@ -1775,7 +1461,7 @@ def _apply_failed_epoch_decision(
     tier0_attempts: int,
     prepare: PrepareConfig | None,
     cap: int,
-    verifier: EpochVerifier | None,
+    verifiers: TaskVerifierMap | None,
     sleep_fn: SleepFn,
 ) -> tuple[RunOutcome | None, EpochOutcome | None]:
     """Dispatch a handle_failed_epoch decision; clear the pending failure.
@@ -1783,8 +1469,12 @@ def _apply_failed_epoch_decision(
     ``halt`` is terminal (escalation). ``retry`` / ``escalate_senior`` re-dispatch
     the SAME originating epoch decision, retry optionally bumping the starting tier
     + threading the planner's hint to the workers, escalate_senior forcing senior.
-    Returns ``(RunOutcome, None)`` on a terminal branch, else ``(None, outcome)``
-    with the re-dispatched epoch's outcome for the caller to chain.
+    Re-decomposition is scoped to the FAILED tasks: DONE tasks keep their branches +
+    handoffs and are never re-dispatched (epoch_loop.run_epoch), so a re-dispatched
+    epoch re-grinds only what did not get done, each task re-verified at its tier
+    inside its own retry ladder. Returns ``(RunOutcome, None)`` on a terminal branch,
+    else ``(None, outcome)`` with the re-dispatched epoch's outcome for the caller to
+    chain.
     """
 
     pending = store.state.pending_failed_epoch
@@ -1826,32 +1516,18 @@ def _apply_failed_epoch_decision(
         return _escalate(journal, store, "implement epoch requested but no repo configured"), None
     outcome = _dispatch_epoch(
         journal, run_dir, store, epoch_decision, repo, ladder, concurrency,
-        tier0_attempts, prepare, sleep_fn,
+        tier0_attempts, prepare, sleep_fn, verifiers,
         epoch_hint=epoch_hint, force_senior=force_senior,
     )
     if outcome.status == "integration_conflict":
         return _escalate(
             journal, store, f"integration conflict in {outcome.epoch_id} (structural bug)"
         ), None
-    # A re-dispatched epoch can itself fail; re-open the disposition (counter keeps
-    # climbing toward the cap, so a retry-loop terminates deterministically). The
-    # re-dispatch is re-verified the same way (a retry that satisfies the floor but
-    # still leaves a semantic gap re-opens the disposition with the fresh gaps).
-    verification = (
-        _verify_epoch(
-            journal, store, run_dir, repo, epoch_decision, outcome,
-            verifier=verifier, prepare=prepare,
-        )
-        if not _epoch_failed(outcome)
-        else None
-    )
-    if isinstance(verification, _VerificationInfraFailure):
-        # The verification TOOLING failed (not a semantic gap): escalate with the
-        # clear message rather than mis-blaming the worker via handle_failed_epoch.
-        return _escalate(journal, store, verification.message), None
+    # A re-dispatched epoch can itself fail (a task exhausting its retry ladder, incl.
+    # an agentic-verification gap it could not close): re-open the disposition (the
+    # counter keeps climbing toward the cap, so a retry-loop terminates deterministically).
     result = _maybe_open_failed_epoch(
         journal, store, run_dir, epoch_decision, outcome, None, cap,
-        verification_gaps=verification,
     )
     return result, outcome
 
@@ -2306,7 +1982,7 @@ def _drive(
     prepare: PrepareConfig | None,
     floor: FloorConfig | None,
     max_failed_epochs_per_phase: int,
-    verifier: EpochVerifier | None = None,
+    verifiers: TaskVerifierMap | None = None,
     infra_repair: InfraRepairConfig | None = None,
     local_max_task_files: int = DEFAULT_LOCAL_MAX_TASK_FILES,
     senior_max_task_files: int = DEFAULT_SENIOR_MAX_TASK_FILES,
@@ -2410,7 +2086,7 @@ def _drive(
         if isinstance(decision, HandleFailedEpochDecision):
             result, outcome = _apply_failed_epoch_decision(
                 journal, run_dir, store, decision, repo, ladder, concurrency,
-                tier0_attempts, prepare, max_failed_epochs_per_phase, verifier,
+                tier0_attempts, prepare, max_failed_epochs_per_phase, verifiers,
                 sleep_fn,
             )
             if result is not None:
@@ -2433,33 +2109,19 @@ def _drive(
             return _escalate(journal, store, "implement epoch requested but no repo configured")
         outcome = _dispatch_epoch(
             journal, run_dir, store, decision, repo, ladder, concurrency,
-            tier0_attempts, prepare, sleep_fn,
+            tier0_attempts, prepare, sleep_fn, verifiers,
         )
         if outcome.status == "integration_conflict":
             return _escalate(
                 journal, store, f"integration conflict in {outcome.epoch_id} (structural bug)"
             )
-        # G4: the deterministic floor cleared (no task failed) -> run the agentic
-        # verification pass over the epoch's criteria; an unmet criterion fails the
-        # epoch through the SAME failed-epoch machinery. Skipped when a task already
-        # failed (the floor is what failed, not the semantics).
-        verification = (
-            _verify_epoch(
-                journal, store, run_dir, repo, decision, outcome,
-                verifier=verifier, prepare=prepare,
-            )
-            if not _epoch_failed(outcome)
-            else None
-        )
-        if isinstance(verification, _VerificationInfraFailure):
-            # The verification TOOLING could not produce a valid verdict (G6 Part B):
-            # the floor passed and the worker is honest, so this is a verification-
-            # infrastructure escalation, NOT a worker semantic gap. Do not route it
-            # through handle_failed_epoch (that mis-blames the worker).
-            return _escalate(journal, store, verification.message)
+        # Verification is now PER TASK, inside the epoch (the task loop): each task was
+        # verified at its tier against its own criteria before it counted DONE, and a
+        # task that could not satisfy its criteria has already FAILED its ladder (and so
+        # the epoch). An epoch failure (a failed task) opens the focused disposition.
         result = _maybe_open_failed_epoch(
             journal, store, run_dir, decision, outcome, phase_ctx,
-            max_failed_epochs_per_phase, verification_gaps=verification,
+            max_failed_epochs_per_phase,
         )
         if result is not None:
             return result
@@ -2487,7 +2149,7 @@ def run_grind(
     final_polish: FinalPolish | None = None,
     prepare: PrepareConfig | None = None,
     floor: FloorConfig | None = None,
-    verifier: EpochVerifier | None = None,
+    verifiers: TaskVerifierMap | None = None,
     infra_repair: InfraRepairConfig | None = None,
     max_failed_epochs_per_phase: int = DEFAULT_MAX_FAILED_EPOCHS_PER_PHASE,
     local_max_task_files: int = DEFAULT_LOCAL_MAX_TASK_FILES,
@@ -2558,7 +2220,7 @@ def run_grind(
             prepare=prepare,
             floor=floor,
             max_failed_epochs_per_phase=max_failed_epochs_per_phase,
-            verifier=verifier,
+            verifiers=verifiers,
             infra_repair=infra_repair,
             local_max_task_files=local_max_task_files,
             senior_max_task_files=senior_max_task_files,
@@ -2566,70 +2228,6 @@ def run_grind(
     # Events are fully flushed (writer closed): render the post-mortem journal.
     write_journal(run_dir)
     return outcome
-
-
-def _resume_pending_verification(
-    journal: JournalWriter,
-    store: _RunStateStore,
-    run_dir: RunDir,
-    repo: Path | None,
-    journal_events: Sequence[object],
-    *,
-    verifier: EpochVerifier | None,
-    prepare: PrepareConfig | None,
-    cap: int,
-) -> RunOutcome | None:
-    """Re-run the G4 verification pass for a completed epoch a kill left UNVERIFIED.
-
-    Closes the loop-position hole: an epoch that persisted ``awaiting_planner`` (or was
-    finished by ``resume_epoch``) carrying ``criteria`` but whose verification did not
-    reach a terminal event is treated as verified-pass by loop position alone. Here, on
-    resume, the DURABLE ``pending_verification`` marker plus the ABSENCE of a terminal
-    verification event (Passed/Failed) for that epoch means the gate never finished -> we
-    re-run it before the next planner boundary. A verdict already produced + recorded
-    (a terminal event present) clears the marker without a re-run, so a produced verdict
-    is reused, never regenerated. Returns a terminal ``RunOutcome`` when the pass fails
-    (infra-escalation, or a gap that trips the failed-epoch cap), else ``None``."""
-
-    pending = store.state.pending_verification
-    if pending is None or verifier is None or repo is None:
-        # Nothing owes verification, or the pass is disabled / has no repo: a clean
-        # skip. Clear a stale marker so the next boundary is not blocked by it.
-        if pending is not None:
-            store.update(pending_verification=None)
-        return None
-    epoch_id = str(pending["epoch_id"])
-    phase_id = str(pending["phase_id"])
-    terminal = any(
-        isinstance(e, (EpochVerificationPassed, EpochVerificationFailed))
-        and getattr(e, "epoch_id", None) == epoch_id
-        for e in journal_events
-    )
-    if terminal:
-        # The verdict was already produced + recorded before the kill: reuse it (the
-        # failed-epoch context, if any, is durable in pending_failed_epoch). Just clear
-        # the now-redundant marker.
-        store.update(pending_verification=None)
-        return None
-    outcome_path = run_dir.resolve(f"{phase_id}/{epoch_id}/outcome.json")
-    if not outcome_path.is_file():
-        # No persisted outcome to verify against (a partial write before the kill):
-        # clear the marker and proceed, the deterministic floor already gated the epoch.
-        store.update(pending_verification=None)
-        return None
-    decision = parse_decision(pending["decision"])
-    outcome = EpochOutcome.from_dict(
-        cast(dict[str, object], json.loads(outcome_path.read_text(encoding="utf-8")))
-    )
-    verification = _verify_epoch(
-        journal, store, run_dir, repo, decision, outcome, verifier=verifier, prepare=prepare,
-    )
-    if isinstance(verification, _VerificationInfraFailure):
-        return _escalate(journal, store, verification.message)
-    return _maybe_open_failed_epoch(
-        journal, store, run_dir, decision, outcome, None, cap,
-        verification_gaps=verification,
-    )
 
 
 def resume_grind(
@@ -2647,7 +2245,7 @@ def resume_grind(
     final_polish: FinalPolish | None = None,
     prepare: PrepareConfig | None = None,
     floor: FloorConfig | None = None,
-    verifier: EpochVerifier | None = None,
+    verifiers: TaskVerifierMap | None = None,
     infra_repair: InfraRepairConfig | None = None,
     max_failed_epochs_per_phase: int = DEFAULT_MAX_FAILED_EPOCHS_PER_PHASE,
     local_max_task_files: int = DEFAULT_LOCAL_MAX_TASK_FILES,
@@ -2703,26 +2301,25 @@ def resume_grind(
                 tier0_attempts=tier0_attempts,
                 prepare=prepare,
                 sleep_fn=sleep_fn,
+                verifiers=verifiers,
             )
             _record_epoch(store, outcome, decision)
             if outcome.status == "integration_conflict":
                 result = _escalate(
                     journal, store, f"integration conflict in {outcome.epoch_id} (structural bug)"
                 )
+            elif (failed := _maybe_open_failed_epoch(
+                journal, store, run_dir, decision, outcome, None,
+                max_failed_epochs_per_phase,
+            )) is not None:
+                # A resumed in-flight task may have FAILED its ladder (incl. an
+                # unsatisfiable per-task verification): open the focused disposition so
+                # the next boundary is constrained to handle_failed_epoch, exactly as a
+                # fresh dispatch would. Verification is per task now, so there is no
+                # separate end-of-epoch re-verify on resume.
+                result = failed
             else:
                 last_epoch = outcome
-
-        # G4 resume guard: a completed epoch (this resume_epoch one, OR one persisted
-        # awaiting_planner before a kill) that carries criteria but never reached a
-        # terminal verification event is RE-VERIFIED now, so a kill can never let the
-        # semantic gate be skipped. A produced verdict (terminal event present) is reused.
-        if result is None:
-            result = _resume_pending_verification(
-                journal, store, run_dir, repo, journal_events,
-                verifier=verifier, prepare=prepare, cap=max_failed_epochs_per_phase,
-            )
-            # A re-verified epoch with a fresh semantic gap may set last_epoch's verdict
-            # in run state; the drive loop below picks the pending-failed-epoch up.
 
         if result is None:
             result = _drive(
@@ -2745,7 +2342,7 @@ def resume_grind(
                 prepare=prepare,
                 floor=floor,
                 max_failed_epochs_per_phase=max_failed_epochs_per_phase,
-                verifier=verifier,
+                verifiers=verifiers,
                 infra_repair=infra_repair,
                 local_max_task_files=local_max_task_files,
                 senior_max_task_files=senior_max_task_files,
