@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -68,15 +69,23 @@ from grindstone.repomap import WORKER_SUBTREE_TOKENS, build_repo_map
 from grindstone.rundir import RunDir
 from grindstone import worktree as wt
 from grindstone.worker import (
+    MAX_SESSION_LIMIT_WAITS,
     PI_SETTINGS_RELPATH,
     REVIEW_CHECK_COMMAND,
     REVIEW_FILENAME,
+    SESSION_LIMIT_RETRY_S,
+    RateLimited,
+    SessionLimited,
     Task,
     WorkerRequest,
     WorkerTransport,
 )
 
 TIER0_ATTEMPTS = 3
+
+#: Injected sleep so the session-limit park is testable (fake records the wait, no
+#: wall clock); defaults to the real ``time.sleep``. Mirrors run_loop's ``SleepFn``.
+SleepFn = Callable[[float], None]
 
 #: DoS sanity backstop on the ``handoff.json`` disk read (the principle's item F): a
 #: generous megabyte-scale ceiling that REJECTS (fail-safe, never truncates) an
@@ -192,12 +201,23 @@ class _AttemptFailed(Exception):
     it is persisted to a failure-detail file under the run dir and REFERENCED by
     path, never embedded in the next prompt. ``None`` means the reason IS the full
     detail (nothing larger to persist beyond the reason itself).
+
+    ``chainable`` (implement only) says whether the rejected attempt's branch is a
+    SOUND base for an incremental same-tier retry. Most rejections are chainable: a
+    failed done_when / review gate / non-DONE status leaves real, fixable work in
+    the worktree the next attempt should keep. An OUT-OF-SCOPE rejection is NOT
+    chainable: the branch committed files the task must not own, so basing the retry
+    on it would carry that pollution into the base (where the scope check can no
+    longer even see it); such a retry restarts from the clean epoch base instead.
     """
 
-    def __init__(self, reason: str, *, detail: str | None = None) -> None:
+    def __init__(
+        self, reason: str, *, detail: str | None = None, chainable: bool = True
+    ) -> None:
         super().__init__(reason)
         self.reason = reason
         self.detail = detail
+        self.chainable = chainable
 
 
 @dataclass
@@ -214,11 +234,7 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-#: Modes whose PRIMARY worker tier is ``senior`` (cloud + web tools), not local.
-#: research/review need judgment and web search (Exa via the senior script);
-#: implement/artifact are production work for the local rig. The planner stays
-#: model-agnostic, it emits a MODE; the core maps mode -> the starting tier.
-_SENIOR_FIRST_MODES: frozenset[HandoffMode] = frozenset({"research", "review"})
+#: The senior tier's name in the ladder; a ``senior`` task starts here when present.
 _SENIOR_TIER = "senior"
 
 #: Max out-of-scope paths NAMED in a rejection reason before the rest are summed
@@ -375,23 +391,26 @@ def _failure_context_entry(
 
 
 def starting_tier(
-    mode: HandoffMode, tier_names: Sequence[str], *, visual: bool = False
+    task: Task, tier_names: Sequence[str], *, force_senior: bool = False
 ) -> int:
     """Ladder index a task STARTS on (before any escalation).
 
-    research/review begin on the ``senior`` tier (web search + stronger judgment)
-    when the ladder has one; implement/artifact begin on tier 0 (the local rig).
-    ``visual`` is taste routing (B3 seam): a VISUAL/taste epoch, UI or polish
-    output, also begins on ``senior`` whatever its mode, because the senior is
-    the stronger TASTE-BUILDER (it builds work judged by how it looks). The senior
-    is a text model, not vision-capable: the genuine image-based judgment is the
-    B3 codex vision-review gate in the phase exit criterion, not this worker. A
-    rig with no senior tier falls every mode back to local, research there is repo
-    investigation only, and a visual epoch grinds locally rather than crash.
-    Escalation still walks upward from the start tier.
+    Routing is PER TASK, by whether the task needs JUDGMENT/TASTE, for ALL modes
+    uniformly. A task with ``senior=True`` (taste composition / layout / polish,
+    approach synthesis, a design-quality verdict) starts on the ``senior`` tier
+    when the ladder has one; every other task (mechanical scaffolding, factual
+    research incl. web search, a structural review) starts on tier 0 (the local
+    rig). This replaces the old wholesale "research/review always senior" + epoch
+    ``visual`` routing: research fact-gathering is local-capable (the local rig has
+    web search + fetch), only the judgment slice goes senior.
+
+    ``force_senior`` is the planner's ``handle_failed_epoch`` tier bump / escalate:
+    it starts EVERY task of the retried epoch on the senior tier regardless of its
+    own flag. A rig with no senior tier falls everything back to local rather than
+    crash. Escalation still walks upward from the start tier.
     """
 
-    if visual or mode in _SENIOR_FIRST_MODES:
+    if force_senior or task.senior:
         try:
             return tier_names.index(_SENIOR_TIER)
         except ValueError:
@@ -422,6 +441,38 @@ def _strip_pi_settings(scratch: Path) -> None:
     pi_dir = settings.parent
     if pi_dir.is_dir() and not any(pi_dir.iterdir()):
         pi_dir.rmdir()
+
+
+def _strip_orchestration_files(scratch: Path) -> None:
+    """Drop the orchestration metadata an implement worker leaves in its scratch
+    (handoff.json + check_handoff.py + review.md + ``.pi/settings.json``) so they
+    never enter a commit or trip the ownership scope check. The handoff is already
+    relocated to the log key, the validator is core-written, the review was gated
+    by the done_when re-run, and the ``.pi`` settings only pin the worker's
+    subagents, none of it is the task's repo work.
+    """
+
+    (scratch / "handoff.json").unlink(missing_ok=True)
+    (scratch / CHECK_SCRIPT_NAME).unlink(missing_ok=True)
+    (scratch / REVIEW_FILENAME).unlink(missing_ok=True)
+    _strip_pi_settings(scratch)
+
+
+def _commit_partial_for_chain(
+    repo: Path, scratch: Path, branch: str, identity: TaskIdentity
+) -> None:
+    """Commit a CHAINABLE-failed attempt's working-tree work to its branch, so the
+    next incremental same-tier retry (based on this branch) inherits it as already-
+    present files. Best-effort: a worker writes its edits to the worktree but the
+    core only commits on success, so a failed attempt's work lives only in the
+    working tree, which the subsequent ``remove_worktree`` would destroy. Committing
+    it here persists it on the branch (the chain base) WITHOUT integrating it, the
+    final successful attempt is still scope-checked against the EPOCH base, so nothing
+    bypasses the gate. Orchestration metadata is stripped first (same as success).
+    """
+
+    _strip_orchestration_files(scratch)
+    wt.commit_all(scratch, f"grind-wip({identity.fq}): partial attempt kept for retry")
 
 
 def _grounding_violations(
@@ -683,13 +734,22 @@ def _dispatch_attempt(
     scratch: Path,
     branch: str | None,
     prepare: PrepareConfig | None,
+    epoch_base: str | None = None,
+    prior_work_present: bool = False,
 ) -> Handoff:
     """Run one attempt end-to-end; raise ``_AttemptFailed`` on any failure.
 
-    For implement tasks the scratch is a fresh worktree from ``base``; on the
-    handoff's success the core commits and scope-checks the diff. Any failure,
-    transport, handoff, or out-of-scope write, maps identically to a failed
-    attempt (ARCHITECTURE.md: the loop never inspects worker internals).
+    For implement tasks the scratch is a worktree from ``base`` (the WORKTREE base:
+    the epoch base for a first/escalated attempt, the prior attempt's branch for an
+    incremental same-tier retry). On the handoff's success the core commits and
+    scope-checks the diff. The scope check runs against ``epoch_base`` (defaulting to
+    ``base``), NOT the worktree base, so an out-of-scope write committed by ANY
+    attempt in the incremental chain is still caught (the chain base would otherwise
+    hide an earlier attempt's pollution inside the base). Any failure, transport,
+    handoff, or out-of-scope write, maps identically to a failed attempt
+    (ARCHITECTURE.md: the loop never inspects worker internals). ``prior_work_present``
+    (an incremental same-tier retry: ``base`` is the prior attempt's branch) is passed
+    to the worker so its prompt says the prior work is already in the CWD.
     """
 
     implement = isinstance(task, ImplementTask)
@@ -719,10 +779,19 @@ def _dispatch_attempt(
         mode=mode,
         repo_map=_worker_subtree(repo, task),
         domain_skills=_load_domain_skills(repo, task),
+        prior_work_present=prior_work_present,
     )
     try:
         worker.run(request)
-    except Exception as exc:  # transport boundary, any raise is a failed attempt
+    except RateLimited:
+        # A rate/session limit is NOT a burned attempt: it is the SAME work
+        # blocked on a quota window, not a failure of the work. Let it ESCAPE the
+        # transport boundary so the ladder driver can park-and-retry the same
+        # attempt without charging the attempt/tier ladder (a SessionLimited is a
+        # RateLimited subclass, so this catches both; the driver parks the hourly
+        # session limit and surfaces any other RateLimited as a failed attempt).
+        raise
+    except Exception as exc:  # transport boundary, any other raise is a failed attempt
         raise _AttemptFailed(f"transport error: {type(exc).__name__}: {exc}") from exc
     handoff = _collect_handoff(request, task, mode, run_dir, identity, repo)
 
@@ -751,26 +820,20 @@ def _dispatch_attempt(
 
     if implement:
         assert repo is not None and base is not None and isinstance(task, ImplementTask)
-        # handoff.json + check_handoff.py + review.md + .pi/settings.json are
-        # orchestration metadata (the handoff is already relocated to the log
-        # key; the validator is core-written; the review was gated by the
-        # done_when re-run above; the .pi settings only pin the worker's
-        # subagents), not the task's repo work, drop the scratch copies so they
-        # never enter the commit or trip the ownership scope check.
-        (scratch / "handoff.json").unlink(missing_ok=True)
-        (scratch / CHECK_SCRIPT_NAME).unlink(missing_ok=True)
-        (scratch / REVIEW_FILENAME).unlink(missing_ok=True)
-        _strip_pi_settings(scratch)
-        committed = wt.commit_all(
+        _strip_orchestration_files(scratch)
+        wt.commit_all(
             scratch, f"grind({identity.fq}): {task.goal.splitlines()[0][:72]}"
         )
         # Floor core invariant (gate-rebalance): an implement task claiming DONE
-        # must actually LAND committed work on its branch. A zero-diff commit means
-        # the worker wrote nothing to the owned files (only metadata, or a no-op)
-        # yet handed off DONE, the handoff re-validation + a trivially-true
-        # done_when would otherwise pass it while the integration merges nothing.
-        # Reject it as a failed attempt so the planner sees the gap.
-        if not committed:
+        # must actually LAND committed work on its branch, measured against the EPOCH
+        # base (not the chained worktree base, which may already carry a prior
+        # attempt's commits). An empty epoch_base..HEAD diff means the whole chain
+        # changed nothing in the owned files (only metadata, or a no-op) yet handed
+        # off DONE, the handoff re-validation + a trivially-true done_when would
+        # otherwise pass it while integration merges nothing. Reject it.
+        landed_base = epoch_base if epoch_base is not None else base
+        assert landed_base is not None
+        if not wt.changed_paths(scratch, landed_base):
             raise _AttemptFailed(
                 "no committed work: the implement task handed off DONE but left a "
                 "zero-diff branch (nothing changed in its file_ownership)"
@@ -784,15 +847,90 @@ def _dispatch_attempt(
         # They are NOT authored work, so the declared dep dirs are exempt from the
         # scope check; an undeclared write outside ownership is still a violation.
         dep_dirs = list(prepare.env_dirs) if prepare is not None else None
+        # Scope-check against the EPOCH base, not the (possibly chained) worktree
+        # base: a chained retry's base is the prior attempt's branch, so diffing
+        # against it would hide any out-of-scope file an earlier attempt committed.
+        scope_base = epoch_base if epoch_base is not None else base
         out_of_scope = wt.scope_violations(
-            wt.changed_paths(scratch, base), list(task.file_ownership), dep_dirs
+            wt.changed_paths(scratch, scope_base), list(task.file_ownership), dep_dirs
         )
         if out_of_scope:
             raise _AttemptFailed(
                 _format_scope_violations(out_of_scope),
                 detail=_full_scope_violations(out_of_scope),
+                chainable=False,
             )
     return handoff
+
+
+def _dispatch_session_aware(
+    *,
+    identity: TaskIdentity,
+    task: Task,
+    mode: HandoffMode,
+    run_dir: RunDir,
+    worker: WorkerTransport,
+    cursor: _Cursor,
+    repo: Path | None,
+    base: str | None,
+    scratch: Path,
+    branch: str | None,
+    prepare: PrepareConfig | None,
+    implement: bool,
+    sleep_fn: SleepFn,
+    epoch_base: str | None = None,
+    prior_work_present: bool = False,
+) -> Handoff:
+    """Run one attempt, PARKING (not burning) on a long session limit.
+
+    A ``SessionLimited`` (the claude/codex/opencode-go quota-window limit, which
+    resets in HOURS) raised by the worker transport is NOT a failed attempt: it is
+    the SAME work blocked on a window, so we sleep ``SESSION_LIMIT_RETRY_S`` via the
+    injected ``sleep_fn`` and re-run the SAME attempt, WITHOUT charging the
+    attempt/tier ladder, bounded by ``MAX_SESSION_LIMIT_WAITS`` (then it surfaces as
+    a failed attempt rather than hanging forever). For an implement task the partial
+    worktree must be discarded between tries because ``_dispatch_attempt`` re-adds it.
+
+    Any OTHER ``RateLimited`` (a transient 429 the worker transport surfaced) is
+    converted to a normal failed attempt here, EXACTLY preserving the pre-fix
+    behavior (the worker path has no short-backoff concept); only the long session
+    limit gets the hourly park. Every non-limit failure keeps its existing
+    ``_AttemptFailed`` mapping (raised inside ``_dispatch_attempt``)."""
+
+    waits = 0
+    while True:
+        try:
+            return _dispatch_attempt(
+                identity=identity,
+                task=task,
+                mode=mode,
+                run_dir=run_dir,
+                worker=worker,
+                cursor=cursor,
+                repo=repo,
+                base=base,
+                scratch=scratch,
+                branch=branch,
+                prepare=prepare,
+                epoch_base=epoch_base,
+                prior_work_present=prior_work_present,
+            )
+        except SessionLimited as exc:
+            if waits >= MAX_SESSION_LIMIT_WAITS:
+                raise _AttemptFailed(
+                    f"session limit: {MAX_SESSION_LIMIT_WAITS} hourly waits exhausted: {exc}"
+                ) from exc
+            waits += 1
+            # Discard the partial worktree the failed try created so the next
+            # try's add_worktree is clean (no-op for non-implement scratch).
+            if implement and repo is not None and branch is not None:
+                wt.discard_attempt(repo, scratch, branch)
+            sleep_fn(SESSION_LIMIT_RETRY_S)
+            continue
+        except RateLimited as exc:
+            # A transient 429 the worker surfaced: no short-backoff concept on the
+            # worker path, so it stays a failed attempt (the prior behavior).
+            raise _AttemptFailed(f"transport error: {type(exc).__name__}: {exc}") from exc
 
 
 def _grind(
@@ -809,8 +947,9 @@ def _grind(
     base: str | None,
     tier0_attempts: int,
     first_attempt_already_dispatched: bool,
-    visual: bool,
+    force_senior: bool,
     prepare: PrepareConfig | None,
+    sleep_fn: SleepFn,
 ) -> TaskOutcome:
     """Drive the ladder from ``cursor`` to a terminal outcome.
 
@@ -822,7 +961,21 @@ def _grind(
 
     implement = isinstance(task, ImplementTask)
     dispatched = first_attempt_already_dispatched
-    start_tier = starting_tier(mode, [name for name, _ in ladder], visual=visual)
+    start_tier = starting_tier(
+        task, [name for name, _ in ladder], force_senior=force_senior
+    )
+
+    # Incremental-retry chain (implement only). A same-tier, non-escalation RETRY
+    # bases its worktree on the PRIOR attempt's branch so the prior attempt's work
+    # is PRESENT in the new CWD (the worker may fix it incrementally or reset and
+    # redo). ``chain_base`` holds that branch (None -> base the next attempt on the
+    # fresh epoch base). The failed branch is kept (worktree torn down, branch left)
+    # until the next attempt has been based on it, then it is deleted as superseded;
+    # a tier escalation starts clean from the epoch base (a higher tier should not
+    # inherit a lower tier's partial work). ``stale_branch`` is the kept failed
+    # branch awaiting deletion once it is superseded (or at the terminal).
+    chain_base: str | None = None
+    stale_branch: str | None = None
 
     def write_cursor(
         status: Literal["running", "done", "failed"],
@@ -858,6 +1011,10 @@ def _grind(
             cursor.attempt += 1
             scratch = _scratch_for(identity, run_dir, cursor.attempt, implement=implement)
             branch = identity.attempt_branch(cursor.attempt) if implement else None
+            # Incremental retry: a same-tier retry (chain_base set) bases on the
+            # prior attempt's branch so its work is present; otherwise (first
+            # attempt or a freshly-escalated tier) base on the epoch base.
+            attempt_base = chain_base if chain_base is not None else base
             write_cursor(
                 "running",
                 tier_index=cursor.tier_index,
@@ -885,7 +1042,7 @@ def _grind(
                     )
                 )
             try:
-                handoff = _dispatch_attempt(
+                handoff = _dispatch_session_aware(
                     identity=identity,
                     task=task,
                     mode=mode,
@@ -893,10 +1050,14 @@ def _grind(
                     worker=worker,
                     cursor=cursor,
                     repo=repo,
-                    base=base,
+                    base=attempt_base,
                     scratch=scratch,
                     branch=branch,
                     prepare=prepare,
+                    implement=implement,
+                    sleep_fn=sleep_fn,
+                    epoch_base=base,
+                    prior_work_present=implement and chain_base is not None,
                 )
             except _AttemptFailed as failure:
                 # Reference-not-embed: the FULL failure detail is persisted to a
@@ -913,7 +1074,32 @@ def _grind(
                     )
                 )
                 if implement and repo is not None and branch is not None:
-                    wt.discard_attempt(repo, scratch, branch)
+                    if failure.chainable:
+                        # Incremental retry: COMMIT this attempt's partial work to its
+                        # branch (the core only commits on success, so otherwise the
+                        # work lives only in the worktree we are about to remove), then
+                        # tear down the worktree checkout but KEEP the branch so the next
+                        # same-tier retry bases on it and inherits that work. The branch
+                        # this attempt was based on (``stale_branch``) is now its
+                        # ancestor, fully superseded, so delete it. The kept branch
+                        # becomes the new chain base + stale branch (deleted once the
+                        # NEXT attempt supersedes it, on escalation, or at the terminal).
+                        _commit_partial_for_chain(repo, scratch, branch, identity)
+                        wt.remove_worktree(repo, scratch)
+                        if stale_branch is not None and stale_branch != branch:
+                            wt.delete_branch(repo, stale_branch)
+                        chain_base = branch
+                        stale_branch = branch
+                    else:
+                        # A non-chainable rejection (out-of-scope writes): the branch
+                        # is poisoned, so discard it entirely and drop the chain, the
+                        # next retry restarts from the clean epoch base. Any kept prior
+                        # branch is dropped too (the worker is starting over).
+                        wt.discard_attempt(repo, scratch, branch)
+                        if stale_branch is not None and stale_branch != branch:
+                            wt.delete_branch(repo, stale_branch)
+                        chain_base = None
+                        stale_branch = None
                 reason = failure.reason
                 journal.emit(
                     lambda s: HandoffRejected(
@@ -925,6 +1111,13 @@ def _grind(
                     )
                 )
                 continue
+            # Success: the winning branch is based on the incremental chain, so any
+            # kept prior-attempt branch is now its ancestor and fully superseded.
+            # Delete it so a rejected attempt leaves nothing (ruling 4); the winning
+            # branch is kept for integration.
+            if implement and repo is not None and stale_branch is not None and stale_branch != branch:
+                wt.delete_branch(repo, stale_branch)
+            stale_branch = None
             journal.emit(
                 lambda s: TaskDone(
                     seq=s, ts=_now(), epoch_id=identity.epoch_id, task_id=identity.task_id
@@ -950,7 +1143,13 @@ def _grind(
                 reason=None,
             )
 
-        # Tier exhausted; climb if a higher rung exists.
+        # Tier exhausted; climb if a higher rung exists. A higher tier starts CLEAN
+        # from the epoch base, never inheriting the lower tier's partial work, so the
+        # incremental chain is reset and the kept lower-tier branch is deleted.
+        if implement and repo is not None and stale_branch is not None:
+            wt.delete_branch(repo, stale_branch)
+        chain_base = None
+        stale_branch = None
         if cursor.tier_index + 1 < len(ladder):
             next_tier = ladder[cursor.tier_index + 1][0]
             cursor.tier_index += 1
@@ -1007,9 +1206,10 @@ def run_task(
     base: str | None = None,
     tier0_attempts: int = TIER0_ATTEMPTS,
     resume_cursor: TaskCursorState | None = None,
-    visual: bool = False,
+    force_senior: bool = False,
     prepare: PrepareConfig | None = None,
     epoch_hint: str | None = None,
+    sleep_fn: SleepFn = time.sleep,
 ) -> TaskOutcome:
     """Grind ONE task to terminal against a shared journal (fan-out unit).
 
@@ -1042,7 +1242,9 @@ def run_task(
             sink=sink,
             ladder=ladder,
             cursor=_Cursor(
-                tier_index=starting_tier(mode, [n for n, _ in ladder], visual=visual),
+                tier_index=starting_tier(
+                    task, [n for n, _ in ladder], force_senior=force_senior
+                ),
                 tier_attempt=0,
                 attempt=0,
                 failure_context=(
@@ -1053,8 +1255,9 @@ def run_task(
             base=base,
             tier0_attempts=tier0_attempts,
             first_attempt_already_dispatched=False,
-            visual=visual,
+            force_senior=force_senior,
             prepare=prepare,
+            sleep_fn=sleep_fn,
         )
 
     # Resume: burn the in-flight attempt.
@@ -1089,6 +1292,7 @@ def run_task(
         base=base,
         tier0_attempts=tier0_attempts,
         first_attempt_already_dispatched=True,
-        visual=visual,
+        force_senior=force_senior,
         prepare=prepare,
+        sleep_fn=sleep_fn,
     )

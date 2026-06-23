@@ -1,7 +1,7 @@
 """Script-backed vision reviewer: the B3 taste gate behind a file contract.
 
 A ``vision_review`` check (``contracts.models.VisionReviewCheck``) is the codex
-VISION REVIEW layered on a visual epoch's deterministic functional floor. Like
+VISION REVIEW layered on a UI phase's deterministic functional floor. Like
 every other model boundary, grindstone reaches it through a request **script**
 (``models/vision_review.sh``) and never learns the transport (codex) behind it:
 the script runs ``codex exec -i <screenshot> --output-schema <verdict> -o <out>``

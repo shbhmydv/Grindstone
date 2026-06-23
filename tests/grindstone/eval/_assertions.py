@@ -140,8 +140,8 @@ def assert_every_implement_task_within(decision: EpochDecision, max_files: int) 
     """Assert every task of an implement epoch is within the file-count cap.
 
     Reuses the production size oracle (``implement_task_size_violations``), so the
-    band is exactly the gate's: a task over ``max_files`` globs, or one claiming
-    whole-repo ownership, fails. A non-implement decision passes vacuously (the
+    band is exactly the gate's: a task over ``max_files`` concrete files, or one
+    carrying a broad glob, fails. A non-implement decision passes vacuously (the
     cap is implement-only)."""
 
     if not isinstance(decision, ImplementDecision):
@@ -150,6 +150,50 @@ def assert_every_implement_task_within(decision: EpochDecision, max_files: int) 
         list(decision.args.tasks), max_files=max_files
     )
     assert not violations, f"implement task(s) over the size cap: {violations}"
+
+
+def assert_decomposed_into_at_least(decision: EpochDecision, n: int) -> None:
+    """Assert a work epoch fans out into at least ``n`` tasks (it decomposed)."""
+
+    count = task_count(decision)
+    assert count >= n, f"expected >= {n} tasks (decomposed), got {count}"
+
+
+def assert_ownership_enumerated(decision: EpochDecision) -> None:
+    """Assert every implement task enumerates CONCRETE files (no wildcard globs).
+
+    Reuses the production wildcard rule via ``implement_task_size_violations`` with a
+    generous cap, so any broad-glob entry surfaces as a violation. A non-implement
+    decision passes vacuously (only implement tasks carry ``file_ownership``)."""
+
+    if not isinstance(decision, ImplementDecision):
+        return
+    # A high cap isolates the broad-glob rejection from the count rejection: any
+    # violation that remains is a wildcard entry, exactly the enumerated-files rule.
+    violations = implement_task_size_violations(
+        list(decision.args.tasks), max_files=1000
+    )
+    assert not violations, f"implement task(s) carry a broad glob: {violations}"
+
+
+def assert_tier_mix(decision: EpochDecision, *, min_local: int = 1, min_senior: int = 1) -> None:
+    """Assert a work epoch mixes tiers: at least ``min_local`` tasks with
+    ``senior=False`` AND at least ``min_senior`` with ``senior=True``.
+
+    The property the routing principle wants from a decomposable mechanical+taste
+    epoch: a local mechanical slice AND a senior judgment/taste slice, so the senior
+    quota is spent only where it is needed."""
+
+    args = decision.args
+    tasks = getattr(args, "tasks", None)
+    if tasks is None:
+        raise TypeError(f"tier_mix is only defined for work epochs, got {decision.tool!r}")
+    local = sum(1 for t in tasks if not t.senior)
+    senior = sum(1 for t in tasks if t.senior)
+    assert local >= min_local and senior >= min_senior, (
+        f"expected >= {min_local} local + >= {min_senior} senior tasks, "
+        f"got {local} local + {senior} senior"
+    )
 
 
 # --- handoff oracles (the worker-boundary analogue of the decision oracles) ----

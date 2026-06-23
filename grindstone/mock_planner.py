@@ -9,9 +9,10 @@ failure sequence with zero randomness. An entry is either:
   - a failure token from ``FAILURES``, raising the matching transport exception
     or returning malformed text.
 
-Failure taxonomy (the planner analogue of the worker's): ``rate_limit`` →
-backoff, ``transient`` / ``timeout`` → retry, ``hard`` → human, ``bad_json`` /
-``empty`` / ``invalid`` → un-gateable output the core re-asks on.
+Failure taxonomy (the planner analogue of the worker's): ``session_limit`` →
+hourly park (the long quota-window limit), ``rate_limit`` → backoff, ``transient``
+/ ``timeout`` → retry, ``hard`` → human, ``bad_json`` / ``empty`` / ``invalid`` →
+un-gateable output the core re-asks on.
 """
 
 from __future__ import annotations
@@ -21,7 +22,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Union
 
-from grindstone.planner import PlannerHardError, RateLimited, TransportError, WorkerTimeout
+from grindstone.planner import (
+    PlannerHardError,
+    RateLimited,
+    SessionLimited,
+    TransportError,
+    WorkerTimeout,
+)
 
 
 #: An ``invalid`` token returns valid JSON that fails the decision gate (an
@@ -57,6 +64,8 @@ class MockPlanner:
         return self._render(entry)
 
     def _failure(self, token: str) -> str:
+        if token == "session_limit":
+            raise SessionLimited("mock planner session limit . resets 2:20am")
         if token == "rate_limit":
             raise RateLimited("mock planner 429")
         if token == "transient":

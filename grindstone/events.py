@@ -102,7 +102,7 @@ class PlannerCallSucceeded(_Event):
 
 class PlannerCallFailed(_Event):
     event: Literal["planner_call_failed"] = "planner_call_failed"
-    classification: Literal["rate_limit", "transient", "hard"]
+    classification: Literal["rate_limit", "transient", "hard", "session_limit"]
 
 
 class SkeletonProposed(_Event):

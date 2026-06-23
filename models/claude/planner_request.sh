@@ -117,6 +117,13 @@ cat "$err_tmp" >&2 || true
 
 if [[ "$rc" -ne 0 ]]; then
   echo "planner_request: claude exited $rc (repo=$repo)" >&2
+  # The claude CLI prints a rate/429/session/usage limit to its STDOUT, which we
+  # redirected to "$out" (the agent log), NOT to this script's stderr. Grindstone's
+  # transport classifies on the script's stdout+stderr, so surface any limit
+  # signature from "$out" to stderr here so the transport raises RateLimited /
+  # SessionLimited (and PARKS) instead of misreading a long limit as a transient
+  # transport error and burning the retry budget.
+  grep -hiE 'rate.?limit|429|session limit|usage limit' "$out" 2>/dev/null | head -3 >&2 || true
   exit "$rc"
 fi
 exit 0

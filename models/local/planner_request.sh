@@ -127,6 +127,12 @@ cat "$err_tmp" >&2 || true
 
 if [[ "$rc" -ne 0 ]]; then
   echo "planner_request: pi exited $rc (provider=$provider model=$model repo=$repo)" >&2
+  # A rate/429/session/usage limit can land on the model's STDOUT (-> "$out", the
+  # agent log), not stderr. Grindstone classifies on the script's stdout+stderr, so
+  # surface any limit signature from "$out" to stderr here so the transport raises
+  # RateLimited / SessionLimited (and PARKS) rather than misreading a long limit as
+  # a transient transport error and burning the retry budget.
+  grep -hiE 'rate.?limit|429|session limit|usage limit' "$out" 2>/dev/null | head -3 >&2 || true
   exit "$rc"
 fi
 exit 0

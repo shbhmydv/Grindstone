@@ -194,3 +194,37 @@ def test_scenario_selector_covers_three_states() -> None:
         A.assert_scenario_selected(
             skeleton_exists=False, failed_epoch_active=False, expected="plan_epoch"
         )
+
+
+# --- decomposition + tier-mix oracles (per-task senior routing) ----------------
+
+
+def _senior_impl(tid: str, *files: str) -> dict[str, object]:
+    return {**_impl_task(tid, *files), "senior": True}
+
+
+def test_assert_decomposed_into_at_least() -> None:
+    multi = _decision(implement_decision(
+        _impl_task("T1", "a.py"), _impl_task("T2", "b.py")
+    ))
+    A.assert_decomposed_into_at_least(multi, 2)
+    with pytest.raises(AssertionError):
+        A.assert_decomposed_into_at_least(multi, 3)
+
+
+def test_assert_ownership_enumerated() -> None:
+    ok = _decision(implement_decision(_impl_task("T1", "src/a.ts", "src/b.ts")))
+    A.assert_ownership_enumerated(ok)  # concrete files: passes
+    broad = _decision(implement_decision(_impl_task("T1", "src/**")))
+    with pytest.raises(AssertionError):
+        A.assert_ownership_enumerated(broad)
+
+
+def test_assert_tier_mix() -> None:
+    mixed = _decision(implement_decision(
+        _impl_task("T1", "a.py"), _senior_impl("T2", "b.py")
+    ))
+    A.assert_tier_mix(mixed, min_local=1, min_senior=1)
+    all_local = _decision(implement_decision(_impl_task("T1", "a.py")))
+    with pytest.raises(AssertionError):
+        A.assert_tier_mix(all_local, min_local=1, min_senior=1)

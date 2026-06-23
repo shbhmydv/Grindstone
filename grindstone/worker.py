@@ -55,11 +55,64 @@ class TransportError(Exception):
 
 
 class RateLimited(TransportError):
-    """The model endpoint refused the call for rate-limit reasons."""
+    """The model endpoint refused the call for rate-limit reasons.
+
+    The SHORT, transient kind: a throttle (429) that clears within seconds to
+    minutes, handled by a short exponential backoff. Distinct from a
+    ``SessionLimited`` quota-window exhaustion (see below), which resets in hours.
+    """
+
+
+class SessionLimited(RateLimited):
+    """A long quota-window SESSION limit, not a transient throttle.
+
+    The Claude / codex / opencode-go "session limit" (e.g. claude's "You've hit
+    your session limit . resets 2:20am") is a usage WINDOW that resets in HOURS,
+    fundamentally different from a 429 throttle that clears in seconds. It must
+    PARK the run and retry hourly WITHOUT counting against the transient-retry or
+    rate-limit-wait budgets. Subclassing ``RateLimited`` keeps every existing
+    ``except RateLimited`` catching it; the policy layer distinguishes the two via
+    ``isinstance`` and ``classify_failure``.
+    """
 
 
 class WorkerTimeout(TransportError):
     """The worker hung and was killed by its own transport-level supervisor."""
+
+
+#: Signatures of a long quota-window SESSION limit in a CLI's stdout/stderr. A
+#: module-level constant so both transports (planner + worker) detect identically,
+#: and extensible: add codex / opencode-go wording here as it is observed. NOTE the
+#: phrasing differs from a transient 429: a plain "rate limit (429)" must NOT match
+#: any of these (it stays on the short-backoff ``RateLimited`` path).
+_SESSION_LIMIT_SIGNATURES: tuple[str, ...] = ("session limit", "usage limit")
+
+
+#: The HOURLY session-limit park policy, shared by BOTH retry paths (the planner
+#: loop in run_loop and the worker/senior attempt driver in task_loop). A long
+#: quota-window limit resets in hours, so we retry once an hour (never against the
+#: transient/rate-limit/attempt budgets), bounded by a high finite ceiling so a
+#: stuck window escalates rather than hanging forever. Defined here (next to
+#: ``SessionLimited``) so task_loop can import them without the planner-import cycle
+#: (planner -> epoch_loop -> task_loop); ``planner`` re-exports them for its callers.
+SESSION_LIMIT_RETRY_S = 3600.0
+MAX_SESSION_LIMIT_WAITS = 24
+
+
+def is_session_limit(text: str) -> bool:
+    """True iff ``text`` carries a long quota-window SESSION-limit signature.
+
+    Matches any of ``_SESSION_LIMIT_SIGNATURES`` ("session limit", "usage limit"),
+    plus the claude phrasing where a "limit" "resets" at a wall-clock time
+    (e.g. "resets 2:20am"). Case-insensitive. A plain transient "rate limit (429)"
+    deliberately does NOT match: that stays on the short-backoff ``RateLimited``
+    path; only the session/usage window goes to the hourly ``SessionLimited`` path.
+    """
+
+    blob = (text or "").lower()
+    if any(sig in blob for sig in _SESSION_LIMIT_SIGNATURES):
+        return True
+    return "limit" in blob and "resets" in blob
 
 
 @dataclass(frozen=True)
@@ -109,6 +162,12 @@ class WorkerRequest:
     #: transport unchanged, the prompt builder branches to
     #: ``build_verification_prompt``. ``None`` for every ordinary task.
     verification: "VerificationBrief | None" = None
+    #: Incremental retry (implement tasks): True when this attempt's worktree was
+    #: based on a PRIOR attempt's branch, so the prior attempt's work is already
+    #: present in ``scratch``. The prompt tells the worker it may fix that work in
+    #: place OR reset and redo if it judges the prior attempt bad. False for a first
+    #: attempt and for a clean tier-escalation start (a fresh worktree from base).
+    prior_work_present: bool = False
 
 
 @dataclass(frozen=True)
@@ -345,6 +404,16 @@ def build_worker_prompt(request: WorkerRequest) -> str:
             f"exhaustive; verify against the actual files.\n{request.repo_map}\n"
             "</repo_map>\n"
         )
+    prior_work_block = ""
+    if request.prior_work_present:
+        prior_work_block = (
+            "\n<prior_work>\nA PRIOR attempt at this task left its work IN PLACE in "
+            "this working directory (the files it created or edited are already "
+            "here). Build on it: fix what the <prior_failures> below report and "
+            "complete what is unfinished, rather than starting from scratch. If you "
+            "judge the prior attempt's approach wrong, you MAY reset and redo it, but "
+            "do not lose correct work for no reason.\n</prior_work>\n"
+        )
     return f"""<task id="{request.task_id}">
 {task.goal}
 </task>
@@ -357,7 +426,7 @@ def build_worker_prompt(request: WorkerRequest) -> str:
 These deterministic checks will be re-run by the orchestrator. They MUST pass:
 {_render_checks(request)}
 </done_when>
-{plan_block}{domain_skills_block}{context_block}
+{plan_block}{domain_skills_block}{prior_work_block}{context_block}
 <stop_rule>
 If the done_when checks cannot be satisfied in THIS verification environment (a
 required tool/dependency is missing, or the task as specified is not achievable

@@ -4,7 +4,10 @@ The role-split boundary: grindstone knows only a *role* name
 (`worker` / `senior`) reached through a script. It never learns the transport
 (`pi` / cloud) or the model behind the role, the script owns transport, model
 identity, GPU arbitration, the pin file (``.pi/settings.json``) and the killable
-process group. ``ScriptWorker`` builds the prompt (orchestration: *what* to ask,
+process group. On a non-zero exit it inspects BOTH stdout and stderr (the claude
+CLI prints its session limit to STDOUT): a session/usage limit -> ``SessionLimited``
+(hourly park), a 429 -> ``RateLimited`` (short backoff), else ``TransportError``.
+``ScriptWorker`` builds the prompt (orchestration: *what* to ask,
 ``build_worker_prompt`` in core), Popen's the script as a group leader, supervises
 wall-clock, and on timeout delegates the kill to ``stop.sh`` (the v7 kill-group
 scar, now in models/). The disk is the only result channel (ARCHITECTURE.md): on success
@@ -25,10 +28,12 @@ from pathlib import Path
 
 from grindstone.worker import (
     RateLimited,
+    SessionLimited,
     TransportError,
     WorkerRequest,
     WorkerTimeout,
     build_worker_prompt,
+    is_session_limit,
 )
 
 
@@ -99,20 +104,31 @@ class ScriptWorker:
             start_new_session=True,
         )
         try:
-            _, stderr = proc.communicate(timeout=self.timeout_s)
+            stdout, stderr = proc.communicate(timeout=self.timeout_s)
         except subprocess.TimeoutExpired as exc:
             self._stop(handle_file, proc)
             raise WorkerTimeout(
                 f"{self.script.name} timed out after {self.timeout_s}s"
             ) from exc
         if proc.returncode != 0:
-            blob = (stderr or "").lower()
+            # Inspect BOTH streams: the claude CLI prints its session limit to
+            # STDOUT, so a stderr-only check missed it and burned the task retry
+            # ladder against a multi-hour limit. ORDER: the long quota-window
+            # session/usage limit is detected FIRST (-> SessionLimited -> hourly
+            # park, never an attempt burn); only a plain 429 is RateLimited.
+            combined = f"{stdout or ''}\n{stderr or ''}"
+            blob = combined.lower()
+            snippet = (stderr.strip() or stdout.strip())[:200]
+            if is_session_limit(combined):
+                raise SessionLimited(
+                    f"{self.script.name} session-limited: {snippet}"
+                )
             if "rate" in blob and "limit" in blob or "429" in blob:
                 raise RateLimited(
-                    f"{self.script.name} rate-limited: {stderr.strip()[:200]}"
+                    f"{self.script.name} rate-limited: {snippet}"
                 )
             raise TransportError(
-                f"{self.script.name} exited {proc.returncode}: {stderr.strip()[:200]}"
+                f"{self.script.name} exited {proc.returncode}: {snippet}"
             )
         # Success: the loop reads handoff.json from request.scratch. Stdout is
         # never parsed for results (disk contract).

@@ -25,7 +25,7 @@ from grindstone.epoch_loop import EpochOutcome, EpochState
 from grindstone.events import RunStarted, read_events, replay
 from grindstone.mock_worker import MockWorker
 from grindstone.rundir import RunDir, create_run_dir
-from grindstone.worker import WorkerRequest, WorkerTransport
+from grindstone.worker import SessionLimited, WorkerRequest, WorkerTransport
 
 from grindstone.worker import PI_SETTINGS_RELPATH
 
@@ -169,6 +169,47 @@ def test_each_failure_behavior_is_a_rejected_attempt(
     outcome = _run_impl(git_repo, run_dir, toy_task, _ladder(worker))
     assert outcome.tasks[0].status == "done"
     assert outcome.tasks[0].attempts == 2
+    rejected = [e for e in read_events(run_dir.events_path) if e.event == "handoff_rejected"]
+    assert len(rejected) == 1
+
+
+# --- session-limit hourly park (not a burned attempt) --------------------------
+
+
+def test_session_limit_parks_then_retries_same_attempt(
+    git_repo: Path, run_dir: RunDir, toy_task: ImplementTask
+) -> None:
+    # A long session limit on the worker path must PARK (sleep 3600s) and retry
+    # the SAME attempt, NOT burn the attempt/tier ladder: the worker hits a session
+    # limit twice, then succeeds, and the task is done on attempt 1 with zero
+    # rejected attempts (the park is not a handoff_rejected).
+    recorded: list[float] = []
+    worker = MockWorker(
+        script=["session_limit", "session_limit", "ok"],
+        artifacts={OUT_FILE: OUT_CONTENT},
+    )
+    outcome = _run_impl(
+        git_repo, run_dir, toy_task, _ladder(worker), sleep_fn=recorded.append
+    )
+    assert outcome.tasks[0].status == "done"
+    assert outcome.tasks[0].attempts == 1  # the ladder was NOT charged
+    assert recorded == [3600.0, 3600.0]  # two hourly parks, no wall clock
+    kinds = [e.event for e in read_events(run_dir.events_path)]
+    assert kinds.count("handoff_rejected") == 0  # a park is never a rejected attempt
+    assert kinds.count("task_retried") == 0
+    assert kinds.count("task_done") == 1
+
+
+def test_non_limit_failure_path_is_unchanged(
+    git_repo: Path, run_dir: RunDir, toy_task: ImplementTask
+) -> None:
+    # Regression guard: a NON-session failure (a transient 429 the worker surfaces
+    # as RateLimited, or a bad handoff) keeps its existing burned-attempt behavior,
+    # the park only catches the long session limit.
+    worker = MockWorker(script=["rate_limit", "ok"], artifacts={OUT_FILE: OUT_CONTENT})
+    outcome = _run_impl(git_repo, run_dir, toy_task, _ladder(worker))
+    assert outcome.tasks[0].status == "done"
+    assert outcome.tasks[0].attempts == 2  # the 429 burned one attempt (unchanged)
     rejected = [e for e in read_events(run_dir.events_path) if e.event == "handoff_rejected"]
     assert len(rejected) == 1
 
@@ -464,7 +505,41 @@ def test_artifact_out_with_subdir_published_from_full_path(
     assert run_dir.resolve("MIGRATION/inv.md").is_file()
 
 
-# --- mode -> tier routing (research/review start on senior; web search) --------
+# --- starting_tier: pure per-task routing unit ---------------------------------
+
+
+def test_starting_tier_routes_on_per_task_senior_flag() -> None:
+    from grindstone.task_loop import starting_tier
+
+    tiers = ["worker", "senior"]
+
+    def impl(senior: bool) -> ImplementTask:
+        return ImplementTask(
+            id="T1", goal="g", done_when=[CmdCheck(cmd="true")],
+            file_ownership=["f.txt"], senior=senior,
+        )
+
+    def art(senior: bool) -> ArtifactTask:
+        return ArtifactTask(
+            id="T1", goal="g", done_when=[CmdCheck(cmd="true")],
+            artifact_out="o.md", senior=senior,
+        )
+
+    # senior:true -> senior (index 1) for every shape; senior:false -> local (0).
+    for make in (impl, art):
+        assert starting_tier(make(True), tiers) == 1
+        assert starting_tier(make(False), tiers) == 0
+    # research/review tasks are NOT wholesale senior anymore: a plain artifact task
+    # (the shape research/review dispatch) defaults local.
+    assert starting_tier(art(False), tiers) == 0
+    # force_senior overrides a local flag (the handle_failed_epoch tier bump).
+    assert starting_tier(impl(False), tiers, force_senior=True) == 1
+    # No senior tier in the ladder -> everything falls back to local (no crash).
+    assert starting_tier(impl(True), ["worker"]) == 0
+    assert starting_tier(art(True), ["worker"], force_senior=True) == 0
+
+
+# --- per-task -> tier routing (senior flag, uniform across all modes) ----------
 
 
 def _local_senior(
@@ -473,94 +548,78 @@ def _local_senior(
     return [("worker", local), ("senior", senior)]
 
 
-def test_research_starts_on_senior_tier(git_repo: Path, run_dir: RunDir) -> None:
-    # research routes to senior (web search). BOTH tiers can succeed, so the
-    # winning tier reveals where the task STARTED, proving local was skipped.
-    task = ArtifactTask(
-        id="T1", goal="investigate online",
-        done_when=[CmdCheck(cmd="test -f notes.md")],
-        artifact_out="notes.md",
+def _artifact_task(tid: str, out: str, *, senior: bool = False) -> ArtifactTask:
+    return ArtifactTask(
+        id=tid, goal="do the thing",
+        done_when=[CmdCheck(cmd=f"test -f {out}")],
+        artifact_out=out, senior=senior,
     )
+
+
+def test_research_defaults_to_local_tier(git_repo: Path, run_dir: RunDir) -> None:
+    # NEW routing: research is no longer wholesale-senior. A plain research task
+    # (fact gathering, web search, which the local rig CAN do) starts on local.
+    task = _artifact_task("T1", "notes.md")
     payload = handoff_payload(citations=[{"file": "README.md"}])
-    local = HandoffWorker(payload, files={"notes.md": "x"})
-    senior = HandoffWorker(payload, files={"notes.md": "x"})
     outcome = run_one_epoch(
         run_dir, args=artifact_epoch(task), mode="research",
-        ladder=_local_senior(local, senior), repo=git_repo, tier0_attempts=2,
+        ladder=_local_senior(
+            HandoffWorker(payload, files={"notes.md": "x"}),
+            HandoffWorker(payload, files={"notes.md": "x"}),
+        ),
+        repo=git_repo, tier0_attempts=2,
     )
     assert outcome.tasks[0].status == "done"
-    assert outcome.tasks[0].tier == "senior"
+    assert outcome.tasks[0].tier == "worker"
 
 
-def test_review_starts_on_senior_tier(git_repo: Path, run_dir: RunDir) -> None:
-    task = ArtifactTask(
-        id="T1", goal="review the module",
-        done_when=[CmdCheck(cmd="test -f verdict.md")],
-        artifact_out="verdict.md",
-    )
+def test_review_defaults_to_local_tier(git_repo: Path, run_dir: RunDir) -> None:
+    # NEW routing: a structural/mechanical review defaults local too.
+    task = _artifact_task("T1", "verdict.md")
     payload = handoff_payload(citations=[{"file": "README.md"}])
-    local = HandoffWorker(payload, files={"verdict.md": "x"})
-    senior = HandoffWorker(payload, files={"verdict.md": "x"})
     outcome = run_one_epoch(
         run_dir, args=artifact_epoch(task), mode="review",
-        ladder=_local_senior(local, senior), repo=git_repo, tier0_attempts=2,
+        ladder=_local_senior(
+            HandoffWorker(payload, files={"verdict.md": "x"}),
+            HandoffWorker(payload, files={"verdict.md": "x"}),
+        ),
+        repo=git_repo, tier0_attempts=2,
     )
+    assert outcome.tasks[0].tier == "worker"
+
+
+@pytest.mark.parametrize("mode", ["research", "review", "artifact"])
+def test_senior_task_routes_to_senior_tier_across_modes(
+    git_repo: Path, run_dir: RunDir, mode: str
+) -> None:
+    # A senior:true task (judgment/taste/synthesis) starts on the senior tier for
+    # EVERY non-write mode. BOTH tiers succeed, so the winning tier reveals where
+    # the task STARTED, proving local was skipped.
+    task = _artifact_task("T1", "out.md", senior=True)
+    payload = handoff_payload(citations=[{"file": "README.md"}])
+    outcome = run_one_epoch(
+        run_dir, args=artifact_epoch(task), mode=mode,
+        ladder=_local_senior(
+            HandoffWorker(payload, files={"out.md": "x"}),
+            HandoffWorker(payload, files={"out.md": "x"}),
+        ),
+        repo=git_repo, tier0_attempts=2,
+    )
+    assert outcome.tasks[0].status == "done"
     assert outcome.tasks[0].tier == "senior"
 
 
-def test_artifact_mode_starts_on_local_tier(git_repo: Path, run_dir: RunDir) -> None:
-    # artifact is production work (no web needed), starts on local, like implement.
-    task = ArtifactTask(
-        id="T1", goal="produce findings",
-        done_when=[CmdCheck(cmd="test -f findings.md")],
-        artifact_out="findings.md",
-    )
-    payload = handoff_payload(citations=[{"file": "README.md"}])
-    local = HandoffWorker(payload, files={"findings.md": "x"})
-    senior = HandoffWorker(payload, files={"findings.md": "x"})
-    outcome = run_one_epoch(
-        run_dir, args=artifact_epoch(task), mode="artifact",
-        ladder=_local_senior(local, senior), repo=git_repo, tier0_attempts=2,
-    )
-    assert outcome.tasks[0].tier == "worker"
-
-
-def test_research_falls_back_to_local_without_senior(
+def test_senior_implement_task_routes_to_senior_tier(
     git_repo: Path, run_dir: RunDir
 ) -> None:
-    # A rig with no senior tier runs research on local (repo investigation only).
-    task = ArtifactTask(
-        id="T1", goal="investigate",
-        done_when=[CmdCheck(cmd="test -f notes.md")],
-        artifact_out="notes.md",
+    # A senior:true implement task (taste/layout/polish) builds on the senior tier.
+    task = ImplementTask(
+        id="T1", goal="create out.txt containing GRINDSTONE",
+        done_when=[CmdCheck(cmd="test -f out.txt")],
+        file_ownership=["out.txt"], senior=True,
     )
-    payload = handoff_payload(citations=[{"file": "README.md"}])
-    local = HandoffWorker(payload, files={"notes.md": "x"})
     outcome = run_one_epoch(
-        run_dir, args=artifact_epoch(task), mode="research",
-        ladder=[("worker", local)], repo=git_repo, tier0_attempts=2,
-    )
-    assert outcome.tasks[0].status == "done"
-    assert outcome.tasks[0].tier == "worker"
-
-
-# --- taste routing: a VISUAL implement/review epoch builds on the senior tier --
-
-
-def _visual_implement(task: ImplementTask) -> ImplementEpochArgs:
-    return ImplementEpochArgs(
-        epoch_title="polish the UI", rationale="visual output", tasks=[task], visual=True
-    )
-
-
-def test_visual_implement_routes_to_senior_tier(
-    git_repo: Path, run_dir: RunDir, toy_task: ImplementTask
-) -> None:
-    # Taste routing: a visual implement epoch is built on the vision-capable
-    # senior tier, not the local mode default. BOTH tiers succeed, so the
-    # winning tier reveals where the task STARTED, proving local was skipped.
-    outcome = run_one_epoch(
-        run_dir, args=_visual_implement(toy_task), mode="implement",
+        run_dir, args=implement_epoch(task), mode="implement",
         ladder=_local_senior(make_ok_worker(), make_ok_worker()),
         repo=git_repo, tier0_attempts=2,
     )
@@ -568,10 +627,10 @@ def test_visual_implement_routes_to_senior_tier(
     assert outcome.tasks[0].tier == "senior"
 
 
-def test_non_visual_implement_routes_to_local_tier(
+def test_non_senior_implement_task_routes_to_local_tier(
     git_repo: Path, run_dir: RunDir, toy_task: ImplementTask
 ) -> None:
-    # Without the flag, implement keeps its mode default (local).
+    # Without the flag, an implement task runs local (the default).
     outcome = run_one_epoch(
         run_dir, args=implement_epoch(toy_task), mode="implement",
         ladder=_local_senior(make_ok_worker(), make_ok_worker()),
@@ -580,41 +639,42 @@ def test_non_visual_implement_routes_to_local_tier(
     assert outcome.tasks[0].tier == "worker"
 
 
-def test_visual_review_still_routes_to_senior_tier(
+def test_senior_task_falls_back_to_local_without_senior_tier(
     git_repo: Path, run_dir: RunDir
 ) -> None:
-    # review already starts on senior; the visual flag must not break that.
-    task = ArtifactTask(
-        id="T1", goal="taste-review the UI",
-        done_when=[CmdCheck(cmd="test -f verdict.md")],
-        artifact_out="P1/E1/T1/verdict.md", targets=["ui/app.tsx"],
-    )
+    # No senior tier in the ladder: a senior:true task falls back to local without
+    # crashing.
+    task = _artifact_task("T1", "notes.md", senior=True)
     payload = handoff_payload(citations=[{"file": "README.md"}])
-    args = ArtifactEpochArgs(
-        epoch_title="review the UI", rationale="taste", tasks=[task], visual=True
-    )
     outcome = run_one_epoch(
-        run_dir, args=args, mode="review",
-        ladder=_local_senior(
-            HandoffWorker(payload, files={"verdict.md": "x"}),
-            HandoffWorker(payload, files={"verdict.md": "x"}),
-        ),
+        run_dir, args=artifact_epoch(task), mode="research",
+        ladder=[("worker", HandoffWorker(payload, files={"notes.md": "x"}))],
         repo=git_repo, tier0_attempts=2,
-    )
-    assert outcome.tasks[0].tier == "senior"
-
-
-def test_visual_implement_falls_back_to_local_without_senior(
-    git_repo: Path, run_dir: RunDir, toy_task: ImplementTask
-) -> None:
-    # No senior tier in the ladder: a visual epoch falls back to local without
-    # crashing (mirrors research's senior-less fallback).
-    outcome = run_one_epoch(
-        run_dir, args=_visual_implement(toy_task), mode="implement",
-        ladder=[("worker", make_ok_worker())], repo=git_repo, tier0_attempts=2,
     )
     assert outcome.tasks[0].status == "done"
     assert outcome.tasks[0].tier == "worker"
+
+
+def test_force_senior_overrides_local_task_flag(
+    git_repo: Path, run_dir: RunDir, toy_task: ImplementTask
+) -> None:
+    # The handle_failed_epoch tier bump: force_senior starts EVERY task on senior,
+    # even a task whose own senior flag is False.
+    from grindstone.epoch_loop import run_epoch
+    from grindstone.events import JournalWriter
+
+    with JournalWriter(run_dir.events_path) as journal:
+        from tests.grindstone.conftest import _emit_run_frame, _close_run_frame
+
+        args = implement_epoch(toy_task)
+        _emit_run_frame(journal, args)
+        outcome = run_epoch(
+            run_dir, journal=journal, args=args, mode="implement",
+            ladder=_local_senior(make_ok_worker(), make_ok_worker()),
+            repo=git_repo, tier0_attempts=2, force_senior=True,
+        )
+        _close_run_frame(journal, outcome)
+    assert outcome.tasks[0].tier == "senior"
 
 
 def test_artifact_out_is_published_to_the_log_key(
@@ -1187,3 +1247,181 @@ def test_task_loop_missing_skill_file_fails_attempt(tmp_path: Path) -> None:
     [t] = outcome.tasks
     assert t.status == "failed"
     assert t.failure_reason is not None and "domain skill" in t.failure_reason
+
+
+# --- incremental retry: a same-tier retry keeps the prior attempt's work -------
+
+
+class _RecordingRetryWorker:
+    """A stateful worker for the incremental-retry tests.
+
+    Attempt 1: write a PARTIAL (in-scope) version of the owned file + a
+    chainable-FAILED handoff (status FAILED is a chainable rejection: it does NOT
+    poison the branch the way an out-of-scope write does, so the next same-tier
+    retry bases on attempt 1's branch and inherits its COMMITTED partial work).
+    Later attempts: record whether ``prior_work_present`` was set and whether
+    attempt 1's partial content is on disk in the CWD, then finish the owned file
+    + a DONE handoff."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.prior_flags: list[bool] = []
+        self.saw_partial_content: list[bool] = []
+
+    def run(self, request: WorkerRequest) -> None:
+        self.calls += 1
+        (request.scratch / "review.md").write_text("reviewed\n", encoding="utf-8")
+        if self.calls == 1:
+            # A partial, in-scope edit of the owned file (kept on the chain branch).
+            (request.scratch / OUT_FILE).write_text("WIP\n", encoding="utf-8")
+            payload = handoff_payload(FQ, status="FAILED", citations=[{"file": OUT_FILE}])
+            (request.scratch / "handoff.json").write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+            return
+        # Retry: observe the inherited state, then finish cleanly.
+        self.prior_flags.append(request.prior_work_present)
+        prior = request.scratch / OUT_FILE
+        self.saw_partial_content.append(
+            prior.is_file() and prior.read_text() == "WIP\n"
+        )
+        prior.write_text(OUT_CONTENT, encoding="utf-8")
+        (request.scratch / "handoff.json").write_text(
+            json.dumps(handoff_payload(FQ, citations=[{"file": OUT_FILE}])),
+            encoding="utf-8",
+        )
+
+
+def test_same_tier_retry_bases_on_prior_attempt_work(
+    git_repo: Path, run_dir: RunDir, toy_task: ImplementTask
+) -> None:
+    # A chainable rejection (status FAILED) commits attempt 1's partial work to its
+    # branch + keeps it; attempt 2 is based on it, so attempt 1's WIP out.txt is
+    # present in attempt 2's CWD and the worker is told prior_work_present.
+    w = _RecordingRetryWorker()
+    outcome = _run_impl(git_repo, run_dir, toy_task, _ladder(w))
+    assert outcome.tasks[0].status == "done"
+    assert outcome.tasks[0].attempts == 2
+    assert w.prior_flags == [True]
+    assert w.saw_partial_content == [True]
+
+
+def test_first_attempt_starts_fresh_from_base(
+    git_repo: Path, run_dir: RunDir, toy_task: ImplementTask
+) -> None:
+    # The FIRST attempt is never told prior work is present (there is none yet):
+    # a one-shot success carries prior_work_present False.
+    class _Probe:
+        def __init__(self) -> None:
+            self.flags: list[bool] = []
+
+        def run(self, request: WorkerRequest) -> None:
+            self.flags.append(request.prior_work_present)
+            make_ok_worker().run(request)
+
+    probe = _Probe()
+    outcome = _run_impl(git_repo, run_dir, toy_task, _ladder(probe))
+    assert outcome.tasks[0].status == "done"
+    assert probe.flags == [False]
+
+
+def test_tier_escalation_starts_clean_from_base(
+    git_repo: Path, run_dir: RunDir, toy_task: ImplementTask
+) -> None:
+    # A higher tier must NOT inherit the lower tier's partial work: the escalated
+    # attempt starts fresh from the epoch base, so prior_work_present is False and
+    # the lower tier's partial.txt is absent.
+    class _SeniorProbe:
+        def __init__(self) -> None:
+            self.flags: list[bool] = []
+            self.saw_partial: list[bool] = []
+
+        def run(self, request: WorkerRequest) -> None:
+            self.flags.append(request.prior_work_present)
+            self.saw_partial.append((request.scratch / "partial.txt").is_file())
+            make_ok_worker().run(request)
+
+    # tier0 always fails (chainable FAILED status, writing partial.txt each time);
+    # exhausting it escalates to the senior probe.
+    class _AlwaysPartial:
+        def run(self, request: WorkerRequest) -> None:
+            (request.scratch / "review.md").write_text("r\n", encoding="utf-8")
+            (request.scratch / "partial.txt").write_text("wip\n", encoding="utf-8")
+            (request.scratch / OUT_FILE).write_text(OUT_CONTENT, encoding="utf-8")
+            (request.scratch / "handoff.json").write_text(
+                json.dumps(handoff_payload(FQ, status="FAILED",
+                                           citations=[{"file": OUT_FILE}])),
+                encoding="utf-8",
+            )
+
+    senior = _SeniorProbe()
+    outcome = _run_impl(
+        git_repo, run_dir, toy_task, _ladder(_AlwaysPartial(), senior),
+        tier0_attempts=2,
+    )
+    assert outcome.tasks[0].status == "done"
+    assert outcome.tasks[0].tier == "cloud"
+    # The senior's first (and only) attempt started clean: no inherited partial.
+    assert senior.flags == [False]
+    assert senior.saw_partial == [False]
+
+
+def test_out_of_scope_retry_does_not_inherit_poisoned_branch(
+    git_repo: Path, run_dir: RunDir, toy_task: ImplementTask
+) -> None:
+    # An out-of-scope rejection is NON-chainable: the next attempt restarts from the
+    # clean epoch base (the poisoned evil.txt is NOT inherited) and prior_work_present
+    # is False.
+    bad = HandoffWorker(handoff_payload(), files={OUT_FILE: OUT_CONTENT, "evil.txt": "x\n"})
+
+    class _Probe:
+        def __init__(self) -> None:
+            self.flags: list[bool] = []
+            self.saw_evil: list[bool] = []
+
+        def run(self, request: WorkerRequest) -> None:
+            self.flags.append(request.prior_work_present)
+            self.saw_evil.append((request.scratch / "evil.txt").is_file())
+            make_ok_worker().run(request)
+
+    probe = _Probe()
+
+    class _Switch:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(self, request: WorkerRequest) -> None:
+            self.calls += 1
+            (bad if self.calls == 1 else probe).run(request)
+
+    outcome = _run_impl(git_repo, run_dir, toy_task, _ladder(_Switch()))
+    assert outcome.tasks[0].status == "done"
+    assert probe.flags == [False]
+    assert probe.saw_evil == [False]
+
+
+def test_session_limit_park_still_works_with_incremental_retry(
+    git_repo: Path, run_dir: RunDir, toy_task: ImplementTask
+) -> None:
+    # The session-limit park (re-run the SAME attempt) must still work alongside the
+    # incremental-retry chain: a session limit on attempt 1 parks + retries the same
+    # attempt, which then succeeds in ONE charged attempt.
+    waits: list[float] = []
+
+    class _LimitOnce:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(self, request: WorkerRequest) -> None:
+            self.calls += 1
+            if self.calls == 1:
+                raise SessionLimited("quota window")
+            make_ok_worker().run(request)
+
+    outcome = _run_impl(
+        git_repo, run_dir, toy_task, _ladder(_LimitOnce()),
+        sleep_fn=waits.append,
+    )
+    assert outcome.tasks[0].status == "done"
+    assert outcome.tasks[0].attempts == 1  # the park did not charge the ladder
+    assert len(waits) == 1

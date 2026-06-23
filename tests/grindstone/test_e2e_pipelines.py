@@ -1,11 +1,11 @@
 """Full-run E2E coverage for the multi-mode decomposition patterns the planner
 contract nudges toward (PLANNER_CONTRACT §3 "Sequencing by tier of thinking"):
 
-  - research -> artifact: judgment on senior, the write-up on local, with the
-    research findings flowing forward as a keyed-log input.
-  - research -> implement -> review: the heavy-build shape, map (senior), build
-    (local, committed), judge (senior).
-  - a visual implement epoch is built on the senior taste tier.
+  - research -> artifact: a senior-flagged research/synthesis task on senior, the
+    write-up on local, with the research findings flowing forward as a keyed-log input.
+  - research -> implement -> review: the heavy-build shape, synthesize (senior),
+    build (local, committed), judge (senior) - judgment slices flagged per task.
+  - a senior-flagged implement task is built on the senior taste tier.
 
 These drive real runs through ``run_grind`` with a scripted ``MockPlanner`` and a
 two-tier ladder, asserting BOTH the tier routing and the cross-epoch handoff,
@@ -106,7 +106,12 @@ def _exists(name: str) -> dict[str, object]:
 
 
 def _artifact_task(
-    tid: str, out: str, *, goal: str = "produce it", inputs: list[str] | None = None
+    tid: str,
+    out: str,
+    *,
+    goal: str = "produce it",
+    inputs: list[str] | None = None,
+    senior: bool = False,
 ) -> dict[str, object]:
     task: dict[str, object] = {
         "id": tid,
@@ -116,15 +121,18 @@ def _artifact_task(
     }
     if inputs is not None:
         task["inputs"] = inputs
+    if senior:
+        task["senior"] = True
     return task
 
 
 def test_research_to_artifact_split_pipeline(git_repo: Path, run_dir: RunDir) -> None:
-    """research (senior) publishes findings to the keyed log; a downstream artifact
-    epoch (local) consumes that key as an ``input`` and writes the report. Proves
-    the cross-epoch keyed-log handoff AND tier routing in one run, and the input
-    only resolves because the research artifact was actually published (the dogfood
-    bug would have left the key absent and failed the report decision's validation)."""
+    """A research task flagged ``senior`` (a synthesis/judgment call) publishes
+    findings to the keyed log; a downstream artifact epoch (local) consumes that key
+    as an ``input`` and writes the report. Proves the cross-epoch keyed-log handoff
+    AND per-task tier routing in one run, and the input only resolves because the
+    research artifact was actually published (the dogfood bug would have left the key
+    absent and failed the report decision's validation)."""
 
     local, senior = _PipelineWorker(), _PipelineWorker()
     planner = MockPlanner(
@@ -134,7 +142,10 @@ def test_research_to_artifact_split_pipeline(git_repo: Path, run_dir: RunDir) ->
                 phase_dict("P2", title="report", exit_criterion=[_exists("report.md")]),
             ),
             research_decision(
-                _artifact_task("T1", "P1/E1/T1/findings.md", goal="investigate the repo"),
+                _artifact_task(
+                    "T1", "P1/E1/T1/findings.md",
+                    goal="synthesize an approach from the repo", senior=True,
+                ),
                 title="investigate",
             ),
             artifact_decision(
@@ -157,7 +168,7 @@ def test_research_to_artifact_split_pipeline(git_repo: Path, run_dir: RunDir) ->
         repo=git_repo,
     )
     assert outcome.status == "completed", outcome
-    # research started on SENIOR; the report write-up on LOCAL.
+    # the senior-flagged research task started on SENIOR; the report write-up on LOCAL.
     assert ("P1/E1/T1", "research") in senior.seen
     assert ("P2/E1/T1", "artifact") in local.seen
     assert ("P1/E1/T1", "research") not in local.seen
@@ -167,10 +178,10 @@ def test_research_to_artifact_split_pipeline(git_repo: Path, run_dir: RunDir) ->
 
 
 def test_research_implement_review_pipeline(git_repo: Path, run_dir: RunDir) -> None:
-    """The heavy-build decomposition: research (senior) maps the work, implement
-    (local) builds + commits, review (senior) judges. Judgment routes to senior,
-    production to local, and the implement task's file lands on the integration
-    branch."""
+    """The heavy-build decomposition: a senior-flagged research task synthesizes the
+    design (senior), implement (local) builds + commits, a senior-flagged review
+    judges (senior). Judgment routes to senior, production to local, and the
+    implement task's file lands on the integration branch."""
 
     local, senior = _PipelineWorker(), _PipelineWorker()
     planner = MockPlanner(
@@ -181,17 +192,21 @@ def test_research_implement_review_pipeline(git_repo: Path, run_dir: RunDir) -> 
                 phase_dict("P3", title="review", exit_criterion=[_exists("verdict.md")]),
             ),
             research_decision(
-                _artifact_task("T1", "P1/E1/T1/design.md", goal="map the work"),
+                _artifact_task(
+                    "T1", "P1/E1/T1/design.md",
+                    goal="synthesize the design approach", senior=True,
+                ),
                 title="map",
             ),
             implement_decision(impl_task("T1", "feature.py"), title="build"),
             review_decision(
                 {
                     "id": "T1",
-                    "goal": "judge feature.py against intent",
+                    "goal": "judge feature.py taste against intent",
                     "done_when": [check_cmd("true")],
                     "artifact_out": "P3/E1/T1/verdict.md",
                     "targets": ["feature.py"],
+                    "senior": True,
                 },
                 title="review",
             ),
@@ -216,19 +231,19 @@ def test_research_implement_review_pipeline(git_repo: Path, run_dir: RunDir) -> 
     assert "feature.py" in tracked_files(git_repo, branch)
 
 
-def test_visual_implement_epoch_builds_on_senior(git_repo: Path, run_dir: RunDir) -> None:
-    """Taste routing: an implement epoch flagged ``visual: true`` is built by the
-    senior tier even though implement normally starts on local."""
+def test_senior_implement_task_builds_on_senior(git_repo: Path, run_dir: RunDir) -> None:
+    """Taste routing: an implement task flagged ``senior: true`` (a taste/polish
+    slice) is built by the senior tier even though implement normally starts on
+    local."""
 
     local, senior = _PipelineWorker(), _PipelineWorker()
-    visual_impl: dict[str, object] = {
+    senior_impl: dict[str, object] = {
         "schema_version": "1",
         "tool": "implement",
         "args": {
             "epoch_title": "polish the UI",
-            "rationale": "visual output",
-            "visual": True,
-            "tasks": [impl_task("T1", "ui.tsx")],
+            "rationale": "taste output",
+            "tasks": [{**impl_task("T1", "ui.tsx"), "senior": True}],
         },
     }
     planner = MockPlanner(
@@ -237,7 +252,7 @@ def test_visual_implement_epoch_builds_on_senior(git_repo: Path, run_dir: RunDir
                 phase_dict("P1", title="ui", exit_criterion=[check_cmd("test -f ui.tsx")]),
                 phase_dict("P2", title="done", exit_criterion=[check_cmd("true")]),
             ),
-            visual_impl,
+            senior_impl,
             complete_decision(check_cmd("true")),
         ]
     )

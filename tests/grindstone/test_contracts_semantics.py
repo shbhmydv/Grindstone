@@ -162,13 +162,18 @@ def test_size_gate_rejects_too_many_ownership_globs() -> None:
     assert implement_task_size_violations([ok], max_files=5) == []
 
 
-def test_size_gate_rejects_whole_repo_ownership() -> None:
-    for glob in ("**", "**/*", "*"):
+def test_size_gate_rejects_any_broad_glob() -> None:
+    # The whole-repo forms AND any scoped wildcard are now rejected: a fresh
+    # implement task must enumerate concrete files (the incident fix). A single
+    # `src/design-system/**` used to slip through (one glob, count 1).
+    for glob in ("**", "**/*", "*", "src/*", "src/**", "src/design-system/**",
+                 "lib/*.ts", "a/b/?.py"):
         bad = implement_task_size_violations([_itask("T1", glob)], max_files=5)
-        assert any("T1" in v and "whole-repo" in v for v in bad), glob
-    # A SCOPED wildcard is decomposed, not whole-repo: it passes.
-    assert implement_task_size_violations([_itask("T1", "src/*")], max_files=5) == []
-    assert implement_task_size_violations([_itask("T1", "src/**")], max_files=5) == []
+        assert any("T1" in v and "broad glob" in v for v in bad), glob
+    # An ENUMERATED slice of concrete files passes.
+    assert implement_task_size_violations(
+        [_itask("T1", "src/theme.ts", "src/tokens.ts")], max_files=5
+    ) == []
 
 
 def test_size_gate_bound_is_tier_aware() -> None:
@@ -177,6 +182,20 @@ def test_size_gate_bound_is_tier_aware() -> None:
     assert implement_task_size_violations([six], max_files=5) != []
     # ...accepted at a larger senior bound (12).
     assert implement_task_size_violations([six], max_files=12) == []
+
+
+def test_size_gate_per_task_senior_bound() -> None:
+    # Per-task bounds: a senior:true task is judged against senior_max_files, a
+    # plain task against max_files, in the SAME call. Six files: the senior task
+    # passes (bound 12), the local task is rejected (bound 5).
+    senior_six = _itask("T1", "a.py", "b.py", "c.py", "d.py", "e.py", "f.py")
+    senior_six = senior_six.model_copy(update={"senior": True})
+    local_six = _itask("T2", "g.py", "h.py", "i.py", "j.py", "k.py", "l.py")
+    bad = implement_task_size_violations(
+        [senior_six, local_six], max_files=5, senior_max_files=12
+    )
+    assert any("T2" in v and "too big" in v for v in bad)
+    assert not any(v.startswith("implement task T1") for v in bad)
 
 
 def test_review_requires_targets() -> None:

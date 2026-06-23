@@ -104,9 +104,12 @@ state machine in `grindstone/task_loop.py`:
 
 A task gets up to three attempts on its starting tier, then one attempt per
 higher ladder rung; exhausting the ladder marks it FAILED and the epoch
-continues. The planner picks the *mode*; the core maps mode → starting tier
-(`research`/`review`, and any `visual` epoch, start on the senior tier when one
-exists; everything else starts on the worker tier).
+continues. Each task picks its own starting tier by its `senior` flag: a
+`senior: true` task (judgment / taste / synthesis) starts on the senior tier when
+one exists, everything else starts on the worker tier. A same-tier retry bases its
+worktree on the prior attempt's branch (keeping that work, the worker may fix it
+in place or reset and redo); a first attempt and a tier escalation start fresh from
+the epoch base.
 
 ### The handoff disk contract
 
@@ -312,8 +315,9 @@ queries under `grindstone/_repomap_queries/` are pure data vendored from aider
 
 Grindstone can build and judge work that is evaluated by how it *looks*:
 
-- **The `visual` flag** routes a UI/visual epoch's build to the **senior** tier
-  (the stronger taste-builder) instead of the worker default.
+- **The per-task `senior` flag** routes a judgment/taste task (layout, polish,
+  synthesis) to the **senior** tier (the stronger taste-builder) instead of the
+  worker default, per task, so a UI epoch's mechanical scaffolding stays local.
 - **The `vision_review` gate** is a deterministic phase check: after a `cmd`
   check builds and screenshots the UI into the tip worktree, a `vision_review`
   check shows that screenshot to a vision model (via the rig's `vision_review.sh`)

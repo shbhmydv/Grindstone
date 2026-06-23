@@ -137,16 +137,18 @@ giant epoch with a single giant task cannot be diagnosed when it fails.
 
 ### Sequencing: decompose heavy work by tier of thinking
 
-The mode also picks the **tier**: `research` / `review` (and any `visual` epoch)
-start on the stronger **senior** tier; `implement` / `artifact` start on the
-**worker** tier (the local rig, see §5). So a phase skeleton is also a *routing*
-decision: put the
-judgment on senior and the production on the worker tier. These are gentle defaults, not
-mandates: a small job is fine as a single epoch. But for heavy or judgment-laden
-work, splitting pays off: each tier does what it is best (and cheapest) at, and
-a non-implement epoch's `artifact_out` persists to the keyed log, so it becomes a
-downstream epoch's `inputs`. That keyed-log handoff is how findings flow from a
-senior investigation into a worker build or write-up.
+The **tier** is chosen PER TASK by the `senior` flag (§5), not by the mode: a task
+flagged `senior: true` (judgment / taste / synthesis) starts on the stronger
+**senior** tier; every other task (mechanical or factual work, including
+web-search research) starts on the **worker** tier (the local rig). So a decision
+is also a *routing* decision: SPLIT a mechanical slice from a judgment slice and
+flag only the judgment slice senior, so the senior quota is spent only where it is
+needed. These are gentle defaults, not mandates: a small job is fine as a single
+epoch. But for heavy or judgment-laden work, splitting pays off: each tier does
+what it is best (and cheapest) at, and a non-implement epoch's `artifact_out`
+persists to the keyed log, so it becomes a downstream epoch's `inputs`. That
+keyed-log handoff is how findings flow from a senior investigation into a worker
+build or write-up.
 
 Splitting is driven by **two independent axes**: a **tier change** (judgment vs.
 production, above) and a **data dependency or checkpoint**. The second matters
@@ -165,13 +167,15 @@ Good shapes (compose freely; these are nudges, not a fixed menu):
   input) → `review` (on senior, re-derive a sample of the result's claims and
   reconcile them against the inputs, not merely confirm the expected sections
   exist).
-- **Report / triage / migration plan** → `research` (investigate + classify, on
-  senior, cited) → `artifact` (write the final report from the findings, on
-  local). Do not collapse the judgment into a single worker `artifact` epoch when
-  the analysis is the hard part, which silently downgrades it off senior.
+- **Report / triage / migration plan** → `research` (investigate + classify, the
+  synthesis task flagged `senior: true`, cited) → `artifact` (write the final
+  report from the findings, local). Do not collapse the judgment into a single
+  local task when the analysis is the hard part, which silently downgrades it off
+  senior; flag the synthesis task senior instead.
 - **UI / polish** → `research` (gather the design intent + tokens) → `implement`
-  with `visual: true` (build on senior) → a phase `exit_criterion` that builds +
-  screenshots the UI and then `vision_review`s it (the taste gate, §5).
+  with the mechanical tokens/scaffolding as LOCAL tasks and the taste/layout task
+  flagged `senior: true` → a phase `exit_criterion` that builds + screenshots the
+  UI and then `vision_review`s it (the taste gate, §5).
 
 Counter-example: framing a judgment job as "produce `report.md`" makes it look
 like worker production and routes it off senior. If the analysis is the point, say
@@ -229,19 +233,22 @@ Common shape:
 
 Mode-specific:
 
-- **implement** additionally requires `file_ownership`: 1–32 path globs that must
-  be **pairwise disjoint across the epoch**; this is the merge-correctness
-  mechanism (§6), not metadata. A **deterministic size gate** further bounds a
-  *fresh* implement task: its `file_ownership` glob count may not exceed a
-  **tier-aware** ceiling (`local_max_task_files`, default **5**; the larger
-  `senior_max_task_files`, default **12**, for a `visual` epoch that starts on
-  senior), and a **whole-repo glob** (`**`, `**/*`, or a bare `*`) is rejected
-  outright as "not decomposed". A task over its bound (or claiming the whole
-  repo) bounces back through the same invalid-decision re-ask path (§1), naming
-  the offending task. The gate is **scoped to fresh decomposition**: a
-  `handle_failed_epoch` repair re-dispatches its originating decision directly
-  and may carry broad scope, so it is **exempt** (a repair cannot predict its
-  files). The bounds are config fields (both ≥ 1).
+- **implement** additionally requires `file_ownership`: 1–32 paths that must be
+  **pairwise disjoint across the epoch**; this is the merge-correctness mechanism
+  (§6), not metadata. A **deterministic size gate** further bounds a *fresh*
+  implement task: every `file_ownership` entry must be a **concrete file path**, a
+  **wildcard glob** (`**`, `**/*`, a bare `*`, a scoped `src/design-system/**`, a
+  `dir/*`, a suffix `*.ts`, anything carrying `*` `?` `[`) is rejected as "a broad
+  glob" so the planner enumerates the files (and so mechanical vs taste files can
+  be tiered). The number of concrete files is then capped **per task by its tier**:
+  `local_max_task_files` (default **5**) for a normal task, the larger
+  `senior_max_task_files` (default **12**) for a `senior: true` task (it falls back
+  to the local bound when the rig has no senior tier). A broad-glob or oversized
+  task bounces back through the same invalid-decision re-ask path (§1), naming the
+  offending task. The gate is **scoped to fresh decomposition**: a
+  `handle_failed_epoch` repair re-dispatches its originating decision directly and
+  may carry broad scope, so it is **exempt** (a repair cannot predict its files).
+  The bounds are config fields (both ≥ 1).
 - **research / review / artifact** additionally require `artifact_out` (the log
   key the task will create). Review tasks also take `targets` (the paths under
   review). These tasks get **no worktree**: a non-write task is never handed the
@@ -253,15 +260,21 @@ Mode-specific:
   contradiction between the reviewed work and that artifact is a primary job of
   the review.
 
-### Taste routing: the `visual` epoch flag
+### Tier routing: the per-task `senior` flag
 
-An `implement` / `review` / `artifact` epoch may set `visual: true` (default
-`false`) on its args when its deliverable is **front-end / UI / visual / polish**
-output: anything judged by how it *looks*. A visual epoch starts its workers on
-the stronger taste-building **senior** tier instead of the worker default. (The
-senior is a text model; the genuine image judgment is the vision-review gate
-below. A rig with no senior tier falls back to the worker tier so a visual epoch grinds
-rather than crash.) Omit the flag for backend / logic / plain-text work.
+Any task (implement / research / review / artifact) may set `senior: true`
+(default `false`) when its work needs **judgment or taste**: taste composition,
+layout, polish, an approach synthesis, or a design-quality verdict. Such a task
+starts on the stronger **senior** tier instead of the worker default; every other
+task (mechanical scaffolding, tokens, boilerplate, exports, web-search fact
+gathering, a structural review) runs on the local worker tier. Routing is **per
+task, not per epoch**: SPLIT a mechanical slice from a judgment slice and flag
+only the judgment slice senior, so the senior quota is spent only where it is
+needed (a whole UI epoch run entirely on the senior burns the quota). The senior
+is a text model; genuine image judgment is the vision-review gate below. A rig
+with no senior tier falls every task back to the worker tier (no crash). A
+`handle_failed_epoch` tier bump (`escalate_tier` / `escalate_senior`) starts EVERY
+task of the retried epoch on senior, overriding the per-task flags.
 
 ### Checks
 

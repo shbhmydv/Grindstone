@@ -71,24 +71,32 @@ def test_parsed_decision_is_frozen() -> None:
 
 
 @pytest.mark.parametrize("fixture", ["implement", "review"])
-def test_visual_flag_backward_compatible_and_typed(fixture: str) -> None:
-    """The taste-routing `visual` flag: optional (backward compat), bool-typed,
-    and agreed-on by both validation layers."""
+def test_per_task_senior_flag_backward_compatible_and_typed(fixture: str) -> None:
+    """The per-task tier-routing `senior` flag: optional (backward compat),
+    bool-typed, and agreed-on by both validation layers, on EVERY task shape."""
 
     base = json.loads((CORPUS / f"decision/valid/{fixture}.json").read_text())
 
-    # Backward compat: a decision WITHOUT `visual` validates at both layers and
-    # the parsed model defaults the flag to False.
+    # Backward compat: a task WITHOUT `senior` validates at both layers and the
+    # parsed model defaults every task's flag to False.
     assert not decision_schema_errors(base)
-    assert parse_decision(base).args.visual is False
+    assert all(t.senior is False for t in parse_decision(base).args.tasks)
 
-    # Explicit visual:true is accepted by both layers and round-trips True.
-    yes = {**base, "args": {**base["args"], "visual": True}}
+    # Explicit senior:true on the first task is accepted by both layers and
+    # round-trips True (the rest stay False).
+    yes_tasks = [
+        {**t, **({"senior": True} if i == 0 else {})}
+        for i, t in enumerate(base["args"]["tasks"])
+    ]
+    yes = {**base, "args": {**base["args"], "tasks": yes_tasks}}
     assert not decision_schema_errors(yes)
-    assert parse_decision(yes).args.visual is True
+    parsed = parse_decision(yes).args.tasks
+    assert parsed[0].senior is True
+    assert all(t.senior is False for t in parsed[1:])
 
-    # A non-bool `visual` is rejected by BOTH layers (schema boolean / StrictBool).
-    bad = {**base, "args": {**base["args"], "visual": "yes"}}
+    # A non-bool `senior` is rejected by BOTH layers (schema boolean / StrictBool).
+    bad_tasks = [{**t, "senior": "yes"} for t in base["args"]["tasks"]]
+    bad = {**base, "args": {**base["args"], "tasks": bad_tasks}}
     assert decision_schema_errors(bad)
     with pytest.raises(ValidationError):
         parse_decision(bad)

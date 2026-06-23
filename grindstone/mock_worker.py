@@ -17,12 +17,18 @@ from dataclasses import dataclass, field
 from grindstone.worker import (
     REVIEW_FILENAME,
     RateLimited,
+    SessionLimited,
     WorkerRequest,
     WorkerTimeout,
 )
 
 #: The exact behavior vocabulary (S1). Order is the scripting order.
 BEHAVIORS: tuple[str, ...] = ("ok", "rate_limit", "bad_json", "empty", "timeout")
+#: ``session_limit`` is a scriptable behavior too (the long quota-window limit:
+#: the attempt driver PARKS hourly on it rather than burning the attempt), but it
+#: is deliberately KEPT OUT of ``BEHAVIORS`` so the fuzz generator never emits it,
+#: a real hourly park would make the termination-fuzz test sleep 24 wall-clock
+#: hours. Tests script it explicitly with an injected fake ``sleep_fn``.
 
 
 def _valid_handoff(request: WorkerRequest, cited: list[str]) -> dict[str, object]:
@@ -67,6 +73,8 @@ class MockWorker:
         self._calls += 1
         handoff = request.scratch / "handoff.json"
 
+        if behavior == "session_limit":
+            raise SessionLimited("mock session limit . resets 2:20am")
         if behavior == "rate_limit":
             raise RateLimited("mock 429")
         if behavior == "bad_json":

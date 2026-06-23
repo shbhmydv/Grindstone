@@ -1249,3 +1249,72 @@ def test_override_senior_synthesizes_failed_handoff_when_agent_writes_none(
     )
     assert res.returncode == 0, res.stderr
     _assert_synthesized_failed(worktree, "0")
+
+
+# --- session-limit propagation (the STDOUT-printed quota-window limit) --------
+# RCA: the claude CLI prints "You've hit your session limit . resets 2:20am" to
+# STDOUT (not stderr); the worker/senior scripts only grepped the stderr log with a
+# rate/429 pattern, so a long session limit was synthesized into a FAILED handoff
+# (burning the retry ladder against a multi-hour limit). The scripts now grep BOTH
+# logs and the session/usage pattern, propagate the non-zero exit, and re-echo the
+# signature to stderr so the Python transport raises SessionLimited and PARKS.
+
+_SESSION_LINE = "You've hit your session limit . resets 2:20am (Asia/Kolkata)"
+
+
+def test_default_local_session_limit_on_stdout_propagates_no_handoff(
+    tmp_path: Path,
+) -> None:
+    # The session limit is on STDOUT and the agent exits non-zero. The script must
+    # propagate the non-zero exit, echo the signature to stderr, and synthesize NO
+    # handoff (it is a retryable limit, not a real task failure).
+    res, worktree = _run_worker_with_prompt(
+        DEFAULT_LOCAL, tmp_path, "claude",
+        f'echo "{_SESSION_LINE}"\nexit 7\n', _PROMPT_WITH_TASK_ID,
+    )
+    assert res.returncode == 7, res.stderr
+    assert "session limit" in res.stderr.lower()
+    assert not (worktree / "handoff.json").exists()
+
+
+def test_default_senior_session_limit_on_stdout_propagates_no_handoff(
+    tmp_path: Path,
+) -> None:
+    res, worktree = _run_worker_with_prompt(
+        DEFAULT_SENIOR, tmp_path, "claude",
+        f'echo "{_SESSION_LINE}"\nexit 7\n', _PROMPT_WITH_TASK_ID,
+    )
+    assert res.returncode == 7, res.stderr
+    assert "session limit" in res.stderr.lower()
+    assert not (worktree / "handoff.json").exists()
+
+
+def test_default_planner_session_limit_on_stdout_surfaces_to_stderr(
+    tmp_path: Path,
+) -> None:
+    # The default planner redirects claude's STDOUT to --out, so a session limit on
+    # stdout lands in the out file, NOT the script's stderr that grindstone reads.
+    # The script must surface the signature from --out to stderr on failure so the
+    # transport classifies it as a session limit (not a transient transport error).
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir()
+    _make_stub(stub_dir, "claude", f'echo "{_SESSION_LINE}"\nexit 5\n')
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("plan", encoding="utf-8")
+    res = subprocess.run(
+        [
+            "bash", str(DEFAULT_PLANNER),
+            "--repo", str(repo),
+            "--prompt", str(prompt),
+            "--out", str(tmp_path / "out.txt"),
+            "--handle-out", str(tmp_path / "handle.txt"),
+            "--timeout", "30",
+        ],
+        env=_env_with_stub_path(stub_dir),
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 5
+    assert "session limit" in res.stderr.lower()

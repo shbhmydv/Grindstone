@@ -27,7 +27,13 @@ from pathlib import Path
 
 from grindstone.check_decision import DECISION_FILE
 from grindstone.planner import PlannerHardError
-from grindstone.worker import RateLimited, TransportError, WorkerTimeout
+from grindstone.worker import (
+    RateLimited,
+    SessionLimited,
+    TransportError,
+    WorkerTimeout,
+    is_session_limit,
+)
 
 
 class ScriptPlanner:
@@ -40,7 +46,9 @@ class ScriptPlanner:
     ``repo`` is the target repo (the planner's read-only working root).
     ``slots`` bounds concurrency; ``timeout_s`` is the transport-owned wall-clock
     supervisor. No model identity: that moved into the script. CLI failures map
-    onto the exception family: rate/limit/429/quota → RateLimited (→ backoff),
+    onto the exception family (BOTH stdout and stderr are inspected, the claude CLI
+    prints its session limit to STDOUT): session/usage limit → SessionLimited
+    (→ hourly park), rate/limit/429/quota → RateLimited (→ short backoff),
     auth/login/401 → PlannerHardError (→ human), other non-zero → TransportError
     (→ transient retry), timeout → WorkerTimeout.
     """
@@ -112,7 +120,7 @@ class ScriptPlanner:
                     f"{self.script.name} timed out after {self.timeout_s}s"
                 ) from exc
             if proc.returncode != 0:
-                self._raise_for_failure(proc.returncode, stderr)
+                self._raise_for_failure(proc.returncode, stdout, stderr)
             # Disk contract, in priority order. (1) A self-validating rig wrote a
             # gate-clean ``decision.json`` into its worktree, that IS the result
             # (the same file the rig looped ``check_decision.py`` on). (2) Else the
@@ -128,17 +136,30 @@ class ScriptPlanner:
                     return text
             return stdout
 
-    def _raise_for_failure(self, returncode: int, stderr: str) -> None:
-        blob = (stderr or "").lower()
+    def _raise_for_failure(self, returncode: int, stdout: str, stderr: str) -> None:
+        # Inspect BOTH streams: the claude CLI prints "You've hit your session
+        # limit" to STDOUT, but historically only stderr was read, so the long
+        # session limit fell through to a transient TransportError and burned the
+        # retry budget in seconds. ``combined`` covers both.
+        combined = f"{stdout or ''}\n{stderr or ''}"
+        blob = combined.lower()
+        # ORDER MATTERS: the long quota-window SESSION/usage limit is detected
+        # FIRST (it resets in hours -> hourly park, never the transient budget);
+        # only a plain transient 429 falls to RateLimited (short backoff). "usage
+        # limit" is the long kind, so it routes to SessionLimited via is_session_limit.
+        snippet = (stderr.strip() or stdout.strip())[:300]
+        if is_session_limit(combined):
+            raise SessionLimited(
+                f"{self.script.name} session-limited: {snippet}"
+            )
         if (
             "rate" in blob
             and "limit" in blob
             or "429" in blob
             or "quota" in blob
-            or "usage limit" in blob
         ):
             raise RateLimited(
-                f"{self.script.name} rate-limited: {stderr.strip()[:300]}"
+                f"{self.script.name} rate-limited: {snippet}"
             )
         if (
             "401" in blob
@@ -149,10 +170,10 @@ class ScriptPlanner:
             or "authentication" in blob
         ):
             raise PlannerHardError(
-                f"{self.script.name} auth/config failure: {stderr.strip()[:300]}"
+                f"{self.script.name} auth/config failure: {snippet}"
             )
         raise TransportError(
-            f"{self.script.name} exited {returncode}: {stderr.strip()[:300]}"
+            f"{self.script.name} exited {returncode}: {snippet}"
         )
 
     def _stop(self, handle_file: Path, proc: "subprocess.Popen[str]") -> None:

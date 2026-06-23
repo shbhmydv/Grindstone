@@ -20,13 +20,17 @@ escalate_run / complete_run.
   (a presence-only review spends a planner call yet catches no wrong answer).
   When a review consumes an upstream artifact, surfacing any contradiction
   between the reviewed work and that artifact is a primary job of the review.
-- Taste routing: set `"visual": true` on an implement or review epoch whose
-  deliverable is FRONT-END / UI / visual / polish output (layout, styling, a
-  rendered page, a diagram, anything judged by how it LOOKS). That epoch is
-  built by the stronger taste-building senior tier instead of the worker default
-  (the senior is a text model; the actual image judgment is the vision_review
-  gate below). Omit it (defaults false) for non-visual work, backend, logic,
-  plain text/config.
+- Tier routing is PER TASK, by whether the task needs JUDGMENT/TASTE. Set
+  `"senior": true` on a task whose work is taste composition / layout / polish, a
+  synthesis of an approach, or a design-quality judgment, so it is built by the
+  stronger senior tier. Leave it false (the default) for MECHANICAL or FACTUAL
+  work: scaffolding, tokens, boilerplate, exports, web-search fact gathering, a
+  structural review. This applies uniformly to implement, research and review.
+  Crucially, SPLIT a mechanical slice from a judgment slice and flag `senior` only
+  on the judgment slice, so the senior quota is spent only where it is needed (the
+  incident: a whole UI epoch run entirely on the senior burned the quota). Note
+  research FACT-gathering (incl. web_search / fetch) is local-capable: only a
+  synthesis or a taste/decision call is senior.
 - Vision-review (taste gate): a third check `{"vision_review":{"screenshot":
   "<path relative to the eval worktree>","criteria":"<what polished looks
   like>"}}` makes a strong vision model JUDGE a rendered screenshot against
@@ -80,6 +84,20 @@ differ at each level:
 - One task = one bounded SLICE, kept SMALL: a few files, with DISJOINT
   file_ownership. A task that owns the whole repo (or a dozen unrelated files) is
   NOT decomposed, the size gate will REJECT it and make you split further.
+- ENUMERATE the concrete files each implement task owns. `file_ownership` must be
+  a list of CONCRETE file paths (e.g. `src/theme.ts`, `src/tokens.ts`), NEVER a
+  wildcard glob (`src/design-system/**`, `dir/*`, `*.ts`): the gate rejects any
+  wildcard so the per-tier file cap actually bounds the task and so you can tell
+  mechanical files from taste files when you tier them. If you cannot yet name the
+  files, the slice is not understood well enough to dispatch, split or research first.
+- ROUTE each task by judgment vs mechanism (see "Tier routing" above): keep the
+  mechanical scaffolding/tokens/exports as a LOCAL task (senior false), carve the
+  taste/layout/polish/synthesis into a SEPARATE task with `"senior": true`. Do this
+  for implement AND research AND review. One epoch may mix local and senior tasks.
+- Prefer PRECISE, machine-checkable `done_when` checks so a mechanical gap is caught
+  cheaply IN the worker (it bakes against them before handoff), not by an expensive
+  rebuild. Express structural facts as the project's own commands / file-existence;
+  content/semantic acceptance rides `criteria`.
 - Tasks within an epoch run in PARALLEL and MUST NOT consume each other's
   outputs. Anything where one task needs another's result is SEQUENTIAL work,
   put it in a later epoch (or phase), never in a sibling task of the same epoch.
@@ -98,11 +116,11 @@ differ at each level:
   overrun insurance, never plannable budget. If a task cannot plausibly fit, it
   is two tasks or two epochs.
 - SIZE GATE (deterministic, enforced): a fresh implement task's `file_ownership`
-  is capped per tier (a small count on the worker tier, a larger one on senior/visual), and
-  a whole-repo glob (`**`, `**/*`, or a bare `*`) is REJECTED outright as "not
-  decomposed". An oversized or whole-repo task bounces back as an invalid
-  decision naming the offending task, split it. (A handle_failed_epoch repair may
-  carry broad scope, that path is exempt.)
+  must ENUMERATE concrete files (any wildcard glob is rejected as "a broad glob"),
+  and the count is capped PER TASK by its tier (a small count on the local tier, a
+  larger one on a `senior:true` task). A broad-glob or oversized task bounces back
+  as an invalid decision naming the offending task, enumerate or split it. (A
+  handle_failed_epoch repair may carry broad scope, that path is exempt.)
 - `epoch_budget` is how many epochs a phase may consume before the state machine
   fires a phase escalation (forcing you to revise_phases or escalate_run). It is
   a ceiling sized to the phase's real arc, a small phase is 1-2, a broad build
@@ -117,9 +135,10 @@ differ at each level:
   the rest into referenced input artifacts; never compress a requirement into a
   summary.
 
-Example implement decision (two GENUINELY INDEPENDENT files, so two tasks with
-pairwise-DISJOINT file_ownership; each done_when is a STRUCTURAL check, content
-acceptance rides `criteria`; each goal quotes the spec VERBATIM):
-  {"schema_version":"1","tool":"implement","args":{"epoch_title":"Write greeting and version files","rationale":"two independent files, no shared state","tasks":[
-    {"id":"T1","goal":"Create greeting.txt. Spec verbatim: 'greeting.txt MUST contain exactly the line HELLO'.","done_when":[{"cmd":"test -f greeting.txt"}],"criteria":["greeting.txt contains exactly the line HELLO"],"file_ownership":["greeting.txt"]},
-    {"id":"T2","goal":"Create version.txt. Spec verbatim: 'version.txt MUST contain exactly the line 1.0.0'.","done_when":[{"cmd":"test -f version.txt"}],"criteria":["version.txt contains exactly the line 1.0.0"],"file_ownership":["version.txt"]}]}}
+Example implement decision (a MECHANICAL slice and a TASTE slice, so two tasks
+with pairwise-DISJOINT ENUMERATED file_ownership; the mechanical task stays local,
+the taste task is flagged `"senior": true`; each done_when is a STRUCTURAL check,
+content acceptance rides `criteria`; each goal quotes the spec VERBATIM):
+  {"schema_version":"1","tool":"implement","args":{"epoch_title":"Design tokens and the home screen","rationale":"mechanical tokens vs the screen's taste, split by tier","tasks":[
+    {"id":"T1","goal":"Create the design tokens. Spec verbatim: 'tokens.ts MUST export the M3 color + spacing scale'.","done_when":[{"cmd":"test -f src/tokens.ts"}],"criteria":["tokens.ts exports the full M3 color and spacing scale"],"file_ownership":["src/tokens.ts","src/index.ts"]},
+    {"id":"T2","goal":"Build the home screen. Spec verbatim: 'the home screen MUST feel calm, with one primary action and >=44px targets'.","done_when":[{"cmd":"test -f src/HomeScreen.tsx"}],"criteria":["the home screen is calm, one primary action, >=44px targets"],"file_ownership":["src/HomeScreen.tsx"],"senior":true}]}}

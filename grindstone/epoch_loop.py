@@ -42,7 +42,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 import threading
-from typing import Literal, Sequence, cast
+import time
+from typing import Callable, Literal, Sequence, cast
 
 from pydantic import BaseModel, ConfigDict
 
@@ -71,6 +72,9 @@ from grindstone.task_loop import (
 from grindstone.worker import Task, WorkerTransport
 
 EpochArgs = ImplementEpochArgs | ArtifactEpochArgs
+#: Injected sleep for the session-limit hourly park, threaded run_loop -> epoch ->
+#: task so tests inject a fake (no wall clock); defaults to real ``time.sleep``.
+SleepFn = Callable[[float], None]
 
 
 def _now() -> str:
@@ -316,8 +320,9 @@ def _fan_out(
     base: str | None,
     concurrency: int,
     tier0_attempts: int,
-    visual: bool,
+    force_senior: bool,
     prepare: PrepareConfig | None,
+    sleep_fn: SleepFn,
     epoch_hint: str | None = None,
 ) -> dict[str, TaskOutcome]:
     """Run ``to_run`` tasks concurrently; return outcomes keyed by short task id."""
@@ -339,9 +344,10 @@ def _fan_out(
             base=base,
             tier0_attempts=tier0_attempts,
             resume_cursor=resume_cursors.get(task.id),
-            visual=visual,
+            force_senior=force_senior,
             prepare=prepare,
             epoch_hint=epoch_hint,
+            sleep_fn=sleep_fn,
         )
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
@@ -506,6 +512,7 @@ def run_epoch(
     prepare: PrepareConfig | None = None,
     epoch_hint: str | None = None,
     force_senior: bool = False,
+    sleep_fn: SleepFn = time.sleep,
 ) -> EpochOutcome:
     """Run ONE epoch (fresh start) to a terminal EpochOutcome.
 
@@ -516,8 +523,9 @@ def run_epoch(
 
     ``epoch_hint`` (a planner handle_failed_epoch ``retry`` corrective) is seeded
     into every task's failure context so the workers see it on their first
-    attempt; ``force_senior`` starts every task on the senior tier (the planner's
-    tier bump / escalate_senior disposition), reusing the visual routing seam.
+    attempt; ``force_senior`` starts EVERY task on the senior tier (the planner's
+    tier bump / escalate_senior disposition), overriding each task's own per-task
+    ``senior`` routing flag.
     """
 
     if not ladder:
@@ -574,9 +582,10 @@ def run_epoch(
         base=base,
         concurrency=_resolve_concurrency(concurrency, len(tasks)),
         tier0_attempts=tier0_attempts,
-        visual=args.visual or force_senior,
+        force_senior=force_senior,
         prepare=prepare,
         epoch_hint=epoch_hint,
+        sleep_fn=sleep_fn,
     )
     if not epoch_done_predicate(store.state):
         raise RuntimeError("epoch loop ended before the done-predicate held")
@@ -603,6 +612,7 @@ def resume_epoch(
     concurrency: int | None = None,
     tier0_attempts: int = TIER0_ATTEMPTS,
     prepare: PrepareConfig | None = None,
+    sleep_fn: SleepFn = time.sleep,
 ) -> EpochOutcome:
     """Re-enter a killed epoch from ``state.json`` against a caller-owned journal.
 
@@ -653,8 +663,12 @@ def resume_epoch(
         base=state.base,
         concurrency=_resolve_concurrency(concurrency, max(1, len(to_run))),
         tier0_attempts=tier0_attempts,
-        visual=args.visual,
+        # force_senior is a fresh-dispatch escalation signal (handle_failed_epoch
+        # tier bump); on resume each task routes by its own per-task ``senior``
+        # flag, and an in-flight escalated task resumes from its recorded cursor.
+        force_senior=False,
         prepare=prepare,
+        sleep_fn=sleep_fn,
     )
     outcomes.update(live)
     if not epoch_done_predicate(store.state):

@@ -125,6 +125,18 @@ class _TaskBase(_Frozen):
     skills: Annotated[
         list[Annotated[str, StringConstraints(max_length=64)]], Field(max_length=6)
     ] = Field(default_factory=list)
+    #: Per-task tier routing: True routes THIS task to the senior tier (judgment /
+    #: taste work, e.g. layout, polish, an approach synthesis, a design-quality
+    #: verdict), False (the default) runs it on the local rig (mechanical /
+    #: factual work, e.g. scaffolding, tokens, boilerplate, web-search fact
+    #: gathering, a structural review). Routing is per TASK, not per epoch, so one
+    #: epoch can split a mechanical local slice from a taste senior slice and the
+    #: senior quota is spent only where judgment is needed. A rig with no senior
+    #: tier falls back to local. Optional, defaults False (a decision without the
+    #: field parses unchanged); ``StrictBool`` mirrors the schema's ``boolean``
+    #: type, so a non-bool is rejected at both layers. It also picks the size-gate
+    #: file-count cap (senior tasks get the larger bound).
+    senior: StrictBool = False
 
 
 class ImplementTask(_TaskBase):
@@ -155,14 +167,6 @@ class ArtifactTask(_TaskBase):
 class _EpochArgsBase(_Frozen):
     epoch_title: Annotated[str, StringConstraints(min_length=1, max_length=120)]
     rationale: Annotated[str, StringConstraints(max_length=2048)]
-    #: Taste routing (B3 seam): set True when the epoch produces or changes
-    #: UI/visual output, so the core builds its workers on the stronger
-    #: taste-building senior tier instead of the mode default. (The senior is a
-    #: text model, the genuine image-based judgment is the B3 vision-review gate
-    #: in the phase exit criterion, not this worker.) Optional, a decision
-    #: without the field parses unchanged (default False); ``StrictBool`` mirrors
-    #: the schema's ``boolean`` type, so a non-bool is rejected at both layers.
-    visual: StrictBool = False
 
 
 class ImplementEpochArgs(_EpochArgsBase):

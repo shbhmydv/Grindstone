@@ -121,53 +121,78 @@ def _review_targets(tasks: list[ArtifactTask]) -> list[str]:
     return out
 
 
-#: Globs that own the WHOLE repo: a fresh implement task carrying one of these
-#: has not been decomposed at all (it claims everything), which defeats the
-#: localize-the-failure point of file_ownership. Mirrors the whole-repo set
-#: ``worktree.path_in_scope`` treats as matching every path, plus the bare
-#: top-level ``*``. A scoped wildcard (``src/*``, ``src/**``) is NOT unbounded.
-_UNBOUNDED_OWNERSHIP: frozenset[str] = frozenset({"**", "**/*", "*"})
+#: The glob metacharacters that make a ``file_ownership`` entry a WILDCARD rather
+#: than a concrete file path. ANY of these in an entry means it is not enumerated.
+_GLOB_WILDCARD_CHARS = "*?["
+
+
+def _ownership_wildcard(glob: str) -> bool:
+    """True when ``glob`` is a wildcard pattern (not a single concrete file path).
+
+    A concrete path (``src/theme.ts``, ``a/b/c.py``) has no glob metacharacter;
+    anything carrying ``*``, ``?`` or ``[`` (``src/design-system/**``, ``dir/*``,
+    ``*.ts``, the whole-repo ``**`` / ``*``) is a wildcard that can cover an
+    unbounded, un-enumerated set of files.
+    """
+
+    return any(ch in glob for ch in _GLOB_WILDCARD_CHARS)
 
 
 def implement_task_size_violations(
-    tasks: list[ImplementTask], *, max_files: int
+    tasks: list[ImplementTask],
+    *,
+    max_files: int,
+    senior_max_files: int | None = None,
 ) -> list[str]:
     """Deterministic per-task SIZE gate for a FRESH implement decomposition.
 
-    Two structural rejections, both derived from the decision alone (no
-    filesystem, no model trust), so the planner CANNOT emit an oversized task:
+    A fresh implement task's ``file_ownership`` must be a BOUNDED, ENUMERATED
+    slice of concrete files, so the per-tier cap actually bounds the work and the
+    planner is forced to decompose (and to know which concrete files are
+    mechanical vs taste, for per-task tiering). Two structural rejections, both
+    derived from the decision alone (no filesystem, no model trust):
 
-    - **Too broad**: a task whose ``file_ownership`` carries more than
-      ``max_files`` globs is not a bounded slice; the planner is told to split it.
-      ``max_files`` is TIER-AWARE: the caller passes the bound for the epoch's
-      target tier (local default vs the larger senior default).
-    - **Unbounded**: a whole-repo glob (``**`` / ``**/*`` / a bare ``*``) means
-      "I did not decompose", it owns every path, so the merge-disjointness and
-      scope checks lose all meaning. Rejected outright for a normal implement
-      task. A scoped wildcard (``src/**``) is fine; only the whole-repo forms are.
+    - **Broad glob**: a ``file_ownership`` entry that is a WILDCARD (carries any of
+      ``* ? [``: the whole-repo ``**`` / ``*``, a subsystem glob ``src/design-system/**``,
+      a directory glob ``dir/*`` that is not a single concrete file, a suffix glob
+      ``*.ts``) is rejected. One scoped wildcard can silently own a whole subsystem,
+      so the per-tier file cap never bites and the localize-the-failure point of
+      file_ownership is lost. The planner must enumerate the concrete files or split
+      into bounded tasks. (The old gate let ``src/design-system/**`` through, every
+      complex epoch then became one giant senior task: the incident this closes.)
+    - **Too big**: once every entry is a concrete file, a task owning more than its
+      tier's bound is not a bounded slice; the planner is told to split it. The bound
+      is TIER-AWARE PER TASK: a ``task.senior`` task is judged against
+      ``senior_max_files`` (the larger senior bound), every other task against
+      ``max_files`` (the local bound). ``senior_max_files`` defaults to ``max_files``
+      when omitted (a single-bound caller), so an all-local gate is unchanged.
 
-    This gate is scoped to FRESH decomposition by the CALLER (it is skipped while
-    a failed epoch is awaiting disposition): a ``handle_failed_epoch`` repair
-    re-dispatches the ORIGINATING decision directly and may legitimately need
-    broad scope, so it never re-enters this gate.
+    This gate is scoped to FRESH decomposition by the CALLER (it is skipped while a
+    failed epoch is awaiting disposition): a ``handle_failed_epoch`` repair
+    re-dispatches the ORIGINATING decision directly and may legitimately need broad
+    scope, so it never re-enters this gate.
     """
 
+    senior_bound = senior_max_files if senior_max_files is not None else max_files
     out: list[str] = []
     for task in tasks:
-        unbounded = [g for g in task.file_ownership if g in _UNBOUNDED_OWNERSHIP]
-        if unbounded:
+        broad = [g for g in task.file_ownership if _ownership_wildcard(g)]
+        if broad:
             out.append(
-                f"implement task {task.id} claims whole-repo ownership "
-                f"({', '.join(repr(g) for g in unbounded)}): that is not a "
-                f"decomposed slice, split it into tasks that each own a bounded "
-                f"set of files"
+                f"implement task {task.id} owns a broad glob "
+                f"({', '.join(repr(g) for g in broad)}): a fresh implement task must "
+                f"enumerate the concrete files it owns (no '*', '?' or '[' wildcards), "
+                f"so the per-tier file cap bounds it and mechanical vs taste files can "
+                f"be tiered, enumerate the concrete files or split into bounded tasks"
             )
-        elif len(task.file_ownership) > max_files:
+            continue
+        bound = senior_bound if task.senior else max_files
+        if len(task.file_ownership) > bound:
             out.append(
                 f"implement task {task.id} owns {len(task.file_ownership)} "
-                f"file_ownership globs (> {max_files} for its tier): the task is "
+                f"file_ownership entries (> {bound} for its tier): the task is "
                 f"too big, split it into smaller tasks (or later epochs) so each "
-                f"owns at most {max_files}"
+                f"owns at most {bound} concrete files"
             )
     return out
 

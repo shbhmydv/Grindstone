@@ -491,6 +491,55 @@ def test_rate_limit_exhaustion_escalates(git_repo: Path, run_dir: RunDir) -> Non
     assert outcome.reason is not None and "rate limit" in outcome.reason
 
 
+# --- session-limit hourly park (separate counter, never the transient budget) --
+
+
+def test_session_limit_parks_hourly_then_succeeds(git_repo: Path, run_dir: RunDir) -> None:
+    # A long quota-window session limit must PARK (sleep 3600s) and retry on a
+    # SEPARATE durable counter, never touching the transient counter or
+    # rate_limit_waits, and the run must NOT escalate.
+    recorded: list[float] = []
+    planner = MockPlanner(
+        script=[
+            two_phase_skeleton(),
+            "session_limit",
+            "session_limit",
+            "session_limit",
+            implement_decision(impl_task("T1", "f1.txt")),
+            complete_decision(check_cmd("test -f f1.txt")),
+        ]
+    )
+    outcome = run_grind(
+        run_dir, job_path="job.md", planner=planner, ladder=_ladder(), repo=git_repo,
+        sleep_fn=recorded.append,
+    )
+    assert outcome.status == "completed"
+    assert recorded == [3600.0, 3600.0, 3600.0]  # hourly, no wall clock
+    state = _run_state(run_dir)
+    assert state.session_limit_waits == 3
+    assert state.rate_limit_waits == 0  # never charged to the rate-limit budget
+    fails = [
+        e for e in read_events(run_dir.events_path)
+        if e.event == "planner_call_failed"
+        and getattr(e, "classification", "") == "session_limit"
+    ]
+    assert len(fails) == 3
+
+
+def test_session_limit_exhaustion_escalates(git_repo: Path, run_dir: RunDir) -> None:
+    # Past the high finite ceiling (24 hourly waits) the run escalates rather than
+    # hanging forever, with a clear reason.
+    recorded: list[float] = []
+    planner = MockPlanner(script=[two_phase_skeleton()] + ["session_limit"] * 30)
+    outcome = run_grind(
+        run_dir, job_path="job.md", planner=planner, ladder=_ladder(), repo=git_repo,
+        sleep_fn=recorded.append,
+    )
+    assert outcome.status == "escalated"
+    assert recorded == [3600.0] * 24  # 24 hourly parks then stop
+    assert outcome.reason is not None and "session limit" in outcome.reason
+
+
 # --- transient retries ---------------------------------------------------------
 
 

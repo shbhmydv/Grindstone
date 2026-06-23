@@ -72,6 +72,12 @@ cat "$err_tmp" >&2 || true
 
 if [[ "$rc" -ne 0 ]]; then
   echo "planner_request: codex exec exited $rc (repo=$repo)" >&2
+  # codex usually reports a rate/429/usage/session limit on stderr (already cat to
+  # ours above), but a limit could also land in the final-message log "$out".
+  # Grindstone classifies on the script's stdout+stderr, so surface any limit
+  # signature from "$out" to stderr too, so the transport raises RateLimited /
+  # SessionLimited (and PARKS) rather than burning the retry budget on a long limit.
+  grep -hiE 'rate.?limit|429|session limit|usage limit' "$out" 2>/dev/null | head -3 >&2 || true
   exit "$rc"
 fi
 exit 0

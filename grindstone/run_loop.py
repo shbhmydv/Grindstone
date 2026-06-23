@@ -113,7 +113,9 @@ from grindstone.planner import (
     MAX_REASKS,
     DEFAULT_LOCAL_MAX_TASK_FILES,
     DEFAULT_SENIOR_MAX_TASK_FILES,
+    MAX_SESSION_LIMIT_WAITS,
     MAX_TRANSIENT_RETRIES,
+    SESSION_LIMIT_RETRY_S,
     FailedEpochInfo,
     PhaseTailInfo,
     PlannerTransport,
@@ -179,6 +181,12 @@ class RunState(BaseModel):
     epoch_counter: int
     planner_call_count: int
     rate_limit_waits: int
+    #: Hourly SESSION-limit parks taken this run. A long quota-window limit
+    #: (claude/codex/opencode-go) resets in hours, so it is retried once an hour
+    #: WITHOUT touching ``rate_limit_waits`` or the transient counter; bounded by
+    #: ``MAX_SESSION_LIMIT_WAITS`` (then escalate). Defaulted so states crafted
+    #: before this field still load; reset to 0 at run start like its sibling.
+    session_limit_waits: int = 0
     last_integration_branch: str | None
     pending_decision: dict[str, Any] | None
     terminal_reason: str | None
@@ -755,10 +763,13 @@ def _transport_call(
 ) -> str:
     """Call the transport, surviving rate-limit / transient failures (ruling 2).
 
-    rate_limit → injected-``sleep_fn`` exponential backoff (max 6 waits/run,
-    durable); transient → immediate retry (max 3 per call site, then hard); hard
-    → escalate. Every attempt journals ``planner_call_started`` then, on failure,
-    ``planner_call_failed(classification)``. Returns the raw text on success.
+    session_limit → injected-``sleep_fn`` HOURLY park (a long quota-window limit
+    that resets in hours, max 24 waits/run via a SEPARATE durable counter, NEVER
+    against the transient/rate-limit budgets); rate_limit → injected-``sleep_fn``
+    exponential backoff (max 6 waits/run, durable); transient → immediate retry
+    (max 3 per call site, then hard); hard → escalate. Every attempt journals
+    ``planner_call_started`` then, on failure, ``planner_call_failed(classification)``.
+    Returns the raw text on success.
     ``workdir`` is the writable planner worktree a self-validating rig grinds in.
     """
 
@@ -775,6 +786,17 @@ def _transport_call(
             journal.emit(
                 lambda s: PlannerCallFailed(seq=s, ts=_now(), classification=classification)
             )
+            if classification == "session_limit":
+                # A long quota-window limit resets in HOURS: park and retry hourly
+                # on a SEPARATE durable counter, never the transient/rate-limit
+                # budgets, so a session limit can never escalate the run prematurely.
+                if store.state.session_limit_waits >= MAX_SESSION_LIMIT_WAITS:
+                    raise _Escalate(
+                        f"session limit: {MAX_SESSION_LIMIT_WAITS} hourly waits exhausted"
+                    ) from exc
+                store.update(session_limit_waits=store.state.session_limit_waits + 1)
+                sleep_fn(SESSION_LIMIT_RETRY_S)
+                continue
             if classification == "rate_limit":
                 if store.state.rate_limit_waits >= MAX_RATE_LIMIT_WAITS:
                     raise _Escalate(
@@ -1198,6 +1220,7 @@ def _dispatch_epoch(
     concurrency: int | None,
     tier0_attempts: int,
     prepare: PrepareConfig | None,
+    sleep_fn: SleepFn,
     *,
     epoch_hint: str | None = None,
     force_senior: bool = False,
@@ -1236,6 +1259,7 @@ def _dispatch_epoch(
         prepare=prepare,
         epoch_hint=epoch_hint,
         force_senior=force_senior,
+        sleep_fn=sleep_fn,
     )
     _record_epoch(store, outcome, decision)
     return outcome
@@ -1752,6 +1776,7 @@ def _apply_failed_epoch_decision(
     prepare: PrepareConfig | None,
     cap: int,
     verifier: EpochVerifier | None,
+    sleep_fn: SleepFn,
 ) -> tuple[RunOutcome | None, EpochOutcome | None]:
     """Dispatch a handle_failed_epoch decision; clear the pending failure.
 
@@ -1801,7 +1826,8 @@ def _apply_failed_epoch_decision(
         return _escalate(journal, store, "implement epoch requested but no repo configured"), None
     outcome = _dispatch_epoch(
         journal, run_dir, store, epoch_decision, repo, ladder, concurrency,
-        tier0_attempts, prepare, epoch_hint=epoch_hint, force_senior=force_senior,
+        tier0_attempts, prepare, sleep_fn,
+        epoch_hint=epoch_hint, force_senior=force_senior,
     )
     if outcome.status == "integration_conflict":
         return _escalate(
@@ -2288,8 +2314,9 @@ def _drive(
     last_epoch_rows = (
         flatten_last_epoch(run_dir, last_epoch) if last_epoch is not None else None
     )
-    # A ``senior`` tier in the ladder means a visual implement epoch starts on
-    # senior, so the size gate applies the senior file-count bound to it.
+    # A ``senior`` tier in the ladder means a per-task ``senior`` implement task
+    # starts on senior, so the size gate applies the larger senior file-count bound
+    # to it (and the local bound to it when the rig has no senior tier).
     has_senior = any(name == "senior" for name, _ in ladder)
     # The target repo's DOMAIN-skill catalogue (name -> one-line description), read
     # ONCE per run-loop entry: the planner sees this index to SELECT skills per task,
@@ -2384,6 +2411,7 @@ def _drive(
             result, outcome = _apply_failed_epoch_decision(
                 journal, run_dir, store, decision, repo, ladder, concurrency,
                 tier0_attempts, prepare, max_failed_epochs_per_phase, verifier,
+                sleep_fn,
             )
             if result is not None:
                 return result
@@ -2405,7 +2433,7 @@ def _drive(
             return _escalate(journal, store, "implement epoch requested but no repo configured")
         outcome = _dispatch_epoch(
             journal, run_dir, store, decision, repo, ladder, concurrency,
-            tier0_attempts, prepare,
+            tier0_attempts, prepare, sleep_fn,
         )
         if outcome.status == "integration_conflict":
             return _escalate(
@@ -2503,6 +2531,7 @@ def run_grind(
                 epoch_counter=0,
                 planner_call_count=0,
                 rate_limit_waits=0,
+                session_limit_waits=0,
                 last_integration_branch=None,
                 pending_decision=None,
                 terminal_reason=None,
@@ -2673,6 +2702,7 @@ def resume_grind(
                 concurrency=concurrency,
                 tier0_attempts=tier0_attempts,
                 prepare=prepare,
+                sleep_fn=sleep_fn,
             )
             _record_epoch(store, outcome, decision)
             if outcome.status == "integration_conflict":

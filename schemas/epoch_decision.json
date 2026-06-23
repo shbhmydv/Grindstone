@@ -143,6 +143,11 @@
           "items": { "type": "string", "maxLength": 64 },
           "maxItems": 6,
           "default": []
+        },
+        "senior": {
+          "description": "Per-task tier routing: true routes THIS task to the senior tier (judgment/taste work: layout, polish, approach synthesis, a design-quality verdict); false (the default) runs it on the local rig (mechanical/factual work: scaffolding, tokens, boilerplate, web-search fact gathering, a structural review). Routing is per task, not per epoch, so one epoch can split a mechanical local slice from a taste senior slice. A rig with no senior tier falls back to local. Also picks the size-gate file-count cap (senior tasks get the larger bound). Optional; defaults false.",
+          "type": "boolean",
+          "default": false
         }
       }
     },
@@ -179,12 +184,7 @@
       "required": ["epoch_title", "rationale", "tasks"],
       "properties": {
         "epoch_title": { "type": "string", "minLength": 1, "maxLength": 120 },
-        "rationale": { "type": "string", "maxLength": 2048 },
-        "visual": {
-          "description": "Taste routing: set true when the epoch produces or changes UI/visual output, so the core builds its workers on the stronger taste-building senior tier instead of the mode default (the senior is a text model; genuine image judgment is the vision_review gate). Optional; defaults false.",
-          "type": "boolean",
-          "default": false
-        }
+        "rationale": { "type": "string", "maxLength": 2048 }
       }
     },
     "implement_epoch_args": {

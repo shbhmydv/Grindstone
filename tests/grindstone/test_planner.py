@@ -652,9 +652,9 @@ def _impl_task_n(tid: str, *globs: str) -> dict[str, object]:
 def test_gate_rejects_oversized_implement_task_and_names_it() -> None:
     import json
 
-    # Seven owned globs > the default local bound (5): rejected, the offending
-    # task id is named so the re-ask tells the planner exactly what to split.
-    big = _impl_task_n("T3", "a", "b", "c", "d", "e", "f", "g")
+    # Seven owned CONCRETE files > the default local bound (5): rejected, the
+    # offending task id is named so the re-ask tells the planner what to split.
+    big = _impl_task_n("T3", "a.py", "b.py", "c.py", "d.py", "e.py", "f.py", "g.py")
     res = validate_decision(
         json.dumps(implement_decision(big)),
         existing_log_keys=_EMPTY, completed_phase_ids=_EMPTY, skeleton_exists=True,
@@ -672,7 +672,38 @@ def test_gate_rejects_whole_repo_ownership_on_fresh_implement() -> None:
             existing_log_keys=_EMPTY, completed_phase_ids=_EMPTY, skeleton_exists=True,
         )
         assert res.decision is None, glob
-        assert any("T1" in e and "whole-repo" in e for e in res.errors), glob
+        assert any("T1" in e and "broad glob" in e for e in res.errors), glob
+
+
+def test_gate_rejects_broad_scoped_wildcard_on_fresh_implement() -> None:
+    import json
+
+    # The incident: a single SCOPED wildcard (a whole subsystem) used to pass both
+    # the whole-repo check and the per-tier cap (one glob, count 1), so every
+    # complex epoch became one giant senior task. The gate now rejects ANY
+    # wildcard entry (must enumerate concrete files), naming the offending task.
+    for glob in ("src/design-system/**", "src/*", "lib/*.ts", "a/b/?.py"):
+        res = validate_decision(
+            json.dumps(implement_decision(_impl_task_n("T1", glob))),
+            existing_log_keys=_EMPTY, completed_phase_ids=_EMPTY, skeleton_exists=True,
+        )
+        assert res.decision is None, glob
+        assert any("T1" in e and "broad glob" in e for e in res.errors), glob
+
+
+def test_gate_accepts_enumerated_multi_file_implement_task() -> None:
+    import json
+
+    # An ENUMERATED slice of concrete files within the local cap passes cleanly.
+    enumerated = _impl_task_n(
+        "T1", "src/theme.ts", "src/tokens.ts", "src/index.ts"
+    )
+    res = validate_decision(
+        json.dumps(implement_decision(enumerated)),
+        existing_log_keys=_EMPTY, completed_phase_ids=_EMPTY, skeleton_exists=True,
+    )
+    assert res.decision is not None
+    assert res.errors == []
 
 
 def test_gate_allows_broad_scope_on_failed_epoch_repair() -> None:
@@ -698,16 +729,19 @@ def test_gate_allows_broad_scope_on_failed_epoch_repair() -> None:
     ) == []
 
 
-def test_gate_size_bound_is_tier_aware_for_visual_epochs() -> None:
+def _senior_task(tid: str, *files: str) -> dict[str, object]:
+    return {**_impl_task_n(tid, *files), "senior": True}
+
+
+def test_gate_size_bound_is_tier_aware_per_task_senior_flag() -> None:
     import json
 
-    # Six globs: over the local bound (5) but under the senior bound (12). A
-    # visual implement epoch starts on senior, so with a senior tier present it
-    # is judged against the senior bound and PASSES; without senior it does not.
-    six = _impl_task_n("T1", "a", "b", "c", "d", "e", "f")
-    dec = implement_decision(six)
-    dec["args"]["visual"] = True  # type: ignore[index]
-    payload = json.dumps(dec)
+    # Six concrete files: over the local bound (5) but under the senior bound (12).
+    # A task flagged senior:true is judged against the senior bound, so with a
+    # senior tier present it PASSES; without a senior tier it falls back to local
+    # and is rejected (its work would actually run on the local rig).
+    six = _senior_task("T1", "a.ts", "b.ts", "c.ts", "d.ts", "e.ts", "f.ts")
+    payload = json.dumps(implement_decision(six))
     with_senior = validate_decision(
         payload, existing_log_keys=_EMPTY, completed_phase_ids=_EMPTY,
         skeleton_exists=True, has_senior=True,
@@ -721,6 +755,26 @@ def test_gate_size_bound_is_tier_aware_for_visual_epochs() -> None:
     )
     assert no_senior.decision is None  # falls back to local bound (5) -> rejected
     assert any("T1" in e and "too big" in e for e in no_senior.errors)
+
+
+def test_gate_local_task_uses_local_bound_even_with_senior_sibling() -> None:
+    import json
+
+    # Per-TASK bounds: in one epoch a senior task may carry up to 12 files while a
+    # local sibling is still held to 5. A 6-file LOCAL task is rejected even though
+    # a senior tier exists and a senior sibling is within its larger bound.
+    local_big = _impl_task_n("T1", "a.ts", "b.ts", "c.ts", "d.ts", "e.ts", "f.ts")
+    senior_ok = _senior_task("T2", "x/1.ts", "x/2.ts", "x/3.ts", "x/4.ts",
+                             "x/5.ts", "x/6.ts", "x/7.ts")
+    res = validate_decision(
+        json.dumps(implement_decision(local_big, senior_ok)),
+        existing_log_keys=_EMPTY, completed_phase_ids=_EMPTY,
+        skeleton_exists=True, has_senior=True,
+        local_max_task_files=5, senior_max_task_files=12,
+    )
+    assert res.decision is None
+    assert any("T1" in e and "too big" in e for e in res.errors)
+    assert not any("T2" in e for e in res.errors)
 
 
 # --- content-grep forbiddance (gate rebalance G1) ------------------------------

@@ -113,11 +113,17 @@ set -e
 cat "$log_err" >&2 || true
 cat "$log_out" || true
 
-# A genuine infra failure (rate limit / 429) must still propagate a non-zero exit
-# so grindstone's transport raises RateLimited and backs off, never synthesize a
-# FAILED handoff over it (that would mask the retryable condition as a hard fail).
-if [[ "$rc" -ne 0 ]] && grep -qiE 'rate.?limit|429' "$log_err" 2>/dev/null; then
-  echo "worker_request: pi exited $rc (provider=$provider model=$model, rate-limited)" >&2
+# A genuine infra failure (rate limit / 429 / a long quota-window SESSION limit)
+# must still propagate a non-zero exit so grindstone's transport raises
+# RateLimited / SessionLimited and parks, never synthesize a FAILED handoff over it
+# (that would mask the retryable condition as a hard fail and burn the retry ladder).
+# A session/usage limit can land on STDOUT, so we grep BOTH logs; the pattern also
+# covers the long session/usage limit, and we re-echo it to stderr so the Python
+# transport's stdout+stderr inspection catches it.
+if [[ "$rc" -ne 0 ]] \
+   && grep -qiE 'rate.?limit|429|session limit|usage limit' "$log_err" "$log_out" 2>/dev/null; then
+  echo "worker_request: pi exited $rc (provider=$provider model=$model, rate/session-limited)" >&2
+  grep -hiE 'rate.?limit|429|session limit|usage limit' "$log_err" "$log_out" 2>/dev/null | head -3 >&2 || true
   exit "$rc"
 fi
 

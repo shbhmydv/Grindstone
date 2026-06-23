@@ -57,7 +57,14 @@ from grindstone.rundir import RunDir
 # planner code imports one surface. ``PlannerHardError`` is the planner-only
 # addition for auth/config: it is deliberately NOT a ``TransportError`` so
 # ``classify_failure`` reads it as ``hard`` (the default branch).
-from grindstone.worker import RateLimited, TransportError, WorkerTimeout
+from grindstone.worker import (
+    MAX_SESSION_LIMIT_WAITS,
+    SESSION_LIMIT_RETRY_S,
+    RateLimited,
+    SessionLimited,
+    TransportError,
+    WorkerTimeout,
+)
 
 __all__ = [
     "BACKOFF_BASE_S",
@@ -70,6 +77,7 @@ __all__ = [
     "GateResult",
     "MAX_RATE_LIMIT_WAITS",
     "MAX_REASKS",
+    "MAX_SESSION_LIMIT_WAITS",
     "MAX_TRANSIENT_RETRIES",
     "PLANNER_CORE",
     "PLANNER_SCENARIOS",
@@ -77,6 +85,8 @@ __all__ = [
     "PlannerHardError",
     "PlannerTransport",
     "RateLimited",
+    "SESSION_LIMIT_RETRY_S",
+    "SessionLimited",
     "TOOL_NAMES",
     "TransportError",
     "WorkerTimeout",
@@ -138,7 +148,7 @@ class PlannerTransport(Protocol):
 
 # --- failure classification + backoff (ruling 2) -------------------------------
 
-FailureClass = Literal["rate_limit", "transient", "hard"]
+FailureClass = Literal["rate_limit", "transient", "hard", "session_limit"]
 
 #: Exponential backoff for rate-limit waits: 30s, 60s, 120s, 240s, 480s, 600s…
 BACKOFF_BASE_S = 30.0
@@ -147,6 +157,15 @@ BACKOFF_CAP_S = 600.0
 MAX_RATE_LIMIT_WAITS = 6
 MAX_TRANSIENT_RETRIES = 3
 MAX_REASKS = 2
+
+# The HOURLY session-limit park policy (``SESSION_LIMIT_RETRY_S`` /
+# ``MAX_SESSION_LIMIT_WAITS``) is imported from ``grindstone.worker`` above, where
+# it lives next to ``SessionLimited`` so the task_loop worker path can share the
+# same values WITHOUT the planner-import cycle (planner -> epoch_loop -> task_loop).
+# It is re-exported here (in ``__all__``) so planner callers keep one import surface:
+# a long quota-window limit resets in HOURS, so ``SessionLimited`` PARKS the run and
+# retries once an hour, never against the transient/rate-limit budgets, bounded by a
+# high finite ceiling (24 hourly waits ~= 24h, past any single reset window, then escalate).
 
 #: Default tier-aware ceilings on a fresh implement task's ``file_ownership``
 #: glob count (the planner-decomposition size gate). Mirror the config defaults
@@ -158,13 +177,18 @@ DEFAULT_SENIOR_MAX_TASK_FILES = 12
 
 
 def classify_failure(exc: BaseException) -> FailureClass:
-    """Three-way classification of a planner-call failure (ARCHITECTURE.md).
+    """Four-way classification of a planner-call failure (ARCHITECTURE.md).
 
-    ``RateLimited`` → rate_limit (wait for the window, never auto-spill to a
-    different planner). ``TransportError`` / ``WorkerTimeout`` → transient (retry
-    the same call). Anything else (auth/config/unknown) → hard (escalate).
+    ``SessionLimited`` → session_limit (a long quota-window limit, park the run
+    and retry hourly, NEVER against the transient/rate-limit budgets). It is
+    checked FIRST because it subclasses ``RateLimited`` (a session limit is the
+    long kind). ``RateLimited`` → rate_limit (a transient 429, short backoff, never
+    auto-spill to a different planner). ``TransportError`` / ``WorkerTimeout`` →
+    transient (retry the same call). Anything else (auth/config/unknown) → hard.
     """
 
+    if isinstance(exc, SessionLimited):
+        return "session_limit"
     if isinstance(exc, RateLimited):
         return "rate_limit"
     if isinstance(exc, (TransportError, WorkerTimeout)):
@@ -264,8 +288,9 @@ The keys schema_version, tool, args are ALL mandatory. Do NOT use the shorthand
 
 `args` by tool (the schema is authoritative):
 - propose_skeleton: {"phases":[{"id":"P1..","title":..,"exit_criterion":[check..],"epoch_budget":int}]}
-- implement:        {"epoch_title":..,"rationale":..,"visual"?:bool,"tasks":[{"id":"T1..","goal":..,"done_when":[check..],"file_ownership":[glob..],"inputs"?,"skills"?}]}
-- research/review/artifact: {"epoch_title":..,"rationale":..,"visual"?:bool,"tasks":[{"id","goal","done_when","artifact_out","targets"?,"inputs"?,"skills"?}]}
+- implement:        {"epoch_title":..,"rationale":..,"tasks":[{"id":"T1..","goal":..,"done_when":[check..],"file_ownership":[concrete file path..],"senior"?:bool,"inputs"?,"skills"?,"criteria"?}]}
+- research/review/artifact: {"epoch_title":..,"rationale":..,"tasks":[{"id","goal","done_when","artifact_out","targets"?,"senior"?:bool,"inputs"?,"skills"?,"criteria"?}]}
+  (`senior`:true routes THAT task to the senior tier for judgment/taste/synthesis; default false runs it locally. `file_ownership` must enumerate CONCRETE files, no wildcard globs.)
 - revise_phases:    {"reason":..,"phases":[..]}  (the PHASE STRUCTURE is wrong; replaces the current phase onward, never completed phases)
 - handle_failed_epoch: {"action":"retry","hint":..,"escalate_tier"?:bool} | {"action":"escalate_senior","diagnosis":..} | {"action":"halt","reason":..}  (legal ONLY when an epoch has failed and is awaiting disposition)
 - escalate_run:     {"reason":..,"needed_from_human"?}
@@ -950,15 +975,22 @@ def _size_gate_violations(
     its originating decision directly (never through this gate) and may need broad
     scope, and while a failed epoch is awaiting disposition the ONLY legal tool is
     ``handle_failed_epoch`` anyway, so ``failed_epoch_active`` short-circuits the
-    gate. TIER-AWARE: a ``visual`` implement epoch starts on the senior tier (when
-    the rig has one), so it gets the larger senior bound; everything else is the worker tier.
+    gate. TIER-AWARE PER TASK: a ``task.senior`` task runs on the senior tier (when
+    the rig has one), so it gets the larger senior bound; every other task (and any
+    task when the rig has NO senior tier, since it then falls back to local) gets the
+    local bound.
     """
 
     if failed_epoch_active or not isinstance(decision, ImplementDecision):
         return []
-    on_senior = decision.args.visual and has_senior
-    bound = senior_max_task_files if on_senior else local_max_task_files
-    return implement_task_size_violations(list(decision.args.tasks), max_files=bound)
+    # No senior tier in the ladder -> a senior task falls back to local, so it is
+    # bounded by the local cap; pass that as the senior bound in that case.
+    senior_bound = senior_max_task_files if has_senior else local_max_task_files
+    return implement_task_size_violations(
+        list(decision.args.tasks),
+        max_files=local_max_task_files,
+        senior_max_files=senior_bound,
+    )
 
 
 def _content_grep_violations(decision: EpochDecision) -> list[str]:

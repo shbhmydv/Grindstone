@@ -60,11 +60,37 @@ Requirements:
 - End with a recommendation for a 3-endpoint internal service.
 """
 
+#: A decomposable implement job: a MECHANICAL slice (design tokens / scaffolding)
+#: plus a TASTE slice (the screen's layout/feel), so a well-decomposed plan splits
+#: them into separate tasks and flags only the taste task senior.
+UI_BUILD_JOB = """\
+Build a small React Native home screen for a notes app (Expo, TypeScript).
+
+Requirements:
+- A `src/tokens.ts` exporting the color + spacing scale (a Material 3 palette).
+- A `src/HomeScreen.tsx` home screen: a calm, well-composed layout with ONE primary
+  action (a "New note" button, >=44px touch target), a list of recent notes, and
+  generous spacing drawn from the token scale.
+- The tokens are mechanical (a fixed scale). The screen's layout and visual feel
+  are a matter of taste and judgment.
+"""
+
 #: A two-phase skeleton handed to the mid-run + failed-epoch boundaries (P1 done).
 _SKELETON_DICT = skeleton_decision(
     phase_dict("P1", title="scaffold the package + store"),
     phase_dict("P2", title="implement the commands + tests"),
 )
+
+#: A skeleton for the UI build whose P2 is the build phase (P1 = scaffold, done).
+_UI_SKELETON_DICT = skeleton_decision(
+    phase_dict("P1", title="scaffold the Expo app"),
+    phase_dict("P2", title="build the tokens + home screen"),
+)
+
+
+def _ui_skeleton() -> list[Phase]:
+    decision = parse_decision(_UI_SKELETON_DICT)
+    return list(decision.args.phases)  # type: ignore[union-attr]
 
 
 def _skeleton() -> list[Phase]:
@@ -169,3 +195,47 @@ def test_failed_epoch_boundary_disposes(rig: str) -> None:
         failed_epoch_active=True,
         completed_phase_ids=frozenset({"P1"}),
     )
+
+
+# --- mid-run boundary: decomposition + per-task tier mix -----------------------
+
+
+@pytest.mark.eval
+def test_decomposable_implement_splits_and_tiers(rig: str) -> None:
+    """A UI build whose work is decomposable into a MECHANICAL slice (tokens) and a
+    TASTE slice (the screen) -> the real planner DECOMPOSES it and TIERS it.
+
+    BAND (properties, not goldens): if the planner picks ``implement`` for this
+    boundary, then (i) it fans out into >= 2 tasks, (ii) every implement task
+    enumerates CONCRETE files (no broad glob, so the gate passes), and (iii) the
+    tasks MIX tiers, at least one local mechanical task AND at least one
+    ``senior: true`` task. The whole decision still conforms to the production gate.
+
+    The tool is NOT pinned to implement: a sound planner may legitimately reach for
+    research first on this phase. We assert the decomposition+tier properties only
+    when it DID choose implement (the case this change targets); a research/artifact
+    choice still must conform. This keeps the band behavioral: a broken plan (one
+    giant senior task, or a broad glob) cannot pass, while a strong and a weak model
+    both can."""
+
+    A.assert_scenario_selected(
+        skeleton_exists=True, failed_epoch_active=False, expected="plan_epoch"
+    )
+    decision = run_planner_boundary(
+        job_spec=UI_BUILD_JOB,
+        rig=rig,
+        skeleton=_ui_skeleton(),
+        completed_phase_ids=("P1",),
+        has_senior=True,
+    )
+    A.assert_tool_in(decision, A.WORK_TOOLS)
+    A.assert_conforms(
+        decision,
+        skeleton_exists=True,
+        completed_phase_ids=frozenset({"P1"}),
+        has_senior=True,
+    )
+    if decision.tool == "implement":
+        A.assert_decomposed_into_at_least(decision, 2)
+        A.assert_ownership_enumerated(decision)
+        A.assert_tier_mix(decision, min_local=1, min_senior=1)
