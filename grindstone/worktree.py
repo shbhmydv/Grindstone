@@ -153,6 +153,25 @@ def force_branch(repo: Path, branch: str, commit: str) -> None:
     _git(repo, "branch", "-f", branch, commit)
 
 
+def fast_forward_branch(repo: Path, run_branch: str, commit: str) -> None:
+    """Advance the persistent RUN branch ``run_branch`` to ``commit`` (create it
+    there if it does not yet exist).
+
+    The single ref that survives between epochs: each epoch stages its merges on a
+    throwaway ``grind-wip/.../_staging`` branch off the current run tip, then on
+    success this advances the run branch to that staging tip. The FIRST epoch
+    creates ``run_branch`` at the staging tip; every later epoch is a true
+    fast-forward (the staging branch was started off the run tip, so it descends
+    from it). ``git branch -f`` covers both create-and-move uniformly; the run
+    branch is never checked out in a worktree (the epoch worktrees are pruned
+    before this runs), so the force always succeeds. Semantically distinct from
+    ``force_branch`` (which force-MOVES an arbitrary branch to a possibly-divergent
+    commit, the polish adoption): here the move is always a forward advance.
+    """
+
+    _git(repo, "branch", "-f", run_branch, commit)
+
+
 # --- worktree lifecycle --------------------------------------------------------
 
 

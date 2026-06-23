@@ -106,6 +106,11 @@ class EpochState(BaseModel):
     title: str
     mode: HandoffMode
     is_implement: bool
+    #: For an IMPLEMENT epoch: the epoch base commit (the run tip the staging branch
+    #: starts at; the scope check measures against it). For a NON-implement epoch
+    #: (review/research/artifact, which integrate nothing): the READ-tip
+    #: (integration-tip) commit the tasks read from, persisted so resume re-derives
+    #: the same read tip. ``None`` when there is no tip yet or no repo.
     base: str | None
     integration: IntegrationState
     tasks: dict[str, TaskCursorState]
@@ -363,6 +368,16 @@ def _fan_out(
 # --- integration ---------------------------------------------------------------
 
 
+def _run_branch(run_dir: RunDir) -> str:
+    """The ONE persistent run branch ``grind/{run_id}``: the only ref that survives
+    between epochs. It fast-forwards as each epoch's staging branch passes. A leaf
+    ref, so nothing else may live under ``grind/{run_id}/...`` (git ref dir/file
+    conflict); the transient staging + attempt branches all live under ``grind-wip/``.
+    """
+
+    return f"grind/{run_dir.root.name}"
+
+
 def _integrate(
     *,
     repo: Path,
@@ -372,29 +387,37 @@ def _integrate(
     base: str,
     done_in_order: list[TaskOutcome],
 ) -> IntegrationOutcome:
-    """Fast-forward-merge each DONE task's branch into the integration branch.
+    """Merge each DONE task's branch onto the epoch STAGING branch, then on success
+    fast-forward the persistent run branch ``grind/{run_id}`` to the staging tip and
+    delete every transient (staging + attempt) branch.
 
-    A fresh integration (nothing merged yet) starts from ``base``: any stale
-    same-named branch (the name is not run-scoped) is dropped first so prior-run
-    content cannot poison the merge. Idempotent for resume: when progress exists
-    (``merged`` non-empty) the branch is kept, and a branch already merged is an
-    ancestor of the integration branch (or has been deleted) and is skipped. Any
-    conflict aborts the epoch; given the fresh-base precondition + disjointness it
-    is structurally impossible.
+    ``branch`` is the transient ``grind-wip/.../_staging`` branch. A fresh
+    integration (nothing merged yet) starts it from ``base`` (the current run tip the
+    caller resolved): any stale same-named leftover is dropped first so prior content
+    cannot poison the merge. On resume mid-integration (``merged`` non-empty) the
+    staging branch carries real progress and is kept; an already-merged task branch is
+    its ancestor (or deleted) and is skipped (idempotent). Any conflict ABORTS the
+    epoch, leaving the run branch UNTOUCHED (given the fresh-base precondition +
+    disjoint ownership it is structurally impossible). The returned
+    ``IntegrationOutcome.branch`` is the RUN branch on success (so the run loop's
+    ``last_integration_branch`` advances to the surviving ref), the staging branch on
+    a conflict (nothing was promoted).
     """
 
-    # A fresh integration (nothing merged yet) must start from `base`. The
-    # internal integration branch name is not run-scoped, so a same-named branch
-    # left by a prior run or a prior attempt would silently poison the merge with
-    # stale content (a phantom both-added conflict). Drop it first. On resume
-    # mid-integration (merged non-empty) the branch carries real progress: keep it.
+    run_branch = _run_branch(run_dir)
+    # A fresh integration (nothing merged yet) must start the staging branch from
+    # `base` (the current run tip). The staging branch name is run-scoped, but a
+    # crash before the prior run's staging branch was deleted could leave a same-named
+    # leftover that would poison the merge with stale content (a phantom both-added
+    # conflict). Drop it first. On resume mid-integration (merged non-empty) the branch
+    # carries real progress: keep it (idempotent).
     if not store.state.integration.merged:
         wt.delete_branch(repo, branch)
     wt.ensure_integration_branch(repo, branch, base)
     merged: list[str] = list(store.state.integration.merged)
 
     if done_in_order:
-        int_wt = run_dir.root / "worktrees" / "_integration"
+        int_wt = run_dir.root / "worktrees" / "_staging"
         wt.add_worktree_on(repo, int_wt, branch=branch)
         for outcome in done_in_order:
             tid = outcome.identity.task_id
@@ -415,6 +438,9 @@ def _integrate(
                 continue
             result = wt.merge_into(int_wt, task_branch)
             if not result.ok:
+                # Conflict: abort the epoch and leave the RUN branch UNTOUCHED. The
+                # staging branch (and the attempt branches) are kept for the next
+                # disposition; only the merge worktree is reclaimed.
                 wt.remove_worktree(repo, int_wt)
                 store.update_integration(
                     IntegrationState(
@@ -430,16 +456,29 @@ def _integrate(
             )
         wt.remove_worktree(repo, int_wt)
 
-    # Prune the epoch's worktrees, THEN delete the merged task branches (git
-    # refuses to delete a branch still checked out in a worktree), ruling 7.
+    # Epoch succeeded: advance the persistent run branch to the staging tip (create
+    # it there on the first epoch; a true fast-forward thereafter, the staging branch
+    # was started off the run tip). Resolve the staging tip BEFORE pruning worktrees
+    # (the ref still exists) so the run branch captures the merged work.
+    staging_tip = wt.resolve_commit(repo, branch)
+    # Prune the epoch's worktrees, THEN move/delete branches: git refuses to delete or
+    # reuse a branch still checked out in a worktree (ruling 7). The run branch is a
+    # leaf ref never checked out in an epoch worktree, so the fast-forward is safe.
     wt.prune_tree(repo, run_dir.root / "worktrees")
+    wt.fast_forward_branch(repo, run_branch, staging_tip)
+    # "Once things pass, they clean up and fall down": delete the now-absorbed
+    # transient branches (the staging branch + every merged task attempt branch). The
+    # work survives on the run branch; nothing under ``grind-wip/`` outlives the epoch.
+    wt.delete_branch(repo, branch)
     for outcome in done_in_order:
         if outcome.branch:
             wt.delete_branch(repo, outcome.branch)
     store.update_integration(
-        IntegrationState(branch=branch, status="completed", merged=merged, conflict=None)
+        IntegrationState(branch=run_branch, status="completed", merged=merged, conflict=None)
     )
-    return IntegrationOutcome(status="completed", branch=branch, merged=merged, conflict=None)
+    return IntegrationOutcome(
+        status="completed", branch=run_branch, merged=merged, conflict=None
+    )
 
 
 def _finish(
@@ -525,6 +564,16 @@ def run_epoch(
     ``base`` is the epoch base commit (the chain tip, ruling 4), defaulted to
     repo HEAD when omitted. Artifact epochs need no repo and integrate nothing.
 
+    For a NON-implement epoch (research/review/artifact) ``base`` is NOT an epoch
+    base (those epochs integrate nothing); it is the READ tip the tasks audit, the
+    current integration tip resolved by the caller. The work built earlier in the
+    run lives only on that tip (the operator checkout sits at the clean base), so a
+    review/research task checks it out into a detached read-only worktree and reads
+    THAT, not the stale operator tree (the live P5 hallucinated-review bug). It is
+    persisted to ``EpochState.base`` so resume re-derives the same read tip. ``None``
+    when there is no tip yet (a first epoch, an unborn HEAD) or no repo, in which case
+    the task falls back to reading the operator checkout (the prior behavior).
+
     ``epoch_hint`` (a planner handle_failed_epoch ``retry`` corrective) is seeded
     into every task's failure context so the workers see it on their first
     attempt; ``force_senior`` starts EVERY task on the senior tier (the planner's
@@ -544,9 +593,18 @@ def run_epoch(
     identities = {t.id: TaskIdentity(run_id, phase_id, epoch_id, t.id) for t in tasks}
     if is_implement and repo is not None:
         base = base if base is not None else wt.head_commit(repo)
-    else:
-        base = None
-    integration_branch = f"grind/{run_id}/{phase_id}/{epoch_id}/_integration" if is_implement else None
+    # A non-implement epoch keeps ``base`` AS PASSED: it is the read tip the caller
+    # resolved (the current integration tip), not an epoch base, and it is the handle
+    # the tasks read against. None when no tip exists yet or no repo (fall back to the
+    # operator checkout). Never defaulted to HEAD: HEAD is the stale operator tree.
+    # The per-epoch STAGING branch (transient): merges fan out onto it off the
+    # current run tip, then on success the run branch ``grind/{run_id}`` fast-forwards
+    # to its tip and it is deleted. It lives under the transient ``grind-wip/``
+    # namespace, never ``grind/{run_id}/...`` (which would dir/file-conflict with the
+    # ``grind/{run_id}`` leaf run branch in git's ref store).
+    integration_branch = (
+        f"grind-wip/{run_id}/{phase_id}/{epoch_id}/_staging" if is_implement else None
+    )
 
     state = EpochState(
         phase_id=phase_id,

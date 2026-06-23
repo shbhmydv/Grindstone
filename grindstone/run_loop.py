@@ -1309,6 +1309,20 @@ def _dispatch_epoch(
             if store.state.last_integration_branch is not None
             else wt.head_commit(repo)
         )
+    else:
+        # A non-implement epoch (research/review/artifact) integrates nothing, so it
+        # has no epoch base; ``base`` here is the READ tip its tasks audit, the
+        # current integration tip. The work built earlier in the run lives ONLY on
+        # that tip (the operator checkout sits at the clean base), so the tasks must
+        # read it, not the stale operator tree (the live P5 hallucinated-review bug).
+        # None when no integration branch exists yet (a first research epoch on the
+        # untouched repo) or the ref will not resolve: the task then falls back to the
+        # operator checkout, preserving the prior first-epoch / artifact-only behavior.
+        if repo is not None and store.state.last_integration_branch is not None:
+            try:
+                base = wt.resolve_commit(repo, store.state.last_integration_branch)
+            except wt.GitError:
+                base = None
     store.update(status="running_epoch", pending_decision=decision.model_dump(mode="json"))
     outcome = run_epoch(
         run_dir,
@@ -1664,7 +1678,11 @@ def _run_one_infra_repair(
     tip = store.state.last_integration_branch or "HEAD"
     base_commit = wt.resolve_commit(repo, tip)
     worktree = run_dir.root / "worktrees" / f"_infra_repair_{attempt}"
-    branch = f"grind/{run_dir.root.name}/infra-repair-{attempt}"
+    # TRANSIENT repair branch under ``grind-wip/``, never ``grind/{run_id}/...``: the
+    # persistent run branch ``grind/{run_id}`` is a leaf ref, and a child under it
+    # would dir/file-conflict in git's ref store. On a sticking repair the run branch
+    # fast-forwards to the repair commit and this transient branch is deleted.
+    branch = f"grind-wip/{run_dir.root.name}/infra-repair-{attempt}"
     failing_cmds = [r.cmd for r in failing if r.cmd is not None]
     output_tail = "\n\n".join(r.label for r in failing)
     journal.emit(
@@ -1727,8 +1745,15 @@ def _run_one_infra_repair(
     if not all(r.ok for r in recheck):
         wt.delete_branch(repo, branch)
         return False
-    # The repair sticks: adopt it as the integration tip so the phase gate passes.
-    store.update(last_integration_branch=branch)
+    # The repair sticks: advance the persistent run branch to the repair commit (it
+    # is created there if no implement epoch has run yet, else fast-forwarded), record
+    # the RUN branch as the integration tip so the phase gate reads the repaired tree,
+    # and delete the now-absorbed transient repair branch ("once it passes, it cleans
+    # up and falls down").
+    run_branch = f"grind/{run_dir.root.name}"
+    wt.fast_forward_branch(repo, run_branch, repair_commit)
+    wt.delete_branch(repo, branch)
+    store.update(last_integration_branch=run_branch)
     return True
 
 

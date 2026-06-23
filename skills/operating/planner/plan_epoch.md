@@ -40,7 +40,13 @@ escalate_run / complete_run.
   ui/screen.png"}`), then a `vision_review` of that `ui/screen.png` against the
   design bar. The state machine renders the verdict deterministically (a failed
   taste verdict fails the phase, just like a failed command), it is not a task
-  `done_when` (a worker scratch has no renderer/screenshot).
+  `done_when` (a worker scratch has no renderer/screenshot). PREFER a
+  vision_review for COMPOSITION and taste judgment (hierarchy, type-scale
+  contrast, balance, deliberate negative space): deterministic DOM and token
+  checks verify per-element correctness but are blind to whole-screen
+  composition, so a visual phase gated on DOM assertions alone passes an
+  element-correct yet compositionally flat screen. Pair the DOM floor with a
+  vision_review against the composition criteria.
 - Domain skills: when a `<domain_skills>` catalogue is shown above, attach the
   relevant skills to a task by listing their NAMES in that task's `skills` field;
   the core delivers the selected skill text into that task's worker. Keep selection

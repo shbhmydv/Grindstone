@@ -148,9 +148,30 @@ roles:
 #   # screenshot: ui/home.png
 """
 
-#: The single line `init` ensures in the repo's .gitignore (the run dir + config
-#: live under .grindstone/ and must never be committed).
-_GITIGNORE_LINE = ".grindstone/"
+#: Markers bracketing grindstone's auto-managed .gitignore block. The bake
+#: detects them and rewrites the block IN PLACE (never re-appends), so it is
+#: idempotent; everything outside the markers is user content, preserved verbatim.
+_IGNORE_HEADER = "# grindstone: run-incidental outputs (auto-managed)"
+_IGNORE_FOOTER = "# grindstone: end run-incidental outputs"
+
+#: The managed entries. The run dir + config live under .grindstone/ and must
+#: never be committed; the CONTENTS form (`.grindstone/*`, not the bare dir) lets
+#: the negation re-include the domain-skill catalogue. The remaining names are
+#: ecosystem-standard test/build incidental dirs that `done_when` commands
+#: commonly emit into a worktree (Playwright, pytest, coverage); without them a
+#: worker's `git add -A` commits the noise, tripping the file-ownership scope gate.
+_MANAGED_IGNORES = (
+    ".grindstone/*",
+    "!.grindstone/skills/",
+    "test-results/",
+    "playwright-report/",
+    "coverage/",
+    ".pytest_cache/",
+)
+
+#: The single bare line old `init` appended. The managed block supersedes it, and
+#: the bare dir form would defeat the skills negation, so the bake drops it.
+_LEGACY_IGNORE_LINE = ".grindstone/"
 
 _EXIT: dict[str, int] = {"completed": 0, "escalated": 1, "failed": 2}
 
@@ -397,24 +418,50 @@ def _cmd_init(args: argparse.Namespace) -> int:
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
         cfg_path.write_text(_render_config_template(args.rig), encoding="utf-8")
         print(f"wrote {cfg_path}")
-    if _ensure_gitignored(repo):
-        print(f"added {_GITIGNORE_LINE} to .gitignore")
+    if ensure_run_incidental_ignores(repo):
+        print("baked the grindstone run-incidental block into .gitignore")
     return 0
 
 
-def _ensure_gitignored(repo: Path) -> bool:
-    """Append ``.grindstone/`` to the repo's ``.gitignore`` if missing.
+def _strip_managed_block(text: str) -> str:
+    """Return ``text`` with a previously-baked managed block removed.
 
-    Returns whether the line was added (so init can report it). Match is on the
-    stripped line so a pre-existing ignore is never duplicated.
+    Drops the header line through the footer line (inclusive); a missing footer
+    is treated as running to end-of-file (defensive). No header -> unchanged.
+    """
+
+    lines = text.splitlines()
+    if _IGNORE_HEADER not in lines:
+        return text
+    start = lines.index(_IGNORE_HEADER)
+    end = len(lines) - 1
+    for i in range(start + 1, len(lines)):
+        if lines[i].strip() == _IGNORE_FOOTER:
+            end = i
+            break
+    del lines[start : end + 1]
+    return "\n".join(lines)
+
+
+def ensure_run_incidental_ignores(repo: Path) -> bool:
+    """Bake grindstone's auto-managed run-incidental block into ``repo/.gitignore``.
+
+    Idempotent: any prior managed block (and the legacy bare ``.grindstone/`` line)
+    is stripped first, then the canonical block is re-emitted, so re-running never
+    duplicates. All other user content is preserved verbatim. Returns whether the
+    file changed (so callers can report it). Creates the file if absent.
     """
 
     gitignore = repo / ".gitignore"
-    existing = gitignore.read_text(encoding="utf-8") if gitignore.is_file() else ""
-    if _GITIGNORE_LINE in {line.strip() for line in existing.splitlines()}:
+    original = gitignore.read_text(encoding="utf-8") if gitignore.is_file() else ""
+    body = _strip_managed_block(original)
+    kept = [ln for ln in body.splitlines() if ln.strip() != _LEGACY_IGNORE_LINE]
+    user_text = "\n".join(kept).rstrip("\n")
+    block = "\n".join((_IGNORE_HEADER, *_MANAGED_IGNORES, _IGNORE_FOOTER))
+    new_text = (user_text + "\n\n" + block + "\n") if user_text else (block + "\n")
+    if new_text == original:
         return False
-    prefix = "" if existing == "" or existing.endswith("\n") else "\n"
-    gitignore.write_text(existing + prefix + _GITIGNORE_LINE + "\n", encoding="utf-8")
+    gitignore.write_text(new_text, encoding="utf-8")
     return True
 
 

@@ -91,7 +91,7 @@ def _craft_inflight_single(repo: Path, run_dir: RunDir) -> None:
         is_implement=True,
         base=wt.head_commit(repo),
         integration=IntegrationState(
-            branch=f"grind/{run_dir.root.name}/P1/E1/_integration",
+            branch=f"grind-wip/{run_dir.root.name}/P1/E1/_staging",
             status="pending", merged=[], conflict=None,
         ),
         tasks={"T1": cursor},

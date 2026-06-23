@@ -505,6 +505,86 @@ def test_artifact_out_with_subdir_published_from_full_path(
     assert run_dir.resolve("MIGRATION/inv.md").is_file()
 
 
+# --- non-implement tasks read the integration tip, not the operator base -------
+
+
+class _TipReadingWorker:
+    """A review/research worker that READS a target file from its scratch CWD and
+    fails the attempt if it is absent, then cites it.
+
+    Used to prove a non-implement task runs against the integration TIP (where the
+    work built earlier in the run lives), not the stale operator checkout (which
+    sits at the clean base, where the file does not exist yet). If the CWD is the
+    base tree the read fails (no handoff is written -> the attempt fails the gate);
+    if it is the tip worktree the read succeeds and the cited file grounds."""
+
+    def __init__(self, target: str, artifact_out: str) -> None:
+        self.target = target
+        self.artifact_out = artifact_out
+        self.saw_target = False
+
+    def run(self, request: WorkerRequest) -> None:
+        src = request.scratch / self.target
+        if not src.is_file():
+            return  # base tree: target absent -> no handoff -> failed attempt
+        self.saw_target = True
+        body = src.read_text(encoding="utf-8")
+        out = request.scratch / self.artifact_out
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(f"reviewed: {body}", encoding="utf-8")
+        payload = handoff_payload(
+            task_id=request.task_id, citations=[{"file": self.target}]
+        )
+        (request.scratch / "handoff.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+
+
+def test_review_task_reads_integration_tip_not_operator_base(
+    git_repo: Path, run_dir: RunDir
+) -> None:
+    """A later-epoch review must audit the accumulated build, which lives on the
+    integration tip, NOT the operator checkout (which during a run sits at the clean
+    base). The earlier work (``src/screens/Home.tsx``) exists only on the tip branch;
+    the operator tree never has it. A review task told to read it must see the tip's
+    content. Before the fix the task ran in a plain run-dir dir with the operator
+    checkout as its citation root, so it could neither READ the file (empty CWD) nor
+    GROUND a citation to it -> the live P5 hallucinated review + false escalation."""
+
+    # Build an integration tip: a branch carrying a file the operator base lacks.
+    target = "src/screens/Home.tsx"
+    (git_repo / "src" / "screens").mkdir(parents=True, exist_ok=True)
+    (git_repo / target).write_text("export const Home = () => null\n", encoding="utf-8")
+    git(git_repo, "checkout", "-q", "-b", "grind/integration-tip")
+    git(git_repo, "add", "-A")
+    git(git_repo, "commit", "-q", "-m", "build Home screen")
+    tip = git(git_repo, "rev-parse", "HEAD").stdout.strip()
+    # Return the operator checkout to the clean base (no src/), the run-time state.
+    git(git_repo, "checkout", "-q", "main")
+    assert not (git_repo / target).exists()
+
+    task = ArtifactTask(
+        id="T1",
+        goal=f"audit {target} for taste",
+        done_when=[CmdCheck(cmd="test -s review.md")],
+        artifact_out="review.md",
+    )
+    worker = _TipReadingWorker(target, "review.md")
+    outcome = run_one_epoch(
+        run_dir,
+        args=artifact_epoch(task),
+        mode="review",
+        ladder=_ladder(worker),
+        repo=git_repo,
+        base=tip,
+        tier0_attempts=1,
+    )
+    assert worker.saw_target, "the review worker's CWD did not contain the tip's file"
+    assert outcome.tasks[0].status == "done", outcome.tasks[0].failure_reason
+    # The operator checkout is untouched (still the clean base, no leaked file).
+    assert not (git_repo / target).exists()
+
+
 # --- starting_tier: pure per-task routing unit ---------------------------------
 
 

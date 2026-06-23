@@ -79,11 +79,14 @@ def test_three_task_epoch_integrates_all(git_repo: Path, run_dir: RunDir) -> Non
         "f2.txt",
         "f3.txt",
     ]
-    # Task branches + worktrees are pruned after integration (ruling 7).
+    # The run branch is the surviving tip; transient grind-wip branches + worktrees
+    # are pruned after integration (ruling 7, "once it passes it cleans up + falls").
+    assert branch == f"grind/{run_dir.root.name}"
     import subprocess
 
     refs = subprocess.run(
-        ["git", "branch", "--list", "grind/P1/E1/T*"], cwd=str(git_repo), capture_output=True, text=True
+        ["git", "branch", "--list", f"grind-wip/{run_dir.root.name}/*"],
+        cwd=str(git_repo), capture_output=True, text=True,
     ).stdout
     assert refs.strip() == ""
     assert not (run_dir.root / "worktrees" / "T1").exists()
@@ -139,7 +142,7 @@ def test_done_predicate_false_with_inflight() -> None:
 
 def test_attempt_branch_is_run_scoped() -> None:
     ident = TaskIdentity(run_id="20260101T000000Z", phase_id="P1", epoch_id="E1", task_id="T1")
-    assert ident.attempt_branch(1) == "grind/20260101T000000Z/P1/E1/T1-a1"
+    assert ident.attempt_branch(1) == "grind-wip/20260101T000000Z/P1/E1/T1-a1"
     # The log-key prefix stays run-agnostic (only branch names carry the run id).
     assert ident.fq == "P1/E1/T1"
 
@@ -165,8 +168,11 @@ def test_run_scoping_isolates_leftover_branch_from_prior_run(git_repo: Path) -> 
 
 
 def test_run_epoch_branch_names_carry_run_id(git_repo: Path, run_dir: RunDir) -> None:
-    """An end-to-end epoch names its task + integration branches under the run id,
-    so a second run (distinct run dir) can never share a branch with this one.
+    """A successful epoch leaves ONLY the persistent run branch ``grind/{run_id}``;
+    the transient ``grind-wip/{run_id}/...`` staging + attempt branches are gone.
+
+    A second run (distinct run dir / run id) can never share the run branch with
+    this one, and after the epoch nothing under ``grind-wip/`` survives.
     """
 
     import subprocess
@@ -174,10 +180,12 @@ def test_run_epoch_branch_names_carry_run_id(git_repo: Path, run_dir: RunDir) ->
     outcome = _run(run_dir, git_repo, _disjoint_tasks(2), _file_workers(2))
     assert outcome.status == "completed"
     run_id = run_dir.root.name
-    assert outcome.integration.branch == f"grind/{run_id}/P1/E1/_integration"
-    # The old, non-run-scoped task-branch namespace is unused.
+    # The integration tip is now the persistent RUN branch (the surviving ref).
+    assert outcome.integration.branch == f"grind/{run_id}"
+    assert wt.branch_exists(git_repo, f"grind/{run_id}")
+    # Every transient branch under grind-wip/{run_id}/ is cleaned up after success.
     refs = subprocess.run(
-        ["git", "branch", "--list", "grind/P1/E1/T*"],
+        ["git", "branch", "--list", f"grind-wip/{run_id}/*"],
         cwd=str(git_repo), capture_output=True, text=True,
     ).stdout
     assert refs.strip() == ""
@@ -372,78 +380,203 @@ def _done_outcome(task_id: str, branch: str) -> TaskOutcome:
 
 
 def test_fresh_integration_drops_stale_same_named_branch(git_repo: Path, run_dir: RunDir) -> None:
-    # A prior run left an integration branch of the SAME name carrying its own
-    # package.json. Without the drop, merging this run's fresh task branches into
-    # that stale branch yields a phantom both-added conflict on package.json (a
-    # file genuinely owned by exactly one task this run).
+    # A crash left a STAGING branch of the SAME name carrying its own package.json.
+    # Without the drop, merging this run's fresh task branches into that stale branch
+    # yields a phantom both-added conflict on package.json (a file genuinely owned by
+    # exactly one task this run). On success the run branch fast-forwards to the
+    # staging tip and the staging branch is deleted, so we assert the RUN branch.
     base = wt.head_commit(git_repo)
-    integ = "grind/P1/E1/_integration"
-    _commit_branch_adding(git_repo, integ, base, {"package.json": "STALE"})
+    staging = "grind-wip/run-1/P1/E1/_staging"
+    run_branch = "grind/run-1"
+    _commit_branch_adding(git_repo, staging, base, {"package.json": "STALE"})
 
-    t1 = _commit_branch_adding(git_repo, "grind/P1/E1/T1", base, {"package.json": "FRESH"})
-    t2 = _commit_branch_adding(git_repo, "grind/P1/E1/T2", base, {"app.json": "APP"})
+    t1 = _commit_branch_adding(git_repo, "grind-wip/run-1/P1/E1/T1-a1", base, {"package.json": "FRESH"})
+    t2 = _commit_branch_adding(git_repo, "grind-wip/run-1/P1/E1/T2-a1", base, {"app.json": "APP"})
     assert t1 and t2
 
-    store = _store_for(run_dir, integ, base, merged=[])
+    store = _store_for(run_dir, staging, base, merged=[])
     outcome = _integrate(
         repo=git_repo,
         run_dir=run_dir,
         store=store,
-        branch=integ,
+        branch=staging,
         base=base,
-        done_in_order=[_done_outcome("T1", "grind/P1/E1/T1"), _done_outcome("T2", "grind/P1/E1/T2")],
+        done_in_order=[
+            _done_outcome("T1", "grind-wip/run-1/P1/E1/T1-a1"),
+            _done_outcome("T2", "grind-wip/run-1/P1/E1/T2-a1"),
+        ],
     )
 
     assert outcome.status == "completed"
     assert outcome.conflict is None
     assert outcome.merged == ["T1", "T2"]
-    # The stale branch was dropped and recreated at base: the FRESH package.json
-    # wins, and app.json is present. The STALE content is gone.
+    # The integration tip is the persistent run branch; the staging branch is gone.
+    assert outcome.branch == run_branch
+    assert not wt.branch_exists(git_repo, staging)
+    # The stale staging branch was dropped and recreated at base: the FRESH
+    # package.json wins, app.json is present, the STALE content is gone, all carried
+    # onto the run branch.
     import subprocess
 
     pkg = subprocess.run(
-        ["git", "show", f"{integ}:package.json"], cwd=str(git_repo), capture_output=True, text=True
+        ["git", "show", f"{run_branch}:package.json"], cwd=str(git_repo), capture_output=True, text=True
     ).stdout
     assert pkg == "FRESH"
-    assert tracked_files(git_repo, integ) == [".gitignore", "README.md", "app.json", "package.json"]
+    assert tracked_files(git_repo, run_branch) == [".gitignore", "README.md", "app.json", "package.json"]
 
 
 def test_resume_mid_integration_keeps_existing_branch(git_repo: Path, run_dir: RunDir) -> None:
-    # Resume mid-integration: the integration branch already carries T1 (merged
-    # non-empty), so _integrate must NOT drop it (that would discard real
-    # progress); it merges only the remaining task and keeps T1's content.
+    # Resume mid-integration: the staging branch already carries T1 (merged
+    # non-empty), so _integrate must NOT drop it (that would discard real progress);
+    # it merges only the remaining task, keeps T1's content, then fast-forwards the
+    # run branch to the staging tip. Idempotent: re-running does not double-merge.
     base = wt.head_commit(git_repo)
-    integ = "grind/P1/E1/_integration"
-    t1 = _commit_branch_adding(git_repo, "grind/P1/E1/T1", base, {"f1.txt": "ONE"})
-    t2 = _commit_branch_adding(git_repo, "grind/P1/E1/T2", base, {"f2.txt": "TWO"})
+    staging = "grind-wip/run-1/P1/E1/_staging"
+    run_branch = "grind/run-1"
+    t1 = _commit_branch_adding(git_repo, "grind-wip/run-1/P1/E1/T1-a1", base, {"f1.txt": "ONE"})
+    t2 = _commit_branch_adding(git_repo, "grind-wip/run-1/P1/E1/T2-a1", base, {"f2.txt": "TWO"})
     assert t1 and t2
 
-    # Materialize the integration branch with T1 already merged into it (the
-    # durable state records merged == ["T1"]).
+    # Materialize the staging branch with T1 already merged into it (the durable
+    # state records merged == ["T1"]).
     import subprocess
 
     int_wt = run_dir.root / "worktrees" / "_seed"
-    wt.add_worktree(git_repo, int_wt, branch=integ, base=base)
-    merge = wt.merge_into(int_wt, "grind/P1/E1/T1")
+    wt.add_worktree(git_repo, int_wt, branch=staging, base=base)
+    merge = wt.merge_into(int_wt, "grind-wip/run-1/P1/E1/T1-a1")
     assert merge.ok
     wt.remove_worktree(git_repo, int_wt)
     subprocess.run(["git", "worktree", "prune"], cwd=str(git_repo), check=True)
-    integ_tip_before = wt.resolve_commit(git_repo, integ)
+    staging_tip_before = wt.resolve_commit(git_repo, staging)
 
-    store = _store_for(run_dir, integ, base, merged=["T1"])
+    store = _store_for(run_dir, staging, base, merged=["T1"])
     outcome = _integrate(
         repo=git_repo,
         run_dir=run_dir,
         store=store,
-        branch=integ,
+        branch=staging,
         base=base,
-        done_in_order=[_done_outcome("T1", "grind/P1/E1/T1"), _done_outcome("T2", "grind/P1/E1/T2")],
+        done_in_order=[
+            _done_outcome("T1", "grind-wip/run-1/P1/E1/T1-a1"),
+            _done_outcome("T2", "grind-wip/run-1/P1/E1/T2-a1"),
+        ],
     )
 
     assert outcome.status == "completed"
     assert outcome.merged == ["T1", "T2"]
-    # T1's content survived (the branch was NOT reset to base), and T2 was added.
-    assert tracked_files(git_repo, integ) == [".gitignore", "README.md", "f1.txt", "f2.txt"]
-    # The integration tip moved forward from the seeded T1 tip (T2 merged on top),
-    # so the prior progress is an ancestor, not discarded.
-    assert wt.is_ancestor(git_repo, integ_tip_before, integ)
+    assert outcome.branch == run_branch
+    # T1's content survived (the staging branch was NOT reset to base, T1 only merged
+    # once) and T2 was added; the run branch carries both. No double-merge of T1.
+    assert tracked_files(git_repo, run_branch) == [".gitignore", "README.md", "f1.txt", "f2.txt"]
+    # The run tip descends from the seeded T1 staging tip (T2 merged on top), so the
+    # prior progress is an ancestor, not discarded and not moved backward.
+    assert wt.is_ancestor(git_repo, staging_tip_before, run_branch)
+
+
+# --- the persistent run branch: fast-forward across epochs, conflict isolation ---
+
+
+def _run_branch_name(run_dir: RunDir) -> str:
+    return f"grind/{run_dir.root.name}"
+
+
+def test_run_branch_persists_and_fast_forwards_across_epochs(
+    git_repo: Path, run_dir: RunDir
+) -> None:
+    """Across two epochs ONLY ``grind/{run_id}`` survives, and it advances by
+    fast-forward: epoch 2 starts its staging branch off the epoch-1 run tip, so the
+    epoch-1 tip is an ancestor of the epoch-2 run tip and the run tip equals the
+    latest staging tip. No other ``grind*`` ref is left behind."""
+
+    import subprocess
+
+    run_branch = _run_branch_name(run_dir)
+    # Epoch 1 (P1/E1): build f1.txt off the operator base.
+    base0 = wt.head_commit(git_repo)
+    out1 = run_one_epoch(
+        run_dir,
+        args=implement_epoch(make_toy_task("T1", "f1.txt", ["f1.txt"])),
+        mode="implement",
+        ladder=[("worker", _file_workers(1))],
+        repo=git_repo,
+        phase_id="P1",
+        epoch_id="E1",
+        base=base0,
+    )
+    assert out1.status == "completed"
+    assert out1.integration.branch == run_branch
+    tip1 = wt.resolve_commit(git_repo, run_branch)
+
+    # Epoch 2 (P1/E2): base = the CURRENT run tip (what the run loop threads), build
+    # f2.txt. The staging branch is created off the run tip, then the run branch FFs.
+    worker2 = RoutingWorker({"T2": MockWorker(script=["ok"], artifacts={"f2.txt": OUT_CONTENT})})
+    out2 = run_one_epoch(
+        run_dir,
+        args=implement_epoch(make_toy_task("T2", "f2.txt", ["f2.txt"])),
+        mode="implement",
+        ladder=[("worker", worker2)],
+        repo=git_repo,
+        phase_id="P1",
+        epoch_id="E2",
+        base=tip1,
+    )
+    assert out2.status == "completed"
+    assert out2.integration.branch == run_branch
+    tip2 = wt.resolve_commit(git_repo, run_branch)
+
+    # The run branch advanced by a true fast-forward (epoch-1 tip is an ancestor).
+    assert tip1 != tip2
+    assert wt.is_ancestor(git_repo, tip1, run_branch)
+    # The run tip carries BOTH epochs' work (an ancestor chain, nothing dropped).
+    assert tracked_files(git_repo, run_branch) == [
+        ".gitignore", "README.md", "f1.txt", "f2.txt",
+    ]
+    # ONLY the run branch survives: no grind-wip/* and no other grind/* refs.
+    all_grind = subprocess.run(
+        ["git", "branch", "--list", "grind*"], cwd=str(git_repo), capture_output=True, text=True
+    ).stdout
+    names = sorted(line.strip().lstrip("* ").strip() for line in all_grind.splitlines() if line.strip())
+    assert names == [run_branch]
+
+
+def test_integration_conflict_leaves_run_branch_untouched(
+    git_repo: Path, run_dir: RunDir
+) -> None:
+    """A merge conflict during staging aborts the epoch and leaves the persistent
+    run branch UNCHANGED (the conflict never reaches the run branch). Reported as a
+    conflict; the run branch tip is identical before and after."""
+
+    run_branch = _run_branch_name(run_dir)
+    base = wt.head_commit(git_repo)
+    # Seed a run branch at base (as if a prior epoch had run): the conflict must not
+    # move it. We materialize it at base; later we assert it never advanced.
+    wt.fast_forward_branch(git_repo, run_branch, base)
+    run_tip_before = wt.resolve_commit(git_repo, run_branch)
+
+    # Two task branches that both add shared.txt -> a both-added merge conflict.
+    staging = f"grind-wip/{run_dir.root.name}/P1/E1/_staging"
+    b1 = _commit_branch_adding(
+        git_repo, f"grind-wip/{run_dir.root.name}/P1/E1/T1-a1", base, {"shared.txt": "from-T1\n"}
+    )
+    b2 = _commit_branch_adding(
+        git_repo, f"grind-wip/{run_dir.root.name}/P1/E1/T2-a1", base, {"shared.txt": "from-T2\n"}
+    )
+    assert b1 and b2
+
+    store = _store_for(run_dir, staging, base, merged=[])
+    outcome = _integrate(
+        repo=git_repo,
+        run_dir=run_dir,
+        store=store,
+        branch=staging,
+        base=base,
+        done_in_order=[
+            _done_outcome("T1", f"grind-wip/{run_dir.root.name}/P1/E1/T1-a1"),
+            _done_outcome("T2", f"grind-wip/{run_dir.root.name}/P1/E1/T2-a1"),
+        ],
+    )
+
+    assert outcome.status == "conflict"
+    assert outcome.conflict
+    # The run branch is untouched: same tip, no advance, no FF on a conflict.
+    assert wt.resolve_commit(git_repo, run_branch) == run_tip_before

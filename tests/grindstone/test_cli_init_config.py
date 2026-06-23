@@ -16,10 +16,12 @@ import pytest
 
 from grindstone.cli import (
     DEFAULT_MAX_PLANNER_CALLS,
+    _IGNORE_HEADER,
     _resolve_concurrency,
     _resolve_ladder,
     _resolve_max_planner_calls,
     _resolve_planner,
+    ensure_run_incidental_ignores,
     main,
 )
 from grindstone.config import GrindstoneConfig, load_config, resolve_role_script
@@ -138,15 +140,92 @@ def test_init_appends_gitignore_idempotently(tmp_path: Path) -> None:
     gitignore.write_text("node_modules/\n", encoding="utf-8")
     main(["init", "--repo", str(tmp_path)])
     first = gitignore.read_text(encoding="utf-8")
-    assert ".grindstone/" in first
+    assert ".grindstone/*" in first
     assert "node_modules/" in first  # pre-existing content preserved
     main(["init", "--repo", str(tmp_path)])  # second init must not duplicate
-    assert gitignore.read_text(encoding="utf-8").count(".grindstone/") == 1
+    # the auto-managed block is rewritten in place, never re-appended.
+    assert gitignore.read_text(encoding="utf-8").count(_IGNORE_HEADER) == 1
 
 
 def test_init_creates_gitignore_when_absent(tmp_path: Path) -> None:
     main(["init", "--repo", str(tmp_path)])
-    assert ".grindstone/" in (tmp_path / ".gitignore").read_text(encoding="utf-8")
+    assert ".grindstone/*" in (tmp_path / ".gitignore").read_text(encoding="utf-8")
+
+
+# --- run-incidental gitignore bake-step ----------------------------------------
+
+
+def _ignore(repo: Path) -> str:
+    return (repo / ".gitignore").read_text(encoding="utf-8")
+
+
+def test_bake_adds_managed_block_when_lacking(tmp_path: Path) -> None:
+    """A repo whose .gitignore lacks the block gets it, clearly marked, with the
+    run-state ignore (+ skills negation) and the ecosystem-standard incidental
+    test/build dirs that done_when commands emit."""
+
+    (tmp_path / ".gitignore").write_text("node_modules/\nweb-build/\n", encoding="utf-8")
+    assert ensure_run_incidental_ignores(tmp_path) is True
+    text = _ignore(tmp_path)
+    assert "node_modules/" in text and "web-build/" in text  # user content preserved
+    assert _IGNORE_HEADER in text
+    for entry in (
+        ".grindstone/*",
+        "!.grindstone/skills/",
+        "test-results/",
+        "playwright-report/",
+        "coverage/",
+        ".pytest_cache/",
+    ):
+        assert f"\n{entry}\n" in text or text.startswith(entry) or text.endswith(entry + "\n")
+
+
+def test_bake_is_idempotent(tmp_path: Path) -> None:
+    """Re-running never duplicates: the second bake is a byte-for-byte no-op."""
+
+    (tmp_path / ".gitignore").write_text("dist/\n", encoding="utf-8")
+    assert ensure_run_incidental_ignores(tmp_path) is True
+    once = _ignore(tmp_path)
+    assert ensure_run_incidental_ignores(tmp_path) is False  # no change
+    assert _ignore(tmp_path) == once
+    assert once.count(_IGNORE_HEADER) == 1
+    assert once.count("test-results/") == 1
+    assert once.count(".grindstone/*") == 1
+
+
+def test_bake_creates_gitignore_when_absent(tmp_path: Path) -> None:
+    """A repo with no .gitignore at all gets one created with just the block."""
+
+    assert ensure_run_incidental_ignores(tmp_path) is True
+    text = _ignore(tmp_path)
+    assert _IGNORE_HEADER in text
+    assert "test-results/" in text and ".grindstone/*" in text
+
+
+def test_bake_preserves_existing_manual_negation(tmp_path: Path) -> None:
+    """An existing manual `.grindstone/*` + `!.grindstone/skills/` negation (as in
+    a hand-edited target repo) survives the bake."""
+
+    (tmp_path / ".gitignore").write_text(
+        "# grindstone run state\n.grindstone/*\n!.grindstone/skills/\n",
+        encoding="utf-8",
+    )
+    assert ensure_run_incidental_ignores(tmp_path) is True
+    text = _ignore(tmp_path)
+    assert "!.grindstone/skills/" in text  # skills catalogue still re-included
+    assert "test-results/" in text
+
+
+def test_bake_upgrades_legacy_bare_dir_line(tmp_path: Path) -> None:
+    """The legacy single `.grindstone/` line old init wrote (which defeats the
+    skills negation) is superseded by the contents-form block, not left behind."""
+
+    (tmp_path / ".gitignore").write_text(".grindstone/\nnode_modules/\n", encoding="utf-8")
+    assert ensure_run_incidental_ignores(tmp_path) is True
+    lines = [ln.strip() for ln in _ignore(tmp_path).splitlines()]
+    assert ".grindstone/" not in lines  # the bare dir form is gone
+    assert ".grindstone/*" in lines and "!.grindstone/skills/" in lines
+    assert "node_modules/" in lines  # unrelated user content preserved
 
 
 def test_init_does_not_clobber_existing_config(tmp_path: Path) -> None:

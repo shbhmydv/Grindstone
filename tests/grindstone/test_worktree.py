@@ -127,20 +127,24 @@ def test_discard_attempt_removes_worktree_and_branch(repo: Path, tmp_path: Path)
 
 
 def test_branch_namespace_df_conflict_is_avoided(repo: Path, tmp_path: Path) -> None:
-    """Ruling-7 deviation guard: an integration branch named ``grind/P1/E1``
-    cannot coexist with task branches ``grind/P1/E1/T1-a1`` (git ref D/F
-    conflict). The collision-free ``grind/P1/E1/_integration`` leaf does.
+    """The git ref dir/file conflict that drives the whole namespace split: the
+    persistent run branch ``grind/{run_id}`` is a LEAF ref, so NOTHING may live under
+    ``grind/{run_id}/...`` (a child there cannot coexist with the leaf). That is why
+    every transient (staging + attempt) branch lives under the separate top-level
+    ``grind-wip/`` tree, which coexists with the ``grind/{run_id}`` leaf fine.
     """
 
     base = wt.head_commit(repo)
     path = tmp_path / "wt" / "a1"
-    wt.add_worktree(repo, path, branch="grind/P1/E1/T1-a1", base=base)
-    # The pinned literal name would collide:
+    # The run branch leaf exists; a child ref under it would D/F-conflict.
+    wt.fast_forward_branch(repo, "grind/run-1", base)
     with pytest.raises(wt.GitError):
-        wt.ensure_integration_branch(repo, "grind/P1/E1", base)
-    # The chosen leaf name does not:
-    wt.ensure_integration_branch(repo, "grind/P1/E1/_integration", base)
-    assert wt.branch_exists(repo, "grind/P1/E1/_integration")
+        wt.ensure_integration_branch(repo, "grind/run-1/P1/E1/_staging", base)
+    # The separate grind-wip/ namespace coexists with the grind/run-1 leaf cleanly.
+    wt.add_worktree(repo, path, branch="grind-wip/run-1/P1/E1/T1-a1", base=base)
+    wt.ensure_integration_branch(repo, "grind-wip/run-1/P1/E1/_staging", base)
+    assert wt.branch_exists(repo, "grind-wip/run-1/P1/E1/_staging")
+    assert wt.branch_exists(repo, "grind/run-1")
 
 
 # --- merge ---------------------------------------------------------------------

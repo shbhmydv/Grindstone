@@ -126,9 +126,17 @@ class TaskIdentity:
     def attempt_branch(self, attempt: int) -> str:
         """The per-attempt worktree branch (ruling 4), run-scoped so two runs
         (or a re-run after escalation) can never collide on a leftover branch.
+
+        Lives under the TRANSIENT ``grind-wip/`` namespace, never ``grind/``: the
+        only surviving ref is the persistent run branch ``grind/{run_id}`` (a leaf),
+        and a child ref ``grind/{run_id}/...`` cannot coexist with that leaf in git's
+        ref store (a dir/file conflict). Every per-attempt + per-epoch staging branch
+        is throwaway, so the whole transient namespace is the separate top-level
+        ``grind-wip/`` tree, cleaned up once the epoch's work is absorbed into the run
+        branch.
         """
 
-        return f"grind/{self.run_id}/{self.phase_id}/{self.epoch_id}/{self.task_id}-a{attempt}"
+        return f"grind-wip/{self.run_id}/{self.phase_id}/{self.epoch_id}/{self.task_id}-a{attempt}"
 
 
 # --- public result + persisted per-task cursor ---------------------------------
@@ -646,13 +654,55 @@ def _collect_handoff(
     return handoff
 
 
+#: Per-attempt parent dir for the DETACHED, read-only worktree a non-implement task
+#: (research/review/artifact) runs in when an integration tip exists. The work built
+#: earlier in the run lives ONLY on that tip (the operator checkout sits at the clean
+#: base), so the task must read the tip, not the stale operator tree. Mirrors the
+#: implement ``worktrees/<task>`` and the planner ``worktrees/_planner_tip`` layout;
+#: torn down after each attempt (the failure-context persist reads scratch first).
+_REVIEW_TIP_WORKTREE = "_review_tip"
+
+
+def _read_tip_for(repo: Path | None, base: str | None) -> str | None:
+    """The integration tip a NON-implement task reads against, or ``None`` to fall
+    back to the operator checkout.
+
+    ``base`` is the read tip the epoch threaded (the current integration tip resolved
+    by the run loop). It is honored only when it is a concrete, resolvable commit in
+    ``repo``: a first research epoch (no tip yet), an unborn HEAD, or an artifact-only
+    run with no repo all leave it unresolvable, in which case the task reads the
+    operator checkout exactly as before (preserving first-epoch + artifact-only
+    behavior). Never raises: an unresolvable ref is simply the fallback."""
+
+    if repo is None or base is None:
+        return None
+    try:
+        return wt.resolve_commit(repo, base)
+    except wt.GitError:
+        return None
+
+
 def _scratch_for(
-    identity: TaskIdentity, run_dir: RunDir, attempt: int, *, implement: bool
+    identity: TaskIdentity,
+    run_dir: RunDir,
+    attempt: int,
+    *,
+    implement: bool,
+    read_tip: bool = False,
 ) -> Path:
-    """The attempt's CWD path (NOT yet created for worktrees, git owns that)."""
+    """The attempt's CWD path (NOT yet created for worktrees, git owns that).
+
+    Implement attempts and a non-implement attempt that reads the integration tip
+    (``read_tip``) both run in a git worktree under ``worktrees/``; a non-implement
+    attempt with no tip keeps the plain run-dir artifacts scratch (the prior, and
+    fallback, behavior)."""
 
     if implement:
         return run_dir.root / "worktrees" / identity.task_id / f"attempt-{attempt}"
+    if read_tip:
+        return (
+            run_dir.root / "worktrees" / _REVIEW_TIP_WORKTREE / identity.fq / f"attempt-{attempt}"
+        )
     return run_dir.artifacts_dir(f"{identity.fq}/attempt-{attempt}")
 
 
@@ -870,6 +920,7 @@ def _dispatch_attempt(
     prepare: PrepareConfig | None,
     epoch_base: str | None = None,
     prior_work_present: bool = False,
+    read_tip: str | None = None,
 ) -> Handoff:
     """Run one attempt end-to-end; raise ``_AttemptFailed`` on any failure.
 
@@ -884,9 +935,22 @@ def _dispatch_attempt(
     (ARCHITECTURE.md: the loop never inspects worker internals). ``prior_work_present``
     (an incremental same-tier retry: ``base`` is the prior attempt's branch) is passed
     to the worker so its prompt says the prior work is already in the CWD.
+
+    For a NON-implement task with a resolvable ``read_tip`` (the integration tip the
+    epoch threaded), ``scratch`` is a DETACHED, read-only worktree of that tip: the
+    worker runs there (so it reads the accumulated build the run produced earlier),
+    and the same worktree is its citation root. Without a tip the scratch is a plain
+    run-dir dir and the operator checkout is the citation root (the prior behavior).
+    The caller (``_grind``) tears the worktree down after the attempt (after the
+    failure-context persist, which reads scratch).
     """
 
     implement = isinstance(task, ImplementTask)
+    # The citation root for the deterministic grounding spot-check + the worker-facing
+    # validator. Implement bakes None (its CWD IS the checkout). A non-implement task
+    # reads the integration tip when one exists (its scratch IS that tip worktree, so
+    # the operator checkout never enters scope), else the operator checkout.
+    citation_root = repo
     if implement:
         assert repo is not None and base is not None and branch is not None
         wt.add_worktree(repo, scratch, branch=branch, base=base)
@@ -898,9 +962,13 @@ def _dispatch_attempt(
             materialize_env(repo, scratch, prepare)
         except Exception as exc:  # PrepareError (or any IO): a clean failed attempt
             raise _AttemptFailed(f"prepare error: {exc}") from exc
+    elif read_tip is not None:
+        assert repo is not None
+        wt.add_worktree_detached(repo, scratch, ref=read_tip)
+        citation_root = scratch
     else:
         scratch.mkdir(parents=True, exist_ok=True)
-    task = _install_attempt_checks(task, scratch, mode, identity.fq, repo)
+    task = _install_attempt_checks(task, scratch, mode, identity.fq, citation_root)
 
     inputs = {key: run_dir.resolve(key) for key in task.inputs}
     request = WorkerRequest(
@@ -927,7 +995,7 @@ def _dispatch_attempt(
         raise
     except Exception as exc:  # transport boundary, any other raise is a failed attempt
         raise _AttemptFailed(f"transport error: {type(exc).__name__}: {exc}") from exc
-    handoff = _collect_handoff(request, task, mode, run_dir, identity, repo)
+    handoff = _collect_handoff(request, task, mode, run_dir, identity, citation_root)
 
     if isinstance(task, ArtifactTask):
         # Publish the produced artifact to its log key, the artifact analogue
@@ -1014,6 +1082,7 @@ def _dispatch_session_aware(
     sleep_fn: SleepFn,
     epoch_base: str | None = None,
     prior_work_present: bool = False,
+    read_tip: str | None = None,
 ) -> Handoff:
     """Run one attempt, PARKING (not burning) on a long session limit.
 
@@ -1048,6 +1117,7 @@ def _dispatch_session_aware(
                 prepare=prepare,
                 epoch_base=epoch_base,
                 prior_work_present=prior_work_present,
+                read_tip=read_tip,
             )
         except SessionLimited as exc:
             if waits >= MAX_SESSION_LIMIT_WAITS:
@@ -1055,10 +1125,14 @@ def _dispatch_session_aware(
                     f"session limit: {MAX_SESSION_LIMIT_WAITS} hourly waits exhausted: {exc}"
                 ) from exc
             waits += 1
-            # Discard the partial worktree the failed try created so the next
-            # try's add_worktree is clean (no-op for non-implement scratch).
+            # Discard the partial worktree the failed try created so the next try's
+            # add_worktree is clean. Implement: the attempt branch + checkout. A
+            # non-implement task reading the tip: its detached read worktree (no
+            # branch). A non-tip non-implement scratch is a plain dir (no-op).
             if implement and repo is not None and branch is not None:
                 wt.discard_attempt(repo, scratch, branch)
+            elif read_tip is not None and repo is not None:
+                wt.remove_worktree(repo, scratch)
             sleep_fn(SESSION_LIMIT_RETRY_S)
             continue
         except RateLimited as exc:
@@ -1099,6 +1173,13 @@ def _grind(
     start_tier = starting_tier(
         task, [name for name, _ in ladder], force_senior=force_senior
     )
+    # A NON-implement task (research/review/artifact) reads the integration tip the
+    # epoch threaded as ``base`` (the work built earlier in the run lives only there;
+    # the operator checkout sits at the clean base). ``None`` when no tip exists yet
+    # or no repo: the task then reads the operator checkout (the prior behavior). Each
+    # attempt's read worktree is torn down after the attempt (the failure-context
+    # persist reads scratch first), so a tip is checked out fresh per attempt.
+    read_tip = None if implement else _read_tip_for(repo, base)
 
     # Incremental-retry chain (implement only). A same-tier, non-escalation RETRY
     # bases its worktree on the PRIOR attempt's branch so the prior attempt's work
@@ -1153,7 +1234,10 @@ def _grind(
         while cursor.tier_attempt < allowance:
             cursor.tier_attempt += 1
             cursor.attempt += 1
-            scratch = _scratch_for(identity, run_dir, cursor.attempt, implement=implement)
+            scratch = _scratch_for(
+                identity, run_dir, cursor.attempt,
+                implement=implement, read_tip=read_tip is not None,
+            )
             branch = identity.attempt_branch(cursor.attempt) if implement else None
             # Incremental retry: a same-tier retry (chain_base set) bases on the
             # prior attempt's branch so its work is present; otherwise (first
@@ -1202,6 +1286,7 @@ def _grind(
                     sleep_fn=sleep_fn,
                     epoch_base=base,
                     prior_work_present=implement and chain_base is not None,
+                    read_tip=read_tip,
                 )
                 # Per-task agentic verification (targets 1-4): the deterministic floor
                 # just cleared (handoff + scope + grounding) on a task that carries
@@ -1243,6 +1328,14 @@ def _grind(
                         run_dir, identity, cursor.attempt, failure, scratch=scratch
                     )
                 )
+                # A non-implement read-tip attempt ran in a detached read worktree:
+                # tear it down now (the failure-context persist above already copied
+                # the rejected handoff out of it). Non-implement integration runs no
+                # prune_tree, so an un-removed worktree would leak. A non-tip scratch
+                # is a plain dir (kept for the failure-detail references already
+                # written under the run-dir failures/ subdir, not inside scratch).
+                if read_tip is not None and not implement and repo is not None:
+                    wt.remove_worktree(repo, scratch)
                 if implement and repo is not None and branch is not None:
                     if failure.chainable:
                         # Incremental retry: COMMIT this attempt's partial work to its
@@ -1288,6 +1381,12 @@ def _grind(
             if implement and repo is not None and stale_branch is not None and stale_branch != branch:
                 wt.delete_branch(repo, stale_branch)
             stale_branch = None
+            # A non-implement read-tip attempt succeeded: its deliverable is already
+            # published to the keyed log (the artifact relocation in _dispatch_attempt)
+            # and there is nothing on the tip to integrate, so tear the read worktree
+            # down (non-implement integration runs no prune_tree to reclaim it).
+            if read_tip is not None and not implement and repo is not None:
+                wt.remove_worktree(repo, scratch)
             journal.emit(
                 lambda s: TaskDone(
                     seq=s, ts=_now(), epoch_id=identity.epoch_id, task_id=identity.task_id

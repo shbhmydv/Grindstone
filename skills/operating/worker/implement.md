@@ -31,4 +31,15 @@ If after honest effort the checks cannot pass, write a truthful FAILED or
 PARTIAL handoff with `not_done` and `downstream_needs` filled in, the planner
 re-plans from that. Never claim DONE on failing checks: every check is re-run
 by the orchestrator and a false DONE is always caught.
+
+THE TASK IS NOT DONE UNTIL handoff.json EXISTS ON DISK AND check_handoff.py
+EXITS 0. A prose completion summary is NOT a handoff: narrating that you
+finished, however thorough, accomplishes nothing the orchestrator can read. It
+parses only the handoff.json file in this directory. Stopping after the prose,
+without the write, is a silent failure that wastes a whole worker subprocess.
+
+STOP-CHECK, apply it before you end this turn: "Does handoff.json exist and
+does check_handoff.py exit 0?" If the answer is no, you are not done. Write the
+handoff and run the check NOW, then re-ask. Do not end your turn until both are
+true (or you have written a truthful FAILED/PARTIAL handoff that itself exits 0).
 </implement_plan>
