@@ -40,6 +40,11 @@ Decomposition is THREE distinct skills, one per level; this scenario is LEVEL 1.
   before the phase's real work is built, which would be a hollow signal. Keep the
   floor a small, genuine build-health check; carry the deliverable bar in the phase
   title and the tasks' `criteria`.
+- `epoch_budget` is now a runaway BACKSTOP, not the completion control (you end a
+  phase yourself with a grounded phase_complete when its GOAL is met), so give it
+  headroom: size it to roughly 2x the epochs you realistically expect the phase to
+  need, leaving room for the occasional failed-epoch re-decomposition without
+  prematurely capping honest work.
 
 Example first decision (note: TWO phases minimum; the exit_criterion is the
 build-health FLOOR, structural only, never the deliverable-completeness gate):
