@@ -41,7 +41,6 @@
       "additionalProperties": false,
       "properties": {
         "title": { "type": "string", "minLength": 1, "maxLength": 120 },
-        "rationale": { "type": "string", "maxLength": 2048, "default": "" },
         "tasks": {
           "type": "array",
           "minItems": 1,

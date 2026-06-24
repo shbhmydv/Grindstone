@@ -273,13 +273,14 @@ class CriticError(Exception):
 #: build_worker_prompt: write only relative to the CWD, never absolute, never
 #: outside the worktree; the orchestrator inspects ONLY this worktree.
 _WORKTREE_CONTRACT = """<worktree>
-You run inside an ISOLATED, throwaway git worktree that is your current working
-directory and IS the repository for this task. Create and edit every file with
-paths RELATIVE to your CWD; never write to an absolute path and never write
-outside your CWD. There is no other repository you may touch, do not go looking
-for one, this worktree is it. The orchestrator inspects ONLY this worktree to
-gate and integrate your work, so anything you write elsewhere is invisible,
-discarded, and corrupts the run.
+You run inside an ISOLATED, throwaway git worktree that is your current working directory
+and IS the repository for this task. Create and edit every file with paths RELATIVE to
+your CWD; never write to an absolute path and never write outside your CWD. There is no
+other repository you may touch - do not go looking for one, this worktree is it. The
+orchestrator inspects ONLY this worktree to gate and integrate your work, so anything you
+write elsewhere is invisible, discarded, and corrupts the run. You can SEE: read any
+image in your worktree or inputs directly (screenshots, mockups, designs) and produce
+images where visual proof helps your reviewer - view, do not guess.
 </worktree>"""
 
 #: Concise per-mode guidance (BONES drops the operating-skill scenario split; the
@@ -289,24 +290,27 @@ discarded, and corrupts the run.
 _MODE_GUIDANCE: dict[HandoffMode, str] = {
     "implement": (
         "Make the change inside your file_ownership, then COMMIT it (the orchestrator "
-        "gates the git diff in this worktree, not your words). If your checks need "
-        "the project's own dependencies, you MAY install them with the project's "
-        "package manager INSIDE THIS WORKTREE as part of your work (setup does not "
-        "reach here). Run whatever "
-        "checks you write to convince yourself it works."
+        "gates the git diff in this worktree, not your words). If your checks need the "
+        "project's dependencies, you MAY install them INSIDE THIS WORKTREE as part of "
+        "your work (setup does not reach here). Run whatever checks you write to "
+        "convince yourself it works; if the work is visual, render and LOOK at the "
+        "result."
     ),
     "research": (
-        "Investigate, then write your findings to the artifact log key below. "
-        "Ground every claim in a real file (cite file + line); do not speculate."
+        "Investigate, then write your findings to the artifact log key below. Ground "
+        "every claim in a real file (cite file + line) or a real image you viewed; do "
+        "not speculate."
     ),
     "review": (
-        "Re-derive the question yourself and reconcile it against the real files; "
-        "do not just check that sections are present. Write your verdict to the "
-        "artifact log key below and cite the files you judged."
+        "Re-derive the question yourself and reconcile it against the real files and "
+        "rendered output; do not just check that sections are present. View any "
+        "screenshots or UI the work produced. Write your verdict to the artifact log "
+        "key below and cite what you judged."
     ),
     "artifact": (
-        "Produce the deliverable at the artifact log key below; ground it in real "
-        "files where it makes claims about the repo."
+        "Produce the deliverable at the artifact log key below (it may be a document "
+        "or a rendered image); ground it in real files or visuals where it makes "
+        "claims about the repo."
     ),
 }
 
@@ -427,7 +431,8 @@ def build_critic_prompt(request: WorkerRequest, brief: CriticBrief) -> str:
         work_line = (
             f"The work is a diff. Run `git diff {brief.diff_base or 'HEAD~1'}` in "
             "this worktree to see exactly what the worker changed, and read the "
-            "changed files."
+            "changed files. If the change is visual and the worktree has a rendered "
+            "screenshot, view it."
         )
         grounding = ""
     else:
@@ -439,16 +444,19 @@ def build_critic_prompt(request: WorkerRequest, brief: CriticBrief) -> str:
         grounding = (
             "\n<grounding>\nThis is a research / review artifact: its claims MUST be "
             f"grounded in real files under `{root}`. VERIFY the citations resolve to "
-            "files that exist and actually support each claim. A claim with no "
-            "citation, or one citing a file that does not exist or does not say what "
-            "is claimed, is UNGROUNDED: if the worker can plausibly fix it (add or "
-            "correct citations) -> RETRY; if the underlying claim is wrong or "
-            "unverifiable -> ESCALATE.\n</grounding>\n"
+            "files that exist and actually support each claim; a citation may be to an "
+            "image, which you must actually OPEN and verify shows what is claimed. A "
+            "claim with no citation, or one citing a file or image that does not exist "
+            "or does not say what is claimed, is UNGROUNDED: if the worker can "
+            "plausibly fix it (add or correct citations) -> RETRY; if the underlying "
+            "claim is wrong or unverifiable -> ESCALATE.\n</grounding>\n"
         )
     report = brief.handoff_text.strip() or "(the worker wrote no handoff report)"
     return f"""<critic id="{request.task_id}">
 You are an INDEPENDENT critic. You did NOT write this work. Do NOT edit anything.
-Your job is to TRIAGE it into one of three routes, not to grade it.
+Your job is to TRIAGE it into one of three routes, not to grade it. You can SEE - if
+the work is or produces a visual (a screenshot, a rendered screen, a diagram), VIEW it
+and judge it with your eyes, not the worker's description.
 </critic>
 
 <claimed_goal>

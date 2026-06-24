@@ -128,7 +128,6 @@ class Epoch(_Frozen):
     """
 
     title: Annotated[str, StringConstraints(min_length=1, max_length=120)]
-    rationale: Annotated[str, StringConstraints(max_length=2048)] = ""
     tasks: Annotated[list[Task], Field(min_length=1, max_length=8)]
     setup: Annotated[
         list[Annotated[str, StringConstraints(min_length=1, max_length=512)]],

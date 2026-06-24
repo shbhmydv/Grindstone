@@ -48,7 +48,6 @@ def _epoch_payload() -> dict[str, object]:
         "kind": "epoch",
         "epoch": {
             "title": "build the thing",
-            "rationale": "first slice",
             "setup": ["npm ci"],
             "tasks": [
                 {

@@ -49,7 +49,7 @@ handle_out="$(cd "$(dirname "$handle_out")" && pwd)/$(basename "$handle_out")"
 provider="${GRINDSTONE_SENIOR_PROVIDER:-local-reviewer}"; model="${GRINDSTONE_SENIOR_MODEL:-qwen-3-6-27b-dense}"
 
 # Pin pi-subagents spawned by this senior (the implement plan's `reviewer`) to THIS
-# endpoint's model, same rationale as the local worker: pi-subagents reads the
+# endpoint's model, same reasoning as the local worker: pi-subagents reads the
 # nearest `.pi/settings.json` up the tree, so writing it into the worktree keeps the
 # reviewer on the local model instead of a cloud default. Grindstone strips this
 # file (by relpath) before commit, so it never enters the diff.
