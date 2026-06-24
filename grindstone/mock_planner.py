@@ -28,7 +28,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Union
 
 from grindstone.check_decision import DECISION_FILE
-from grindstone.contracts.models import Decision
+from grindstone.contracts.models import (
+    Decision,
+    EndDecision,
+    Epoch,
+    EpochDecision,
+    Task,
+)
 from grindstone.planner import PlannerDispatch, PlannerError, RateLimited
 
 if TYPE_CHECKING:
@@ -205,3 +211,98 @@ class MockDecisionPlanner:
                 raise PlannerError(f"mock planner {entry}")
             raise ValueError(f"unknown mock decision token: {entry!r}")
         return entry
+
+
+@dataclass
+class GoalPlanner:
+    """A GOAL-DRIVEN loop planner for the stochastic convergence E2E.
+
+    Unlike ``MockDecisionPlanner`` (a fixed script), this one self-steers like the
+    real planner: it reads the boundary's DISK STATE (the keyed-log index + the
+    integration-tip file list) and proposes the next epoch toward a fixed goal,
+    reacting to a stochastic worker's failures. It plans a realistic multi-epoch
+    job, RESEARCH (one artifact) -> IMPLEMENT fan-out (one disjoint task per missing
+    module) -> REVIEW (one artifact) -> END, and retries a stage that did not land
+    (a failed/blocked task leaves no artifact / no file on the tip), each retry on a
+    FRESH epoch index so the stochastic worker re-draws (a different full task id ->
+    a different outcome), so the run converges.
+
+    Termination is guaranteed two ways: each stage is bounded by ``stage_cap``
+    attempts (after which the planner moves on / ends with what it has), and the
+    loop's ``max_epochs`` backstop forces a clean partial-end regardless. It records
+    every ``PlannerContext`` + the integration tip it saw each boundary so a test can
+    assert the run-branch fast-forward invariant.
+    """
+
+    impl_files: tuple[str, ...]
+    stage_cap: int = 4
+    contexts: list["PlannerContext"] = field(default_factory=list)
+    tip_history: list[str | None] = field(default_factory=list)
+    _research_tries: int = 0
+    _impl_tries: int = 0
+    _review_tries: int = 0
+
+    def decide(self, context: "PlannerContext") -> Decision:
+        self.contexts.append(context)
+        self.tip_history.append(context.tip_ref)
+        n = context.epoch_index
+
+        if not self._has_artifact(context, "research.md") and (
+            self._research_tries < self.stage_cap
+        ):
+            self._research_tries += 1
+            return self._epoch(
+                "research",
+                [
+                    Task(
+                        id="T1",
+                        mode="research",
+                        goal="investigate the job and lay groundwork",
+                        artifact_out=f"P1/E{n}/T1/research.md",
+                    )
+                ],
+            )
+
+        missing = [f for f in self.impl_files if f not in context.tip_files]
+        if missing and self._impl_tries < self.stage_cap:
+            self._impl_tries += 1
+            tasks = [
+                Task(
+                    id=f"T{i + 1}",
+                    mode="implement",
+                    goal=f"build {f}",
+                    file_ownership=[f],
+                )
+                for i, f in enumerate(missing[:8])
+            ]
+            return self._epoch("build the missing modules", tasks)
+
+        if not self._has_artifact(context, "review.md") and (
+            self._review_tries < self.stage_cap
+        ):
+            self._review_tries += 1
+            return self._epoch(
+                "review",
+                [
+                    Task(
+                        id="T1",
+                        mode="review",
+                        goal="re-derive the job and reconcile against the built modules",
+                        artifact_out=f"P1/E{n}/T1/review.md",
+                    )
+                ],
+            )
+
+        built = [f for f in self.impl_files if f in context.tip_files]
+        return EndDecision(
+            kind="end",
+            summary=f"built {len(built)} of {len(self.impl_files)} modules",
+        )
+
+    @staticmethod
+    def _epoch(title: str, tasks: list[Task]) -> EpochDecision:
+        return EpochDecision(kind="epoch", epoch=Epoch(title=title, tasks=tasks))
+
+    @staticmethod
+    def _has_artifact(context: "PlannerContext", name: str) -> bool:
+        return any(key.endswith("/" + name) for key in context.log_index)

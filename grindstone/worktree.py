@@ -26,8 +26,19 @@ from __future__ import annotations
 import fnmatch
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
+
+#: Serializes the worktree-REGISTRY mutations (``git worktree add`` / ``remove`` /
+#: ``prune``). These touch a repo's SHARED ``.git/worktrees`` admin state and the new
+#: branch ref, so git is not safe to run them concurrently in one repo, yet the epoch
+#: fan-out creates each implement attempt's worktree from a parallel thread. A
+#: process-global lock serializes only these sub-millisecond git-admin ops; the slow
+#: model dispatch stays concurrent (it runs outside this lock, bounded by the
+#: per-backend semaphores). Surfaced by the stochastic convergence E2E: concurrent
+#: ``git worktree add`` intermittently exited 128 under contention.
+_WORKTREE_LOCK = threading.Lock()
 
 #: Identity for core-authored commits/merges (models never run git, so the
 #: committer is always Grindstone itself). Passed per-command so a throwaway
@@ -203,8 +214,9 @@ def add_worktree(repo: Path, path: Path, *, branch: str, base: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         shutil.rmtree(path)
-    _git(repo, "worktree", "prune")
-    _git(repo, "worktree", "add", "-b", branch, str(path), base)
+    with _WORKTREE_LOCK:
+        _git(repo, "worktree", "prune")
+        _git(repo, "worktree", "add", "-b", branch, str(path), base)
 
 
 def add_worktree_on(repo: Path, path: Path, *, branch: str) -> None:
@@ -217,8 +229,9 @@ def add_worktree_on(repo: Path, path: Path, *, branch: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         shutil.rmtree(path)
-    _git(repo, "worktree", "prune")
-    _git(repo, "worktree", "add", str(path), branch)
+    with _WORKTREE_LOCK:
+        _git(repo, "worktree", "prune")
+        _git(repo, "worktree", "add", str(path), branch)
 
 
 def add_worktree_detached(repo: Path, path: Path, *, ref: str) -> None:
@@ -234,17 +247,19 @@ def add_worktree_detached(repo: Path, path: Path, *, ref: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         shutil.rmtree(path)
-    _git(repo, "worktree", "prune")
-    _git(repo, "worktree", "add", "--detach", str(path), ref)
+    with _WORKTREE_LOCK:
+        _git(repo, "worktree", "prune")
+        _git(repo, "worktree", "add", "--detach", str(path), ref)
 
 
 def remove_worktree(repo: Path, path: Path) -> None:
     """Force-remove a worktree + prune its registration (idempotent)."""
 
-    _git(repo, "worktree", "remove", "--force", str(path), check=False)
-    if path.exists():
-        shutil.rmtree(path, ignore_errors=True)
-    _git(repo, "worktree", "prune")
+    with _WORKTREE_LOCK:
+        _git(repo, "worktree", "remove", "--force", str(path), check=False)
+        if path.exists():
+            shutil.rmtree(path, ignore_errors=True)
+        _git(repo, "worktree", "prune")
 
 
 def prune_tree(repo: Path, worktrees_dir: Path) -> None:
@@ -256,7 +271,8 @@ def prune_tree(repo: Path, worktrees_dir: Path) -> None:
 
     if worktrees_dir.exists():
         shutil.rmtree(worktrees_dir, ignore_errors=True)
-    _git(repo, "worktree", "prune")
+    with _WORKTREE_LOCK:
+        _git(repo, "worktree", "prune")
 
 
 def discard_attempt(repo: Path, path: Path, branch: str) -> None:

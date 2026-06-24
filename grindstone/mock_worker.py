@@ -21,6 +21,7 @@ from grindstone.worker import (
     RateLimited,
     TransportError,
     WorkerRequest,
+    WorkerTransport,
 )
 
 #: The behavior vocabulary. Order is the scripting order. ``session_limit`` is a
@@ -210,3 +211,140 @@ def fuzz_script(seed: int, length: int) -> list[str]:
 
     rng = random.Random(seed)
     return [rng.choice(BEHAVIORS) for _ in range(length)]
+
+
+#: The per-task outcome vocabulary the seeded stochastic worker draws from. Each
+#: task's outcome is a PURE function of ``(seed, task_id)`` (a per-task
+#: ``random.Random``), so the result is deterministic regardless of the order
+#: concurrent fan-out threads dispatch in, AND stable across a rate-limit
+#: epoch-restart (which re-enters ``run_task`` fresh). The four map onto the loop's
+#: real routes: ``pass`` -> merged; ``retry_pass`` -> a FAILED first attempt then a
+#: DONE retry (the bounded same-tier self-heal); ``failed`` -> FAILED every attempt
+#: (retries exhaust -> escalated to the planner); ``blocked`` -> a worker-reported
+#: BLOCKED (straight to the planner, critic skipped).
+STOCHASTIC_OUTCOMES: tuple[str, ...] = ("pass", "retry_pass", "failed", "blocked")
+
+#: Default outcome weights: mostly-pass with a tail of self-heals + hard failures,
+#: so a multi-epoch run converges most of the time while every failure route is
+#: exercised across a seed sweep.
+DEFAULT_OUTCOME_WEIGHTS: tuple[float, float, float, float] = (0.6, 0.2, 0.1, 0.1)
+
+
+@dataclass
+class StochasticWorker:
+    """A SEEDED stochastic loop worker for the convergence / invariant E2E.
+
+    Concurrency-safe by construction: a task's outcome is drawn from a per-task
+    ``random.Random(f"{seed}|{task_id}")``, never a shared global generator and
+    never in dispatch order, so two threads fanning out cannot race the draw and a
+    re-run (rate-limit restart, resume) reproduces the SAME per-task outcome. The
+    only shared mutable state is the one-shot rate-limit flag, guarded by a lock.
+
+    Retry is detected statelessly from ``request.failure_context`` (a retry attempt
+    carries the prior rejection), so no per-task counter can drift across a restart.
+    Every DONE handoff writes exactly what the task CLAIMS (each ``file_ownership``
+    path + ``review.md`` for implement, the ``artifact_out`` for a non-write task),
+    so the scope + citation gates pass by construction; the critic dispatch always
+    rubber-stamps PASS (a DONE handoff here is honest work, the rubber-stamp SAFETY
+    net is tested separately against a critic that passes BROKEN work).
+    """
+
+    seed: int
+    weights: tuple[float, float, float, float] = DEFAULT_OUTCOME_WEIGHTS
+    rate_limit_once: bool = False
+    _rl_fired: bool = False
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def _outcome(self, task_id: str) -> str:
+        rng = random.Random(f"{self.seed}|{task_id}")
+        return rng.choices(STOCHASTIC_OUTCOMES, weights=list(self.weights), k=1)[0]
+
+    def run(self, request: WorkerRequest) -> None:
+        if request.critic is not None:
+            (request.scratch / CRITIC_VERDICT_FILENAME).write_text(
+                json.dumps({"outcome": "PASS", "reason": "stochastic critic PASS"}),
+                encoding="utf-8",
+            )
+            return
+
+        with self._lock:
+            if self.rate_limit_once and not self._rl_fired:
+                self._rl_fired = True
+                raise RateLimited("stochastic worker one-shot rate limit")
+
+        outcome = self._outcome(request.task_id)
+        is_retry = bool(request.failure_context)
+        if outcome == "blocked":
+            status = "BLOCKED"
+        elif outcome == "failed":
+            status = "FAILED"
+        elif outcome == "retry_pass":
+            status = "DONE" if is_retry else "FAILED"
+        else:
+            status = "DONE"
+
+        cited = self._write_work(request) if status == "DONE" else []
+        (request.scratch / "handoff.json").write_text(
+            json.dumps(_valid_handoff(request, cited, status=status)), encoding="utf-8"
+        )
+
+    def _write_work(self, request: WorkerRequest) -> list[str]:
+        """Write exactly the claimed deliverables for a DONE handoff (mirrors the
+        ``LoopWorker`` happy path) and return the citation paths."""
+
+        task = request.task
+        cited: list[str] = []
+        if request.mode == "implement":
+            for rel in task.file_ownership:
+                path = request.scratch / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    f"# {request.task_id}\nvalue = {request.task_id!r}\n",
+                    encoding="utf-8",
+                )
+                cited.append(rel)
+            (request.scratch / REVIEW_FILENAME).write_text(
+                "stochastic review: no findings\n", encoding="utf-8"
+            )
+        else:
+            assert task.artifact_out is not None
+            out = request.scratch / task.artifact_out
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(f"# artifact {request.task_id}\n", encoding="utf-8")
+            cited.append(task.artifact_out)
+        return cited
+
+
+class SimulatedKill(BaseException):
+    """A modelled host SIGKILL: a ``BaseException`` (NOT an ``Exception``) so it
+    escapes the loop's transport boundary (which catches ``Exception`` and demotes it
+    to a retryable task failure) and propagates clean out of ``start_run``, exactly
+    like the host process dying mid-epoch. Subclasses ``BaseException`` rather than
+    reusing ``KeyboardInterrupt`` so it never trips pytest's interrupt handling."""
+
+
+@dataclass
+class CrashingWorker:
+    """Wraps an inner worker and raises a HARD kill on the ``crash_on``-th worker
+    dispatch (a simulated SIGKILL mid-run).
+
+    The kill (a ``SimulatedKill`` ``BaseException``) is NOT caught by the loop's
+    transport boundary, so it propagates out of ``start_run`` exactly like the host
+    process dying: the journal is left at a mid-epoch boundary (an ``epoch_started``
+    with no ``epoch_completed``) and the in-flight epoch's throwaway worktrees + wip
+    branches survive on disk, for ``resume_run`` to raze + re-plan. Critic dispatches
+    are passed through (the kill models a death DURING a worker grind). If the run
+    finishes before the ``crash_on``-th dispatch, no kill fires (a clean run)."""
+
+    inner: WorkerTransport
+    crash_on: int
+    _n: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def run(self, request: WorkerRequest) -> None:
+        if request.critic is None:
+            with self._lock:
+                self._n += 1
+                if self._n == self.crash_on:
+                    raise SimulatedKill("simulated kill (mid-epoch crash)")
+        self.inner.run(request)
