@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # senior_request.sh, the DEFAULT `senior` worker role: the escalation tier. Runs
 # Claude (Opus) headless via `claude -p` one-shot IN the task worktree, with edit
-# + exec permissions, same grindstone contract as worker_request.sh. Senior handles
-# research/review escalations and visual epochs, so it leans on deeper
-# investigation (Claude's built-in web search/fetch tools, available under full
-# permissions) and independent re-derivation.
+# + exec permissions, same grindstone contract as worker_request.sh. The senior
+# TIER takes the tasks the planner routes to it (judgment, taste, synthesis, and
+# escalations), so it leans on deeper investigation (Claude's built-in web
+# search/fetch tools, available under full permissions) and independent re-derivation.
 #
 # This is the shipped default rig: a fresh cloner with Claude Code installed runs
 # with zero setup. An operator's own senior tier (e.g. a cloud agent with a
@@ -67,7 +67,7 @@ build_timeout_prefix "$timeout"
 # The worktree is an isolated, throwaway checkout, so --dangerously-skip-permissions
 # (full tool access incl. web search/fetch + Bash) is safe and required for a
 # headless run that never blocks on a permission prompt.
-sys_append="You are the SENIOR escalation worker for a grindstone task. Investigate thoroughly: use web search when researching, and INDEPENDENTLY re-derive the claims you judge rather than merely confirm expected sections exist. Work only inside this worktree (your CWD): write every file with a path RELATIVE to your CWD, never an absolute path and never outside it, COMMIT your work, run the done_when checks, and write a short free-form handoff.md report for the reviewer exactly as the task instructs."
+sys_append="You are the SENIOR escalation worker for a grindstone task. Investigate thoroughly: use web search when researching, and INDEPENDENTLY re-derive the claims you judge rather than merely confirm expected sections exist. Work only inside this worktree (your CWD): write every file with a path RELATIVE to your CWD, never an absolute path and never outside it, COMMIT your work, run whatever checks convince you it works, and write a short free-form handoff.md report for the reviewer exactly as the task instructs."
 
 # The prompt is fed to claude on STDIN (`claude -p` reads the prompt from stdin),
 # never as an argv string: a large prior-failure context could otherwise exceed

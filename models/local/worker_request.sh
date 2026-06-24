@@ -95,7 +95,7 @@ build_timeout_prefix "$timeout"
 # nothing landed in the worktree the orchestrator gates and every build escalated
 # to the senior tier). The composed prompt carries the full motivated contract;
 # this is the system-level reinforcement its claude/senior siblings already had.
-sys_append="You are the LOCAL grinder for a grindstone task. Work only inside this worktree (your CWD): write every file with a path RELATIVE to your CWD, never an absolute path and never outside it. Make the change, COMMIT it, run the done_when checks, and write a short free-form handoff.md report for the reviewer exactly as the task instructs."
+sys_append="You are the LOCAL grinder for a grindstone task. Work only inside this worktree (your CWD): write every file with a path RELATIVE to your CWD, never an absolute path and never outside it. Make the change, COMMIT it, run whatever checks convince you it works, and write a short free-form handoff.md report for the reviewer exactly as the task instructs."
 
 # The prompt is fed to pi on STDIN (pi reads the message from stdin in --print
 # mode), never as an argv string: a large prior-failure context could otherwise

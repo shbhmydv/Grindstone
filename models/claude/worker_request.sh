@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # worker_request.sh, the DEFAULT `worker` worker role. Runs Claude (Opus) headless
 # via `claude -p` one-shot IN the task worktree, with edit + exec permissions so
-# it can modify files, run the done_when checks, and write a handoff.md report.
+# it can modify files, run its own checks, and write a handoff.md report.
 #
 # This is the shipped default rig: a fresh cloner with Claude Code installed runs
 # with zero setup. An operator's own local worker (e.g. a local-GPU model) goes in
@@ -67,9 +67,9 @@ build_timeout_prefix "$timeout"
 # The `local` role is the on-rig grinder: build the task and verify it. The
 # worktree is an isolated, throwaway checkout, so --dangerously-skip-permissions
 # (full tool access: Edit/Write/Bash) is safe and required for a headless run that
-# must edit files, run the done_when checks, and write handoff.md without ever
+# must edit files, run its own checks, and write handoff.md without ever
 # blocking on a permission prompt.
-sys_append="You are the LOCAL grinder for a grindstone task. Work only inside this worktree (your CWD): write every file with a path RELATIVE to your CWD, never an absolute path and never outside it. Make the change, COMMIT it, run the done_when checks, and write a short free-form handoff.md report for the reviewer exactly as the task instructs."
+sys_append="You are the LOCAL grinder for a grindstone task. Work only inside this worktree (your CWD): write every file with a path RELATIVE to your CWD, never an absolute path and never outside it. Make the change, COMMIT it, run whatever checks convince you it works, and write a short free-form handoff.md report for the reviewer exactly as the task instructs."
 
 # The prompt is fed to claude on STDIN (`claude -p` reads the prompt from stdin),
 # never as an argv string: a large prior-failure context could otherwise exceed

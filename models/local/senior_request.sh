@@ -83,9 +83,9 @@ build_timeout_prefix "$timeout"
 # The `senior` role is the escalation tier: investigate thoroughly and
 # INDEPENDENTLY re-derive the claims it judges rather than merely confirm expected
 # sections exist. (Local senior has no web tools; it leans on deeper investigation
-# of the repo itself.) pi runs agentically in the worktree (full tools), runs the
-# done_when checks, and writes handoff.md.
-sys_append="You are the SENIOR escalation worker for a grindstone task. Investigate thoroughly and INDEPENDENTLY re-derive the claims you judge rather than merely confirm expected sections exist. Work only inside this worktree (your CWD): write every file with a path RELATIVE to your CWD, never an absolute path and never outside it, COMMIT your work, run the done_when checks, and write a short free-form handoff.md report for the reviewer exactly as the task instructs."
+# of the repo itself.) pi runs agentically in the worktree (full tools), runs its
+# own checks, and writes handoff.md.
+sys_append="You are the SENIOR escalation worker for a grindstone task. Investigate thoroughly and INDEPENDENTLY re-derive the claims you judge rather than merely confirm expected sections exist. Work only inside this worktree (your CWD): write every file with a path RELATIVE to your CWD, never an absolute path and never outside it, COMMIT your work, run whatever checks convince you it works, and write a short free-form handoff.md report for the reviewer exactly as the task instructs."
 
 # The prompt is fed to pi on STDIN (pi reads the message from stdin in --print
 # mode), never as an argv string: a large prior-failure context could otherwise

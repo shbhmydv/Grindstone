@@ -26,9 +26,8 @@ from pathlib import Path
 
 from grindstone.contracts.models import parse_decision
 
-#: The filename the wrapper is written as, and the command the planner re-runs.
+#: The filename the wrapper is written as (the planner re-runs it on its decision).
 CHECK_SCRIPT_NAME = "check_decision.py"
-CHECK_COMMAND = f"python3 {CHECK_SCRIPT_NAME} decision.json"
 #: Where the planner writes its candidate decision (the disk contract read back).
 DECISION_FILE = "decision.json"
 

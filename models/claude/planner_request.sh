@@ -88,7 +88,7 @@ if [[ -n "$workdir" ]]; then
   # call, so any edit evaporates and only decision.json is read back. The contract
   # is the disk file, not stdout; --out still captures the agent log for debugging.
   workdir="$(cd "$workdir" && pwd)"
-  sys_append="You are the grindstone planner. Decide the SINGLE next epoch as one JSON object matching the epoch-decision schema (schema_version, tool, args). Your CWD is a throwaway worktree checkout of the current code: read and grep it to ground your plan, but any file you change here is discarded. Steps you MUST follow: (1) write your decision JSON to ./decision.json; (2) run \`python3 check_decision.py decision.json\`; (3) if it prints violations, FIX decision.json (the schema is two levels: an epoch carries epoch_title, rationale and a tasks array; per-task fields like id/goal/done_when live INSIDE each task, never on the epoch) and re-run; (4) repeat until it exits 0 with no violations. decision.json, gate-clean, is your ONLY output. Do not print the decision."
+  sys_append="You are the grindstone planner. Decide the SINGLE next step as one JSON object: either {\"kind\":\"epoch\",\"epoch\":{...}} or {\"kind\":\"end\",\"summary\":\"...\"}. Your CWD is a throwaway worktree checkout of the current code: read and grep it to ground your plan, but any file you change here is discarded. Steps you MUST follow: (1) write your decision JSON to ./decision.json; (2) run \`python3 check_decision.py decision.json\`; (3) if it prints violations, FIX decision.json (an epoch carries title, optional rationale, and a tasks array of 1 to 8 disjoint tasks; each task carries id/mode/goal/tier, an implement task carries file_ownership and a research/review/artifact task carries artifact_out; you author NO done_when or check commands) and re-run; (4) repeat until it exits 0 with no violations. decision.json, gate-clean, is your ONLY output. Do not print the decision."
   ( cd "$workdir" && "${timeout_prefix[@]}" claude -p \
     --model "$model" \
     --output-format text \
@@ -102,7 +102,7 @@ else
   # --dangerously-skip-permissions, so in headless `-p` mode any edit/exec tool is
   # denied (it cannot prompt) and the planner cannot mutate the repo. The final
   # message is captured to --out for the core extractor.
-  sys_append="Output ONLY a single JSON object that matches the grindstone epoch-decision schema (schema_version, tool, args). No prose, no markdown code fences, no commentary before or after the object."
+  sys_append="Output ONLY a single JSON object matching the grindstone epoch-decision schema: either {\"kind\":\"epoch\",\"epoch\":{...}} or {\"kind\":\"end\",\"summary\":\"...\"}. No prose, no markdown code fences, no commentary before or after the object."
   ( cd "$repo" && "${timeout_prefix[@]}" claude -p \
     --model "$model" \
     --output-format text \
