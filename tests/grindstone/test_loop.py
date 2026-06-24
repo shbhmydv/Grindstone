@@ -320,6 +320,59 @@ def test_resume_razes_inflight_and_replans(
     assert "P1/E1/T1/handoff.json" in planner.contexts[0].log_index
 
 
+# --- FIX 1: an unexpected GitError/OSError mid-epoch routes to node #2 ----------
+
+
+def test_unexpected_git_error_mid_epoch_is_carried_not_crash(
+    git_repo: Path, run_dir: RunDir, job_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An orchestrator-side fault (a GitError from the integration machinery, OUTSIDE
+    # the worker's attempt try) must NOT crash an unattended run: BONES routes ANY
+    # other epoch failure to node #2 as carried context the next boundary sees.
+    real_ff = wt.fast_forward_branch
+    calls = {"n": 0}
+
+    def flaky_ff(repo: Path, branch: str, commit: str) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise wt.GitError("injected integration fault")
+        real_ff(repo, branch, commit)
+
+    monkeypatch.setattr("grindstone.loop.wt.fast_forward_branch", flaky_ff)
+    planner = MockDecisionPlanner(
+        [_epoch(_impl("T1", ["a.py"])), _epoch(_impl("T2", ["b.py"])), _end()]
+    )
+    result = start_run(
+        job_path=job_path, run_dir=run_dir, repo=git_repo, planner=planner,
+        backends=_backends(LoopWorker()), max_epochs=5,
+    )
+    assert result.status == "completed"  # the run survived the fault
+    # E1's integration aborted; the planner saw the abort as carried context at E2.
+    assert any("abort" in c.lower() for c in planner.contexts[1].carried)
+    # The run recovered: E2 integrated cleanly onto the run branch.
+    assert "b.py" in wt.list_tree(git_repo, "grind/run-1")
+
+
+def test_k_consecutive_aborts_end_cleanly(
+    git_repo: Path, run_dir: RunDir, job_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A PERSISTENT infra fault must not infinite-loop: after K consecutive aborts the
+    # bounded backstop clean-ends the run (node #2), resumable as the next run.
+    def always_raise(repo: Path, branch: str, commit: str) -> None:
+        raise OSError("persistent integration fault")
+
+    monkeypatch.setattr("grindstone.loop.wt.fast_forward_branch", always_raise)
+    planner = MockDecisionPlanner([_epoch(_impl("T1", ["a.py"]))] * 5 + [_end()])
+    result = start_run(
+        job_path=job_path, run_dir=run_dir, repo=git_repo, planner=planner,
+        backends=_backends(LoopWorker()), max_epochs=20,
+    )
+    assert result.status == "ended"
+    assert "consecutive" in result.summary
+    # It ended at the backstop, well before max_epochs.
+    assert result.epochs <= 3
+
+
 # --- the final-acceptance invariant runs done_when against the tip -------------
 
 

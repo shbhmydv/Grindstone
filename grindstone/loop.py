@@ -97,6 +97,12 @@ from grindstone.worker import (
 #: cap is the involuntary trigger of the clean partial-end, never unbounded).
 DEFAULT_MAX_EPOCHS = 40
 
+#: BONES failure node #2 backstop: K CONSECUTIVE epochs aborting on an UNEXPECTED
+#: error (a GitError/OSError escaping the worktree/integration machinery, not a
+#: planned task failure) clean-ends the run, so a persistent infra fault cannot
+#: infinite-loop an unattended run. A single transient fault is just carried.
+MAX_CONSECUTIVE_ABORTS = 3
+
 #: Node-#1 backoff (~1/hr). Injected as ``sleep_fn``/``backoff_s`` so tests park
 #: without a real wall clock.
 DEFAULT_BACKOFF_S = 3600.0
@@ -667,6 +673,7 @@ def _drive(
 
     epoch_index = start_index
     carried: tuple[str, ...] = ()
+    consec_aborts = 0
     while epoch_index <= max_epochs:
         _reap_prior_logs(log_root, epoch_index)
         tip_ref = _resolve_tip(repo, run_branch)
@@ -694,35 +701,68 @@ def _drive(
 
         epoch = decision.epoch
         epoch_id = f"{_PHASE}/E{epoch_index}"
-        setup_err = _run_setup(
-            list(epoch.setup), repo if repo is not None else run_dir.root
-        )
-        if setup_err is not None:
-            carried = carried + (f"E{epoch_index} setup failed: {setup_err}",)
+        base = tip_ref
+        started_emitted = False
+        try:
+            setup_err = _run_setup(
+                list(epoch.setup), repo if repo is not None else run_dir.root
+            )
+            if setup_err is not None:
+                carried = carried + (f"E{epoch_index} setup failed: {setup_err}",)
+                consec_aborts = 0
+                epoch_index += 1
+                continue
+            journal.emit(
+                lambda s: EpochStarted(
+                    seq=s, ts=now_fn(), epoch_id=epoch_id, title=epoch.title,
+                    tasks=[TaskRef(id=t.id, mode=t.mode) for t in epoch.tasks],
+                )
+            )
+            started_emitted = True
+            results = _grind_epoch(
+                epoch, epoch_id, base, repo=repo, run_dir=run_dir,
+                run_branch=run_branch, backends=backends, journal=journal,
+                log_root=log_root, sleep_fn=sleep_fn, backoff_s=backoff_s,
+                now_fn=now_fn,
+            )
+            tasks_by_id = {f"{epoch_id}/{t.id}": t for t in epoch.tasks}
+            integration = _integrate(
+                epoch_id, base, repo=repo, run_dir=run_dir, run_branch=run_branch,
+                results=results, tasks_by_id=tasks_by_id,
+            )
+            carried = _carry(results, integration)
+            journal.emit(
+                lambda s: EpochCompleted(seq=s, ts=now_fn(), epoch_id=epoch_id)
+            )
+            consec_aborts = 0
+        except WorkerRateLimited:
+            # Node #1 stays un-burned (defensive: _grind_epoch already parks on it).
+            raise
+        except Exception as exc:
+            # BONES node #2: ANY other epoch failure (a GitError/OSError escaping the
+            # worktree or integration machinery) becomes carried context the planner
+            # steers around next boundary, never an uncaught crash of an unattended
+            # run. The in-flight epoch's partial debris is razed.
+            consec_aborts += 1
+            detail = (
+                f"E{epoch_index} aborted on an unexpected "
+                f"{type(exc).__name__}: {exc}"
+            )
+            _raze_epoch(run_dir, repo, run_branch, epoch_id, log_root)
+            if started_emitted:
+                journal.emit(
+                    lambda s: EpochCompleted(seq=s, ts=now_fn(), epoch_id=epoch_id)
+                )
+            if consec_aborts >= MAX_CONSECUTIVE_ABORTS:
+                summary = (
+                    f"{consec_aborts} consecutive epochs aborted on unexpected "
+                    f"errors (persistent infra fault); last: {detail}"
+                )
+                _emit_ended(journal, now_fn, summary)
+                return RunResult("ended", summary, epoch_index - 1)
+            carried = carried + (detail,)
             epoch_index += 1
             continue
-
-        journal.emit(
-            lambda s: EpochStarted(
-                seq=s, ts=now_fn(), epoch_id=epoch_id, title=epoch.title,
-                tasks=[TaskRef(id=t.id, mode=t.mode) for t in epoch.tasks],
-            )
-        )
-        base = tip_ref
-        results = _grind_epoch(
-            epoch, epoch_id, base, repo=repo, run_dir=run_dir, run_branch=run_branch,
-            backends=backends, journal=journal, log_root=log_root, sleep_fn=sleep_fn,
-            backoff_s=backoff_s, now_fn=now_fn,
-        )
-        tasks_by_id = {f"{epoch_id}/{t.id}": t for t in epoch.tasks}
-        integration = _integrate(
-            epoch_id, base, repo=repo, run_dir=run_dir, run_branch=run_branch,
-            results=results, tasks_by_id=tasks_by_id,
-        )
-        carried = _carry(results, integration)
-        journal.emit(
-            lambda s: EpochCompleted(seq=s, ts=now_fn(), epoch_id=epoch_id)
-        )
         epoch_index += 1
 
     summary = f"max epochs ({max_epochs}) reached without a planned end"
