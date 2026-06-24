@@ -259,7 +259,7 @@ class GoalPlanner:
                         id="T1",
                         mode="research",
                         goal="investigate the job and lay groundwork",
-                        artifact_out=f"P1/E{n}/T1/research.md",
+                        artifact_out=f"E{n}/T1/research.md",
                     )
                 ],
             )
@@ -289,7 +289,7 @@ class GoalPlanner:
                         id="T1",
                         mode="review",
                         goal="re-derive the job and reconcile against the built modules",
-                        artifact_out=f"P1/E{n}/T1/review.md",
+                        artifact_out=f"E{n}/T1/review.md",
                     )
                 ],
             )

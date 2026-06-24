@@ -67,8 +67,8 @@ from grindstone.events import (
     EpochCarried,
     EpochCompleted,
     EpochStarted,
-    HandoffAccepted,
-    HandoffRejected,
+    WorkGatePassed,
+    WorkGateRejected,
     JournalWriter,
     RateLimited as RateLimitedEvent,
     RunCompleted,
@@ -111,11 +111,6 @@ DEFAULT_BACKOFF_S = 3600.0
 #: Wall-clock cap on each planner-declared setup command (the trusted-tier
 #: host-mutation seam runs them via the shell before the tasks).
 SETUP_TIMEOUT_S = 1800.0
-
-#: The single phase prefix (BONES is epochs-only; the keyed-log grammar still wants
-#: ``P*/E*/T*``, so every epoch lives under one fixed phase).
-_PHASE = "P1"
-
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -225,7 +220,7 @@ class RunResult:
 
 def _short_id(task_id: str) -> str:
     """The per-epoch short task id (``T1``) the journal groups under ``epoch_id``;
-    ``run_task`` works in the fully-qualified ``P*/E*/T*`` for the keyed log."""
+    ``run_task`` works in the fully-qualified ``E*/T*`` for the keyed log."""
 
     return task_id.rsplit("/", 1)[-1]
 
@@ -241,18 +236,18 @@ class _JournalAttemptEvents:
         self._epoch_id = epoch_id
         self._now = now_fn
 
-    def handoff_accepted(self, task_id: str) -> None:
+    def work_gate_passed(self, task_id: str) -> None:
         tid = _short_id(task_id)
         self._journal.emit(
-            lambda s: HandoffAccepted(
+            lambda s: WorkGatePassed(
                 seq=s, ts=self._now(), epoch_id=self._epoch_id, task_id=tid
             )
         )
 
-    def handoff_rejected(self, task_id: str, reason: str) -> None:
+    def work_gate_rejected(self, task_id: str, reason: str) -> None:
         tid = _short_id(task_id)
         self._journal.emit(
-            lambda s: HandoffRejected(
+            lambda s: WorkGateRejected(
                 seq=s, ts=self._now(), epoch_id=self._epoch_id, task_id=tid,
                 reason=reason,
             )
@@ -330,9 +325,9 @@ def _run_setup(
     mutations (system packages, global tooling, shared directories), so the shell is
     intentional (the untrusted worker never reaches this seam). They run in a
     THROWAWAY detached worktree of the epoch base, torn down after, so setup can
-    NEVER dirty the operator checkout. Project-LOCAL dependency installs (npm ci /
-    pip install) do NOT belong here: this throwaway checkout is not the task
-    worktrees, so an install run here would not reach them; an implement task
+    NEVER dirty the operator checkout. Project-LOCAL dependency installs (the
+    project's own package manager) do NOT belong here: this throwaway checkout is not
+    the task worktrees, so an install run here would not reach them; an implement task
     installs the project deps it needs inside its OWN worktree instead. With no repo
     there is nothing to check out, so the commands run in the run dir (a degenerate
     but honest fallback)."""
@@ -620,7 +615,7 @@ def _reap_prior_logs(log_root: Path, epoch_index: int) -> None:
     epoch's full raw logs, so an overnight run cannot fill the disk)."""
 
     if epoch_index > 1:
-        _reap_epoch_logs(log_root, f"{_PHASE}/E{epoch_index - 1}")
+        _reap_epoch_logs(log_root, f"E{epoch_index - 1}")
 
 
 def _raze_epoch(
@@ -746,7 +741,7 @@ def _drive(
             return RunResult("ended", decision.summary, epoch_index - 1)
 
         epoch = decision.epoch
-        epoch_id = f"{_PHASE}/E{epoch_index}"
+        epoch_id = f"E{epoch_index}"
         base = tip_ref
         started_emitted = False
         try:
@@ -899,7 +894,7 @@ def resume_run(
 
     completed = _completed_count(events)
     start_index = completed + 1
-    in_flight_id = f"{_PHASE}/E{start_index}"
+    in_flight_id = f"E{start_index}"
     started_ids = {e.epoch_id for e in events if isinstance(e, EpochStarted)}
     razed = in_flight_id if in_flight_id in started_ids else None
     carried = _reconstruct_carried(events)

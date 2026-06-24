@@ -239,7 +239,7 @@ def test_non_write_reads_integration_tip(
     planner = MockDecisionPlanner(
         [
             _epoch(_impl("T1", ["feature.py"]), title="build"),
-            _epoch(_review("T1", "P1/E2/T1/review.md"), title="review"),
+            _epoch(_review("T1", "E2/T1/review.md"), title="review"),
             _end(),
         ]
     )
@@ -248,10 +248,10 @@ def test_non_write_reads_integration_tip(
         backends=_backends(LoopWorker(read_cite="feature.py")),
     )
     assert result.status == "completed"
-    review = run_dir.resolve("P1/E2/T1/review.md").read_text(encoding="utf-8")
+    review = run_dir.resolve("E2/T1/review.md").read_text(encoding="utf-8")
     # The review worker read feature.py AT THE INTEGRATION TIP that E1 built; the
     # tip-keyed content proves it saw the in-run state, not the stale base checkout.
-    assert "value = 'P1/E1/T1'" in review
+    assert "value = 'E1/T1'" in review
 
 
 # --- resume from a mid-epoch crash ---------------------------------------------
@@ -268,35 +268,35 @@ def _fabricate_crashed_run(
     wt.ensure_integration_branch(git_repo, "grind/run-1", "main")
     e1_wt = run_dir.worktrees_root / "_e1build"
     wt.add_worktree_on(git_repo, e1_wt, branch="grind/run-1")
-    (e1_wt / "feature.py").write_text("value = 'P1/E1/T1'\n", encoding="utf-8")
+    (e1_wt / "feature.py").write_text("value = 'E1/T1'\n", encoding="utf-8")
     wt.commit_all(e1_wt, "e1: feature")
     wt.remove_worktree(git_repo, e1_wt)
 
     # E1's durable keyed log (the done-list the re-planned epoch must keep).
-    h = run_dir.resolve("P1/E1/T1/handoff.json")
+    h = run_dir.resolve("E1/T1/handoff.json")
     h.parent.mkdir(parents=True, exist_ok=True)
-    h.write_text('{"task_id": "P1/E1/T1", "status": "DONE"}', encoding="utf-8")
+    h.write_text('{"task_id": "E1/T1", "status": "DONE"}', encoding="utf-8")
 
     # The journal: E1 done, E2 in flight (no EpochCompleted, no run terminal).
     with JournalWriter(run_dir.events_path) as jw:
         jw.emit(lambda s: RunStarted(seq=s, ts="t0", run_id="run-1",
                                      job_path=str(job_path), max_epochs=9))
-        jw.emit(lambda s: EpochStarted(seq=s, ts="t1", epoch_id="P1/E1", title="build",
+        jw.emit(lambda s: EpochStarted(seq=s, ts="t1", epoch_id="E1", title="build",
                                        tasks=[TaskRef(id="T1", mode="implement")]))
-        jw.emit(lambda s: EpochCompleted(seq=s, ts="t2", epoch_id="P1/E1"))
-        jw.emit(lambda s: EpochStarted(seq=s, ts="t3", epoch_id="P1/E2", title="more",
+        jw.emit(lambda s: EpochCompleted(seq=s, ts="t2", epoch_id="E1"))
+        jw.emit(lambda s: EpochStarted(seq=s, ts="t3", epoch_id="E2", title="more",
                                        tasks=[TaskRef(id="T1", mode="implement")]))
 
     # In-flight E2 transient debris: a registered worktree + wip branch, a partial
     # keyed-log subdir, and a raw-log dir.
     wt.add_worktree(
-        git_repo, run_dir.worktrees_root / "P1-E2-T1" / "attempt-1",
-        branch="grind-wip/run-1/P1-E2-T1/attempt-1", base="grind/run-1",
+        git_repo, run_dir.worktrees_root / "E2-T1" / "attempt-1",
+        branch="grind-wip/run-1/E2-T1/attempt-1", base="grind/run-1",
     )
-    partial = run_dir.resolve("P1/E2/T1")
+    partial = run_dir.resolve("E2/T1")
     partial.mkdir(parents=True, exist_ok=True)
     (partial / "scratch.txt").write_text("half-written\n", encoding="utf-8")
-    logs = run_dir.root / "logs" / "P1-E2-T1-worker"
+    logs = run_dir.root / "logs" / "E2-T1-worker"
     logs.mkdir(parents=True, exist_ok=True)
     (logs / "stdout.log").write_text("noise\n", encoding="utf-8")
 
@@ -314,22 +314,22 @@ def test_resume_razes_inflight_and_replans(
     assert result.status == "completed"
 
     # The in-flight epoch was razed: worktree, wip branch, partial keyed log, raw logs.
-    assert not (run_dir.worktrees_root / "P1-E2-T1").exists()
-    assert not wt.branch_exists(git_repo, "grind-wip/run-1/P1-E2-T1/attempt-1")
-    assert not run_dir.resolve("P1/E2").exists()
-    assert not (run_dir.root / "logs" / "P1-E2-T1-worker").exists()
+    assert not (run_dir.worktrees_root / "E2-T1").exists()
+    assert not wt.branch_exists(git_repo, "grind-wip/run-1/E2-T1/attempt-1")
+    assert not run_dir.resolve("E2").exists()
+    assert not (run_dir.root / "logs" / "E2-T1-worker").exists()
 
     # The completed-epoch keyed log + the run-branch boundary are PRESERVED.
-    assert run_dir.resolve("P1/E1/T1/handoff.json").is_file()
+    assert run_dir.resolve("E1/T1/handoff.json").is_file()
     assert "feature.py" in wt.list_tree(git_repo, "grind/run-1")
 
     # The journal was APPENDED, never truncated: the razed-epoch marker is permanent.
     events = read_events(run_dir.events_path)
     resumed = [e for e in events if isinstance(e, RunResumed)]
-    assert len(resumed) == 1 and resumed[0].razed_epoch == "P1/E2"
+    assert len(resumed) == 1 and resumed[0].razed_epoch == "E2"
     # The planner re-entered at the last clean boundary and saw the completed E1.
     assert planner.contexts[0].epoch_index == 2
-    assert "P1/E1/T1/handoff.json" in planner.contexts[0].log_index
+    assert "E1/T1/handoff.json" in planner.contexts[0].log_index
 
 
 # --- FIX 1: an unexpected GitError/OSError mid-epoch routes to node #2 ----------

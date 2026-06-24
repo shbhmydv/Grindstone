@@ -35,7 +35,7 @@ def _arg(name: str) -> str:
 def _request(scratch: Path) -> WorkerRequest:
     task = Task(id="T1", mode="implement", goal="x", file_ownership=["a.py"])
     return WorkerRequest(
-        task=task, task_id="P1/E1/T1", mode="implement", scratch=scratch
+        task=task, task_id="E1/T1", mode="implement", scratch=scratch
     )
 
 
@@ -52,7 +52,7 @@ def test_script_worker_writes_handoff(tmp_path: Path) -> None:
     # The script honors the file contract: it writes its free-form handoff.md into
     # the --worktree. ScriptWorker just runs it (run_task gates the work, not this).
     body = _arg("worktree") + (
-        'printf "# handoff P1/E1/T1\\nDONE\\n" > "$wt/handoff.md"\n'
+        'printf "# handoff E1/T1\\nDONE\\n" > "$wt/handoff.md"\n'
     )
     script = _script(tmp_path / "worker_request.sh", body)
     scratch = tmp_path / "wt"

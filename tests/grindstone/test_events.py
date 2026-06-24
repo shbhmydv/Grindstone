@@ -12,7 +12,7 @@ from grindstone.events import (
     EpochCompleted,
     EpochStarted,
     Event,
-    HandoffRejected,
+    WorkGateRejected,
     JournalWriter,
     RateLimited,
     RunCompleted,
@@ -33,17 +33,17 @@ def _seed(path: Path) -> list[Event]:
         jw.emit(lambda s: RunStarted(seq=s, ts="2026-06-24T00:00:00", run_id="r1",
                                      job_path="job.md", max_epochs=10))
         jw.emit(lambda s: EpochStarted(
-            seq=s, ts="2026-06-24T00:00:01", epoch_id="P1/E1", title="build",
+            seq=s, ts="2026-06-24T00:00:01", epoch_id="E1", title="build",
             tasks=[TaskRef(id="T1", mode="implement"), TaskRef(id="T2", mode="research")],
         ))
         jw.emit(lambda s: TaskDispatched(seq=s, ts="2026-06-24T00:00:02",
-                                         epoch_id="P1/E1", task_id="T1"))
-        jw.emit(lambda s: HandoffRejected(seq=s, ts="2026-06-24T00:00:03",
-                                          epoch_id="P1/E1", task_id="T2", reason="no citation"))
-        jw.emit(lambda s: Verdict(seq=s, ts="2026-06-24T00:00:04", epoch_id="P1/E1",
+                                         epoch_id="E1", task_id="T1"))
+        jw.emit(lambda s: WorkGateRejected(seq=s, ts="2026-06-24T00:00:03",
+                                          epoch_id="E1", task_id="T2", reason="no citation"))
+        jw.emit(lambda s: Verdict(seq=s, ts="2026-06-24T00:00:04", epoch_id="E1",
                                   task_id="T1", outcome="PASS", reason="ok"))
         jw.emit(lambda s: TaskDone(seq=s, ts="2026-06-24T00:00:05",
-                                   epoch_id="P1/E1", task_id="T1"))
+                                   epoch_id="E1", task_id="T1"))
     return read_events(path)
 
 
@@ -83,12 +83,12 @@ def test_replay_builds_phase_free_tree(tmp_path: Path) -> None:
     assert tree.max_epochs == 10
     assert len(tree.epochs) == 1
     epoch = tree.epochs[0]
-    assert epoch.id == "P1/E1"
+    assert epoch.id == "E1"
     t1 = next(t for t in epoch.tasks if t.id == "T1")
     t2 = next(t for t in epoch.tasks if t.id == "T2")
     assert t1.status == "done"  # done clears the earlier verdict note
     assert t1.note is None
-    assert t2.status == "handoff_rejected"
+    assert t2.status == "gate_rejected"
     assert t2.note == "no citation"
 
 
@@ -108,12 +108,12 @@ def test_replay_resume_marker(tmp_path: Path) -> None:
     path = tmp_path / "events.ndjson"
     with JournalWriter(path) as jw:
         jw.emit(lambda s: RunStarted(seq=s, ts="t0", run_id="r3", job_path="j"))
-        jw.emit(lambda s: EpochStarted(seq=s, ts="t1", epoch_id="P1/E1", title="x",
+        jw.emit(lambda s: EpochStarted(seq=s, ts="t1", epoch_id="E1", title="x",
                                        tasks=[TaskRef(id="T1", mode="implement")]))
-        jw.emit(lambda s: EpochCompleted(seq=s, ts="t2", epoch_id="P1/E1"))
-        jw.emit(lambda s: RunResumed(seq=s, ts="t3", run_id="r3", razed_epoch="P1/E2"))
+        jw.emit(lambda s: EpochCompleted(seq=s, ts="t2", epoch_id="E1"))
+        jw.emit(lambda s: RunResumed(seq=s, ts="t3", run_id="r3", razed_epoch="E2"))
     events = read_events(path)
-    assert any(isinstance(e, RunResumed) and e.razed_epoch == "P1/E2" for e in events)
+    assert any(isinstance(e, RunResumed) and e.razed_epoch == "E2" for e in events)
     tree = replay(events)
     assert tree.status == "running"
     assert tree.epochs[0].status == "completed"
@@ -125,18 +125,18 @@ def test_epoch_carried_roundtrips_and_replays(tmp_path: Path) -> None:
     path = tmp_path / "events.ndjson"
     with JournalWriter(path) as jw:
         jw.emit(lambda s: RunStarted(seq=s, ts="t0", run_id="r4", job_path="j"))
-        jw.emit(lambda s: EpochStarted(seq=s, ts="t1", epoch_id="P1/E1", title="x",
+        jw.emit(lambda s: EpochStarted(seq=s, ts="t1", epoch_id="E1", title="x",
                                        tasks=[TaskRef(id="T1", mode="implement")]))
-        jw.emit(lambda s: EpochCarried(seq=s, ts="t2", epoch_id="P1/E1",
-                                       reason="P1/E1/T1 escalated: missing dep"))
-        jw.emit(lambda s: EpochCompleted(seq=s, ts="t3", epoch_id="P1/E1"))
+        jw.emit(lambda s: EpochCarried(seq=s, ts="t2", epoch_id="E1",
+                                       reason="E1/T1 escalated: missing dep"))
+        jw.emit(lambda s: EpochCompleted(seq=s, ts="t3", epoch_id="E1"))
     events = read_events(path)
     carried = [e for e in events if isinstance(e, EpochCarried)]
     assert len(carried) == 1 and "escalated" in carried[0].reason
     tree = replay(events)
-    assert tree.epochs[0].carried == ["P1/E1/T1 escalated: missing dep"]
+    assert tree.epochs[0].carried == ["E1/T1 escalated: missing dep"]
 
 
 def test_replay_rejects_event_before_run_started(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
-        replay([EpochCompleted(seq=0, ts="t", epoch_id="P1/E1")])
+        replay([EpochCompleted(seq=0, ts="t", epoch_id="E1")])

@@ -40,7 +40,7 @@ def test_mock_planner_failures_route_two_node() -> None:
 def test_mock_worker_writes_work_and_freeform_handoff(tmp_path: Path) -> None:
     task = Task(id="T1", mode="implement", goal="x", file_ownership=["a.py"])
     request = WorkerRequest(
-        task=task, task_id="P1/E1/T1", mode="implement", scratch=tmp_path
+        task=task, task_id="E1/T1", mode="implement", scratch=tmp_path
     )
     worker = MockWorker(script=["ok"], artifacts={"a.py": "print(1)\n"})
     worker.run(request)
@@ -48,13 +48,13 @@ def test_mock_worker_writes_work_and_freeform_handoff(tmp_path: Path) -> None:
     # handoff.md report sits alongside it (prose, never a schema).
     assert (tmp_path / "a.py").read_text() == "print(1)\n"
     report = (tmp_path / HANDOFF_FILENAME).read_text()
-    assert "P1/E1/T1" in report and "DONE" in report
+    assert "E1/T1" in report and "DONE" in report
 
 
 def test_mock_worker_rate_limit_raises(tmp_path: Path) -> None:
-    task = Task(id="T1", mode="research", goal="x", artifact_out="P1/E1/T1/r.md")
+    task = Task(id="T1", mode="research", goal="x", artifact_out="E1/T1/r.md")
     request = WorkerRequest(
-        task=task, task_id="P1/E1/T1", mode="research", scratch=tmp_path
+        task=task, task_id="E1/T1", mode="research", scratch=tmp_path
     )
     worker = MockWorker(script=["rate_limit"])
     with pytest.raises(WorkerRateLimited):

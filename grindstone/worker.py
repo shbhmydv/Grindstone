@@ -123,7 +123,7 @@ class CriticBrief:
 @dataclass(frozen=True)
 class WorkerRequest:
     """One fully-resolved dispatch: the typed ``task``, its full keyed-log
-    ``task_id`` (``P*/E*/T*``), the worker ``mode``, the scratch CWD it writes its
+    ``task_id`` (``E*/T*``), the worker ``mode``, the scratch CWD it writes its
     output into, the resolved ``inputs`` (prior keyed-log artifacts), the SELECTED
     domain skills (retrieve-not-concatenate), prior-attempt ``failure_context``, and
     whether a prior attempt's work is already present (incremental retry).
@@ -162,12 +162,12 @@ class AttemptEvents(Protocol):
     """Optional per-attempt event sink the epoch driver threads in so the gate +
     triage land in the journal LIVE during a real run (default ``None`` keeps
     ``run_task`` standalone for the unit tests). The driver's adapter maps these to
-    ``handoff_accepted`` / ``handoff_rejected`` / ``verdict`` journal events.
-    ``handoff_accepted`` now fires when the DETERMINISTIC gate passes (a non-empty
+    ``work_gate_passed`` / ``work_gate_rejected`` / ``verdict`` journal events.
+    ``work_gate_passed`` now fires when the DETERMINISTIC gate passes (a non-empty
     in-scope commit, or a present artifact), before the critic runs."""
 
-    def handoff_accepted(self, task_id: str) -> None: ...
-    def handoff_rejected(self, task_id: str, reason: str) -> None: ...
+    def work_gate_passed(self, task_id: str) -> None: ...
+    def work_gate_rejected(self, task_id: str, reason: str) -> None: ...
     def verdict(self, task_id: str, outcome: VerdictOutcome, reason: str) -> None: ...
 
 
@@ -290,8 +290,9 @@ _MODE_GUIDANCE: dict[HandoffMode, str] = {
     "implement": (
         "Make the change inside your file_ownership, then COMMIT it (the orchestrator "
         "gates the git diff in this worktree, not your words). If your checks need "
-        "project dependencies (npm ci, pip install, yarn), you MAY install them INSIDE "
-        "THIS WORKTREE as part of your work (setup does not reach here). Run whatever "
+        "the project's own dependencies, you MAY install them with the project's "
+        "package manager INSIDE THIS WORKTREE as part of your work (setup does not "
+        "reach here). Run whatever "
         "checks you write to convince yourself it works."
     ),
     "research": (
@@ -698,7 +699,7 @@ def _run_attempt(
                 f"out-of-scope writes: {', '.join(out_of_scope)}", chainable=False
             )
         if events is not None:
-            events.handoff_accepted(task_id)
+            events.work_gate_passed(task_id)
         return _AttemptOutput(
             handoff_path=handoff_path, handoff_text=handoff_text,
             head=wt.head_commit(scratch), artifact_rel=None,
@@ -715,7 +716,7 @@ def _run_attempt(
     published.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(produced, published)
     if events is not None:
-        events.handoff_accepted(task_id)
+        events.work_gate_passed(task_id)
     return _AttemptOutput(
         handoff_path=handoff_path, handoff_text=handoff_text,
         head=None, artifact_rel=task.artifact_out,
@@ -784,7 +785,7 @@ def run_task(
             )
         except _Rejected as rej:
             if events is not None:
-                events.handoff_rejected(task_id, rej.reason)
+                events.work_gate_rejected(task_id, rej.reason)
             failure_context.append(rej.reason)
             prior_branch = _carry_or_discard(
                 rej, repo=repo, scratch=scratch, branch=branch, implement=implement,

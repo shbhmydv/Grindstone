@@ -105,7 +105,7 @@ tool, a shared directory outside the repo), the planner lists the command in the
 epoch's `setup`: the **trusted** state machine runs those, in order, before the
 tasks (the untrusted worker never mutates the host). Setup runs in a throwaway
 checkout, **not** the task worktrees, so project-**local** dependency installs
-(`npm ci`, `pip install`, `yarn`) do **not** belong in `setup`: they would not reach
+(the project's own package manager) do **not** belong in `setup`: they would not reach
 the isolated task worktrees. An implement task installs the project deps it needs
 inside its own worktree as part of its work. This one field replaces an entire
 infra-repair subsystem.

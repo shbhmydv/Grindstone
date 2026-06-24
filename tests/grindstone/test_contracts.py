@@ -64,7 +64,7 @@ def _epoch_payload() -> dict[str, object]:
                     "mode": "research",
                     "goal": "survey the api",
                     "tier": "senior",
-                    "artifact_out": "P1/E1/T2/report.md",
+                    "artifact_out": "E1/T2/report.md",
                 },
             ],
         },
@@ -131,8 +131,8 @@ def test_epoch_rejects_colliding_artifact_out() -> None:
         "epoch": {
             "title": "two reports",
             "tasks": [
-                {"id": "T1", "mode": "research", "goal": "a", "artifact_out": "P1/E1/out.md"},
-                {"id": "T2", "mode": "review", "goal": "b", "artifact_out": "P1/E1/out.md"},
+                {"id": "T1", "mode": "research", "goal": "a", "artifact_out": "E1/out.md"},
+                {"id": "T2", "mode": "review", "goal": "b", "artifact_out": "E1/out.md"},
             ],
         },
     }
@@ -146,8 +146,8 @@ def test_epoch_allows_distinct_artifact_out() -> None:
         "epoch": {
             "title": "two reports",
             "tasks": [
-                {"id": "T1", "mode": "research", "goal": "a", "artifact_out": "P1/E1/a.md"},
-                {"id": "T2", "mode": "review", "goal": "b", "artifact_out": "P1/E1/b.md"},
+                {"id": "T1", "mode": "research", "goal": "a", "artifact_out": "E1/a.md"},
+                {"id": "T2", "mode": "review", "goal": "b", "artifact_out": "E1/b.md"},
             ],
         },
     }

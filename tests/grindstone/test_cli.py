@@ -171,13 +171,13 @@ def test_watch_renders_journal(
         jw.emit(lambda s: RunStarted(seq=s, ts="2026-06-24T00:00:00+00:00",
                                      run_id="run1", job_path="job.md"))
         jw.emit(lambda s: EpochStarted(seq=s, ts="2026-06-24T00:00:01+00:00",
-                                       epoch_id="P1/E1", title="build",
+                                       epoch_id="E1", title="build",
                                        tasks=[TaskRef(id="T1", mode="implement")]))
     code = cli.main(["watch", "run1", "--repo", str(repo)])
     out = capsys.readouterr().out
     assert code == 0
     assert "# Run run1" in out
-    assert "## P1/E1 - build" in out
+    assert "## E1 - build" in out
     assert "T1 (implement)" in out
 
 

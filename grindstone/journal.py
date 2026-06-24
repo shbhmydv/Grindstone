@@ -19,13 +19,13 @@ from grindstone.events import RunTree, read_events, replay
 from grindstone.rundir import RunDir
 
 #: Task-status glyphs (plain ASCII, markdown carries no colour). Unmapped statuses
-#: (pending / dispatched / handoff_accepted) render with the neutral bullet.
+#: (pending / dispatched / gate_passed) render with the neutral bullet.
 _TASK_GLYPH = {
     "done": "[ok]",
     "verdict_pass": "[ok]",
     "verdict_retry": "[retry]",
     "verdict_escalate": "[esc]",
-    "handoff_rejected": "[x]",
+    "gate_rejected": "[x]",
 }
 
 

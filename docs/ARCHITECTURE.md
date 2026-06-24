@@ -242,8 +242,8 @@ review cannot un-run it. Therefore:
   before the tasks, in a throwaway checkout of the epoch base (torn down after, so
   setup can never dirty the operator checkout). The untrusted worker never
   improvises host mutations.
-- Project-**local** dependency installs (`npm ci`, `pip install`) do **not** go in
-  `setup`: that throwaway checkout is not the task worktrees, so an install there
+- Project-**local** dependency installs (the project's own package manager) do **not**
+  go in `setup`: that throwaway checkout is not the task worktrees, so an install there
   would not reach them. An implement task installs the project deps it needs inside
   its **own** worktree as part of its work.
 - Worktree isolation contains every worker file write.

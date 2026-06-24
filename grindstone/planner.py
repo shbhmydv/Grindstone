@@ -134,9 +134,9 @@ These rules hold for EVERY decision:
   list it in the epoch's "setup": the TRUSTED state machine runs those, in order,
   BEFORE the tasks (the untrusted worker never mutates the host). Setup runs in a
   throwaway checkout, NOT the task worktrees, so do NOT put project-local dependency
-  installs (npm ci, pip install, yarn) in setup: they would not reach the isolated
-  task worktrees. Instead an implement task installs the project dependencies it
-  needs INSIDE its own worktree as part of its work.
+  installs (the project's own package manager) in setup: they would not reach the
+  isolated task worktrees. Instead an implement task installs the project dependencies
+  it needs INSIDE its own worktree as part of its work.
 - Do NOT author verify or test commands as a gate. You write no done_when and no
   check commands: an independent agentic CRITIC re-derives each task's goal and
   judges the work against it. Carry acceptance in the task's prose goal, never as a

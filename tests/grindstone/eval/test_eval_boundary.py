@@ -83,7 +83,7 @@ def test_boundary_with_carried_failure_conforms(rig: str) -> None:
     decision = run_planner_boundary(
         job_spec=TODO_APP_JOB,
         rig=rig,
-        carried=("P1/E1/T1 escalated: pytest is not installed in the environment",),
+        carried=("E1/T1 escalated: pytest is not installed in the environment",),
         epoch_index=2,
     )
     O.assert_decision_conforms(decision)

@@ -10,7 +10,7 @@ from pathlib import Path
 from grindstone.events import (
     EpochCompleted,
     EpochStarted,
-    HandoffRejected,
+    WorkGateRejected,
     JournalWriter,
     RateLimited,
     RunCompleted,
@@ -43,17 +43,17 @@ def _scripted(events_path: Path) -> None:
     with JournalWriter(events_path) as jw:
         jw.emit(lambda s: RunStarted(seq=s, ts=_ts(0), run_id="run-x",
                                      job_path="/jobs/build.md", max_epochs=5))
-        jw.emit(lambda s: EpochStarted(seq=s, ts=_ts(1), epoch_id="P1/E1", title="scaffold",
+        jw.emit(lambda s: EpochStarted(seq=s, ts=_ts(1), epoch_id="E1", title="scaffold",
                                        tasks=[TaskRef(id="T1", mode="implement"),
                                               TaskRef(id="T2", mode="review")]))
-        jw.emit(lambda s: TaskDispatched(seq=s, ts=_ts(2), epoch_id="P1/E1", task_id="T1"))
-        jw.emit(lambda s: Verdict(seq=s, ts=_ts(8), epoch_id="P1/E1", task_id="T1",
+        jw.emit(lambda s: TaskDispatched(seq=s, ts=_ts(2), epoch_id="E1", task_id="T1"))
+        jw.emit(lambda s: Verdict(seq=s, ts=_ts(8), epoch_id="E1", task_id="T1",
                                   outcome="PASS", reason="good enough to build on"))
-        jw.emit(lambda s: TaskDone(seq=s, ts=_ts(9), epoch_id="P1/E1", task_id="T1"))
-        jw.emit(lambda s: TaskDispatched(seq=s, ts=_ts(2), epoch_id="P1/E1", task_id="T2"))
-        jw.emit(lambda s: HandoffRejected(seq=s, ts=_ts(6), epoch_id="P1/E1",
+        jw.emit(lambda s: TaskDone(seq=s, ts=_ts(9), epoch_id="E1", task_id="T1"))
+        jw.emit(lambda s: TaskDispatched(seq=s, ts=_ts(2), epoch_id="E1", task_id="T2"))
+        jw.emit(lambda s: WorkGateRejected(seq=s, ts=_ts(6), epoch_id="E1",
                                           task_id="T2", reason="missing citation"))
-        jw.emit(lambda s: EpochCompleted(seq=s, ts=_ts(30), epoch_id="P1/E1"))
+        jw.emit(lambda s: EpochCompleted(seq=s, ts=_ts(30), epoch_id="E1"))
         jw.emit(lambda s: RunCompleted(seq=s, ts=_ts(31)))
 
 
@@ -67,14 +67,14 @@ def test_render_timeline_sections_and_durations(tmp_path: Path) -> None:
     assert "# Run run-x - completed" in md
     assert "- Job: `/jobs/build.md`" in md
     assert "Epochs: 1/5" in md
-    assert "## P1/E1 - scaffold  [completed]" in md
+    assert "## E1 - scaffold  [completed]" in md
     # The whole run spanned 0s..31s.
     assert "Duration: 31s" in md
     # Task T1 ran 2s..9s; reaching done clears any stale verdict note.
     assert "T1 (implement) [done]  (7s)" in md
     assert "good enough to build on" not in md
     # A rejected task surfaces its reason as the carried note.
-    assert "T2 (review) [handoff_rejected]" in md
+    assert "T2 (review) [gate_rejected]" in md
     assert "missing citation" in md
 
 
@@ -98,9 +98,9 @@ def test_render_run_dir_renders_resume_marker(tmp_path: Path) -> None:
     rd = create_run_dir(repo, "run-z")
     with JournalWriter(rd.events_path) as jw:
         jw.emit(lambda s: RunStarted(seq=s, ts=_ts(0), run_id="run-z", job_path="j.md"))
-        jw.emit(lambda s: EpochStarted(seq=s, ts=_ts(1), epoch_id="P1/E1", title="x",
+        jw.emit(lambda s: EpochStarted(seq=s, ts=_ts(1), epoch_id="E1", title="x",
                                        tasks=[TaskRef(id="T1", mode="implement")]))
-        jw.emit(lambda s: RunResumed(seq=s, ts=_ts(2), run_id="run-z", razed_epoch="P1/E1"))
+        jw.emit(lambda s: RunResumed(seq=s, ts=_ts(2), run_id="run-z", razed_epoch="E1"))
     md = render_run_dir(rd)
     assert md is not None and "# Run run-z - running" in md
 

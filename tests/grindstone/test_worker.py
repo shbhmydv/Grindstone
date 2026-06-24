@@ -36,7 +36,7 @@ def _implement(owned: list[str] | None = None) -> Task:
 
 def _research() -> Task:
     return Task(
-        id="T1", mode="research", goal="investigate", artifact_out="P1/E1/T1/r.md"
+        id="T1", mode="research", goal="investigate", artifact_out="E1/T1/r.md"
     )
 
 
@@ -51,7 +51,7 @@ def test_done_pass_is_merge_ready(git_repo: Path, run_dir: RunDir) -> None:
     base = wt.head_commit(git_repo)
     worker = MockWorker(script=["ok", "PASS"], artifacts={"a.py": "print(1)\n"})
     result = run_task(
-        _implement(), "P1/E1/T1", run_dir=run_dir, repo=git_repo, base=base,
+        _implement(), "E1/T1", run_dir=run_dir, repo=git_repo, base=base,
         backends=_backends(worker),
     )
     assert result.outcome == "passed"
@@ -65,16 +65,16 @@ def test_done_pass_is_merge_ready(git_repo: Path, run_dir: RunDir) -> None:
 def test_research_pass_publishes_artifact(git_repo: Path, run_dir: RunDir) -> None:
     base = wt.head_commit(git_repo)
     worker = MockWorker(
-        script=["ok", "PASS"], artifacts={"P1/E1/T1/r.md": "# findings\n"}
+        script=["ok", "PASS"], artifacts={"E1/T1/r.md": "# findings\n"}
     )
     result = run_task(
-        _research(), "P1/E1/T1", run_dir=run_dir, repo=git_repo, base=base,
+        _research(), "E1/T1", run_dir=run_dir, repo=git_repo, base=base,
         backends=_backends(worker),
     )
     assert result.outcome == "passed"
-    assert result.artifact_key == "P1/E1/T1/r.md"
+    assert result.artifact_key == "E1/T1/r.md"
     # The deliverable is relocated into the durable run dir (the keyed log).
-    assert run_dir.resolve("P1/E1/T1/r.md").read_text() == "# findings\n"
+    assert run_dir.resolve("E1/T1/r.md").read_text() == "# findings\n"
 
 
 # --- RETRY then PASS -----------------------------------------------------------
@@ -86,7 +86,7 @@ def test_retry_then_pass(git_repo: Path, run_dir: RunDir) -> None:
         script=["ok", "RETRY", "ok", "PASS"], artifacts={"a.py": "print(1)\n"}
     )
     result = run_task(
-        _implement(), "P1/E1/T1", run_dir=run_dir, repo=git_repo, base=base,
+        _implement(), "E1/T1", run_dir=run_dir, repo=git_repo, base=base,
         backends=_backends(worker),
     )
     assert result.outcome == "passed"
@@ -100,7 +100,7 @@ def test_escalate_surfaced(git_repo: Path, run_dir: RunDir) -> None:
     base = wt.head_commit(git_repo)
     worker = MockWorker(script=["ok", "ESCALATE"], artifacts={"a.py": "print(1)\n"})
     result = run_task(
-        _implement(), "P1/E1/T1", run_dir=run_dir, repo=git_repo, base=base,
+        _implement(), "E1/T1", run_dir=run_dir, repo=git_repo, base=base,
         backends=_backends(worker),
     )
     assert result.outcome == "escalated"
@@ -117,7 +117,7 @@ def test_retries_exhausted_surfaced(git_repo: Path, run_dir: RunDir) -> None:
         script=["ok", "RETRY", "ok", "RETRY"], artifacts={"a.py": "print(1)\n"}
     )
     result = run_task(
-        _implement(), "P1/E1/T1", run_dir=run_dir, repo=git_repo, base=base,
+        _implement(), "E1/T1", run_dir=run_dir, repo=git_repo, base=base,
         backends=_backends(worker),
     )
     assert result.outcome == "escalated"
@@ -133,7 +133,7 @@ def test_blocked_report_escalates(git_repo: Path, run_dir: RunDir) -> None:
     base = wt.head_commit(git_repo)
     worker = MockWorker(script=["blocked", "ESCALATE"], artifacts={"a.py": "print(1)\n"})
     result = run_task(
-        _implement(), "P1/E1/T1", run_dir=run_dir, repo=git_repo, base=base,
+        _implement(), "E1/T1", run_dir=run_dir, repo=git_repo, base=base,
         backends=_backends(worker),
     )
     assert result.outcome == "escalated"
@@ -151,7 +151,7 @@ def test_empty_attempt_retried_then_pass(git_repo: Path, run_dir: RunDir) -> Non
         script=["empty", "ok", "PASS"], artifacts={"a.py": "print(1)\n"}
     )
     result = run_task(
-        _implement(), "P1/E1/T1", run_dir=run_dir, repo=git_repo, base=base,
+        _implement(), "E1/T1", run_dir=run_dir, repo=git_repo, base=base,
         backends=_backends(worker),
     )
     assert result.outcome == "passed"
@@ -164,7 +164,7 @@ def test_empty_attempts_exhaust_to_escalate(
     base = wt.head_commit(git_repo)
     worker = MockWorker(script=["empty", "empty"], artifacts={"a.py": "x\n"})
     result = run_task(
-        _implement(), "P1/E1/T1", run_dir=run_dir, repo=git_repo, base=base,
+        _implement(), "E1/T1", run_dir=run_dir, repo=git_repo, base=base,
         backends=_backends(worker),
     )
     assert result.outcome == "escalated"
@@ -179,7 +179,7 @@ def test_rate_limit_propagates(git_repo: Path, run_dir: RunDir) -> None:
     worker = MockWorker(script=["rate_limit"], artifacts={"a.py": "x\n"})
     with pytest.raises(RateLimited):
         run_task(
-            _implement(), "P1/E1/T1", run_dir=run_dir, repo=git_repo, base=base,
+            _implement(), "E1/T1", run_dir=run_dir, repo=git_repo, base=base,
             backends=_backends(worker),
         )
 
@@ -195,7 +195,7 @@ def test_worktree_isolation_external_base(git_repo: Path, run_dir: RunDir) -> No
     base = wt.head_commit(git_repo)
     worker = MockWorker(script=["ok", "PASS"], artifacts={"a.py": "print(1)\n"})
     run_task(
-        _implement(), "P1/E1/T1", run_dir=run_dir, repo=git_repo, base=base,
+        _implement(), "E1/T1", run_dir=run_dir, repo=git_repo, base=base,
         backends=_backends(worker),
     )
     # Nothing the worker wrote landed in the live repo working tree.
@@ -211,7 +211,7 @@ def test_implement_prompt_allows_in_worktree_dep_install() -> None:
     from grindstone.worker import WorkerRequest, build_worker_prompt
 
     request = WorkerRequest(
-        task=_implement(), task_id="P1/E1/T1", mode="implement", scratch=Path("/x"),
+        task=_implement(), task_id="E1/T1", mode="implement", scratch=Path("/x"),
     )
     prompt = build_worker_prompt(request).lower()
     assert "install" in prompt and "inside this worktree" in prompt
@@ -221,7 +221,7 @@ def test_critic_prompt_encodes_triage() -> None:
     from grindstone.worker import CriticBrief, WorkerRequest
 
     request = WorkerRequest(
-        task=_implement(), task_id="P1/E1/T1", mode="implement", scratch=Path("/x"),
+        task=_implement(), task_id="E1/T1", mode="implement", scratch=Path("/x"),
         critic=CriticBrief(goal="create a.py", mode="implement", diff_base="HEAD~1"),
     )
     prompt = build_critic_prompt(request, request.critic)  # type: ignore[arg-type]

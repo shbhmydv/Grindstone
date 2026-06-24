@@ -30,7 +30,7 @@ def run_worker_task(*, task: Task, rig: str, timeout: float = 900) -> TaskResult
 
     Builds a throwaway committed repo (the epoch base) + run dir + a ``Backends`` map
     whose ``worker`` (and fallback ``senior``) role is the given rig, then runs the
-    production ``run_task`` for ``P1/E1/T1``. An implement task grinds in an isolated
+    production ``run_task`` for ``E1/T1``. An implement task grinds in an isolated
     worktree off the repo tip; a non-write task grounds its citations against the repo.
     """
 
@@ -53,5 +53,5 @@ def run_worker_task(*, task: Task, rig: str, timeout: float = 900) -> TaskResult
         backends = build_backends(config, log_root=log_root)
         base = wt.head_commit(repo)
         return run_task(
-            task, "P1/E1/T1", run_dir=run_dir, repo=repo, base=base, backends=backends
+            task, "E1/T1", run_dir=run_dir, repo=repo, base=base, backends=backends
         )

@@ -61,7 +61,7 @@ from grindstone.worker import Backends, WorkerRequest
 # The goal the GoalPlanner steers toward: three modules built via implement fan-out.
 IMPL_FILES: tuple[str, ...] = ("mod_a.py", "mod_b.py", "mod_c.py")
 MAX_EPOCHS = 25
-#: A short task-id, the form every journal task event carries (P*/E*/T* is reduced
+#: A short task-id, the form every journal task event carries (E*/T* is reduced
 #: to its trailing T-segment for the per-epoch grouping).
 _SHORT_TASK_ID = re.compile(r"^T[1-8]$")
 
@@ -175,7 +175,7 @@ def _assert_log_and_events_consistent(run_dir: RunDir, result: RunResult) -> Non
             assert _SHORT_TASK_ID.match(tid), f"malformed task id in journal: {tid!r}"
     # Every relocated handoff is a non-empty file (free-form prose, never parsed),
     # and every published artifact is a non-empty file (no half-relocated deliverable).
-    for handoff in run_dir.root.rglob("P*/E*/T*/handoff.md"):
+    for handoff in run_dir.root.rglob("E*/T*/handoff.md"):
         assert handoff.stat().st_size > 0, f"empty relocated handoff {handoff}"
     for key in run_dir.log_index():
         if key.endswith((".md",)):

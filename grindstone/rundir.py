@@ -23,8 +23,8 @@ _DEFAULT_WORKTREE_BASE = "/tmp/cache/grindstone"
 #: Log-key grammar, mirrored from schemas/epoch_decision.json $defs/log_key.
 _LOG_KEY_RE = re.compile(r"^[A-Za-z0-9][a-zA-Z0-9._/-]{0,127}$")
 
-#: A top-level phase directory (``P1`` … ``P99``), the root of the keyed log.
-_PHASE_DIR_RE = re.compile(r"^P[1-9][0-9]?$")
+#: A per-epoch keyed-log dir (``E1``, ``E2``, ...), the root of the keyed log.
+_EPOCH_DIR_RE = re.compile(r"^E[1-9][0-9]*$")
 
 
 def _contained(root: Path, candidate: Path) -> Path:
@@ -89,7 +89,7 @@ class RunDir:
         """Sorted relative paths of the durable keyed log (ARCHITECTURE.md).
 
         The log keys a planner may reference as task ``inputs``: every regular
-        file under a phase dir (``P<n>/...``, handoffs, outcomes, relocated
+        file under an epoch dir (``E<n>/...``, handoffs, outcomes, relocated
         artifacts). Excludes ``events.ndjson`` / ``journal.md`` / artifact
         scratch, none of which are durable references (the throwaway git
         worktrees live on an external base outside the run dir entirely; see
@@ -101,7 +101,7 @@ class RunDir:
             if not path.is_file():
                 continue
             rel = path.relative_to(self.root)
-            if rel.parts and _PHASE_DIR_RE.match(rel.parts[0]):
+            if rel.parts and _EPOCH_DIR_RE.match(rel.parts[0]):
                 out.append(rel.as_posix())
         return sorted(out)
 

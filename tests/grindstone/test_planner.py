@@ -58,7 +58,7 @@ def _raw_context(run_dir: RunDir) -> PlannerContext:
         run_branch=None,
         tip_ref="deadbeef",
         tip_files=("README.md", "src/app.py"),
-        log_index=("P1/E1/T1/handoff.md", "P1/E1/T2/report.md"),
+        log_index=("E1/T1/handoff.md", "E1/T2/report.md"),
         carried=("T2 escalated: missing dep foo",),
         epoch_index=3,
         max_epochs=40,
@@ -80,8 +80,8 @@ def test_build_planner_input_renders_every_context_field(run_dir: RunDir) -> Non
     # the running state + epoch counter
     assert "epoch 3 of at most 40" in prompt
     # the keyed-log index a task may name as inputs
-    assert "P1/E1/T1/handoff.md" in prompt
-    assert "P1/E1/T2/report.md" in prompt
+    assert "E1/T1/handoff.md" in prompt
+    assert "E1/T2/report.md" in prompt
     # the integration-tip file list
     assert "README.md" in prompt and "src/app.py" in prompt
     # the prior epoch's carried failures to steer around
@@ -100,7 +100,7 @@ def test_planner_core_reframes_setup_as_host_global(run_dir: RunDir) -> None:
     prompt = build_planner_input(_raw_context(run_dir), domain_skill_index={})
     low = prompt.lower()
     assert "host-global" in low
-    assert "npm ci" in low and "pip install" in low  # named as what NOT to put here
+    assert "package manager" in low  # named as what NOT to put here
     assert "would not reach" in low or "do not put" in low
 
 

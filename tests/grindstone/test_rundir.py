@@ -31,17 +31,17 @@ def test_create_run_dir_rejects_existing(tmp_path: Path) -> None:
         create_run_dir(repo, "dup")
 
 
-def test_log_index_keys_phase_dirs_only(tmp_path: Path) -> None:
+def test_log_index_keys_epoch_dirs_only(tmp_path: Path) -> None:
     rd = _run_dir(tmp_path)
-    (rd.root / "P1" / "E1" / "T1").mkdir(parents=True)
-    (rd.root / "P1" / "E1" / "T1" / "handoff.json").write_text("{}", encoding="utf-8")
-    (rd.root / "P1" / "report.md").write_text("hi", encoding="utf-8")
-    # Non-phase run state must NOT appear in the keyed log.
+    (rd.root / "E1" / "T1").mkdir(parents=True)
+    (rd.root / "E1" / "T1" / "handoff.json").write_text("{}", encoding="utf-8")
+    (rd.root / "E1" / "report.md").write_text("hi", encoding="utf-8")
+    # Non-epoch run state must NOT appear in the keyed log.
     rd.events_path.write_text("", encoding="utf-8")
     rd.journal_path.write_text("# journal\n", encoding="utf-8")
     index = rd.log_index()
-    assert "P1/report.md" in index
-    assert "P1/E1/T1/handoff.json" in index
+    assert "E1/report.md" in index
+    assert "E1/T1/handoff.json" in index
     assert "events.ndjson" not in index
     assert "journal.md" not in index
 
@@ -62,8 +62,8 @@ def test_resolve_rejects_embedded_traversal(tmp_path: Path) -> None:
 
 def test_resolve_accepts_valid_key(tmp_path: Path) -> None:
     rd = _run_dir(tmp_path)
-    resolved = rd.resolve("P1/E1/T1/handoff.json")
-    assert resolved == (rd.root / "P1/E1/T1/handoff.json").resolve()
+    resolved = rd.resolve("E1/T1/handoff.json")
+    assert resolved == (rd.root / "E1/T1/handoff.json").resolve()
 
 
 def test_worktrees_root_is_external_and_honors_override(

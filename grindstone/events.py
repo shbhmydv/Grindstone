@@ -6,7 +6,7 @@ resume reads it to find the last clean boundary. ``replay`` folds an event list
 into a ``RunTree`` snapshot.
 
 The bones taxonomy is small (BONES "epochs only, no phases"): the run lifecycle,
-the epoch and task lifecycle, the handoff gate, the critic ``verdict`` triage,
+the epoch and task lifecycle, the work gate, the critic ``verdict`` triage,
 and the one backoff signal ``rate_limited``. No phases, no infra-repair, no
 vision, no session-limit / failed-epoch state-machine events.
 """
@@ -113,14 +113,14 @@ class TaskDone(_Event):
 # --- gate + triage -------------------------------------------------------------
 
 
-class HandoffAccepted(_Event):
-    event: Literal["handoff_accepted"] = "handoff_accepted"
+class WorkGatePassed(_Event):
+    event: Literal["work_gate_passed"] = "work_gate_passed"
     epoch_id: str
     task_id: str
 
 
-class HandoffRejected(_Event):
-    event: Literal["handoff_rejected"] = "handoff_rejected"
+class WorkGateRejected(_Event):
+    event: Literal["work_gate_rejected"] = "work_gate_rejected"
     epoch_id: str
     task_id: str
     reason: str
@@ -156,8 +156,8 @@ Event = Annotated[
         EpochCarried,
         TaskDispatched,
         TaskDone,
-        HandoffAccepted,
-        HandoffRejected,
+        WorkGatePassed,
+        WorkGateRejected,
         Verdict,
         RateLimited,
     ],
@@ -376,11 +376,11 @@ def replay(events: list[Event]) -> RunTree:
             task.status = "dispatched"
             if task.started_ts is None:  # first dispatch; retries keep the origin
                 task.started_ts = ev.ts
-        elif isinstance(ev, HandoffAccepted):
-            _task(epochs_by_id[ev.epoch_id], ev.task_id).status = "handoff_accepted"
-        elif isinstance(ev, HandoffRejected):
+        elif isinstance(ev, WorkGatePassed):
+            _task(epochs_by_id[ev.epoch_id], ev.task_id).status = "gate_passed"
+        elif isinstance(ev, WorkGateRejected):
             task = _task(epochs_by_id[ev.epoch_id], ev.task_id)
-            task.status = "handoff_rejected"
+            task.status = "gate_rejected"
             task.note = ev.reason
         elif isinstance(ev, Verdict):
             task = _task(epochs_by_id[ev.epoch_id], ev.task_id)
