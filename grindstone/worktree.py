@@ -140,6 +140,25 @@ def delete_branch(repo: Path, branch: str) -> None:
         _git(repo, "branch", "-D", branch, check=False)
 
 
+def branches_with_prefix(repo: Path, prefix: str) -> list[str]:
+    """Short names of every local branch under ``refs/heads/<prefix>*``.
+
+    The resume / rate-limit RAZE primitive uses this to drop ALL transient
+    ``grind-wip/`` branches of an incomplete epoch (the durable ``grind/<run-id>``
+    run branch is never under that prefix, so it is never touched). Returns ``[]``
+    when none match. Every head is listed and filtered in-process (a ref-glob
+    ``*`` does not reliably span the slashes of a multi-level wip branch name)."""
+
+    out = _git(
+        repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/", check=False
+    ).stdout
+    return [
+        line.strip()
+        for line in out.splitlines()
+        if line.strip().startswith(prefix)
+    ]
+
+
 def force_branch(repo: Path, branch: str, commit: str) -> None:
     """Point ``branch`` at ``commit`` (create it, or force-move an existing one).
 

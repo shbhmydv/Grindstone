@@ -20,9 +20,13 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Union
+from typing import TYPE_CHECKING, Union
 
+from grindstone.contracts.models import Decision
 from grindstone.planner import PlannerError, RateLimited
+
+if TYPE_CHECKING:
+    from grindstone.loop import PlannerContext
 
 #: An ``invalid`` token returns valid JSON that fails the decision gate (an epoch
 #: decision with an empty epoch: no title, no tasks), exercising the re-ask ladder
@@ -91,3 +95,36 @@ class MockPlanner:
                 f"{body}\n\nThat is my single decision."
             )
         return body
+
+
+#: A decision-level script entry: a typed ``Decision`` returned verbatim, or a
+#: failure token (``rate_limit`` -> ``RateLimited`` node #1, ``error`` ->
+#: ``PlannerError`` node #2).
+DecisionEntry = Union[Decision, str]
+
+
+@dataclass
+class MockDecisionPlanner:
+    """The loop's planner seam as a test double (symmetric to the worker mocks):
+    ``decide`` returns the next scripted ``Decision`` (or raises a scripted failure)
+    instead of dispatching a real rig. It records every ``PlannerContext`` it was
+    handed so a test can assert the loop rebuilt the context from disk (e.g. the
+    prior epoch's carried failures landed on the next boundary)."""
+
+    script: list[DecisionEntry]
+    contexts: list["PlannerContext"] = field(default_factory=list)
+    _calls: int = field(default=0)
+
+    def decide(self, context: "PlannerContext") -> Decision:
+        self.contexts.append(context)
+        if self._calls >= len(self.script):
+            raise AssertionError("mock decision planner script exhausted")
+        entry = self.script[self._calls]
+        self._calls += 1
+        if isinstance(entry, str):
+            if entry in ("rate_limit", "session_limit"):
+                raise RateLimited(f"mock planner {entry}")
+            if entry in ("error", "hard", "transient"):
+                raise PlannerError(f"mock planner {entry}")
+            raise ValueError(f"unknown mock decision token: {entry!r}")
+        return entry

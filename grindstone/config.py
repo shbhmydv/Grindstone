@@ -218,47 +218,15 @@ def resolve_role_script(role: str, rc: RoleConfig) -> Path:
     return models_script(f"{role}_request.sh", rig=rc.rig)
 
 
-class PrepareConfig(BaseModel):
-    """Declared dependency materialization for build gates (optional).
-
-    A phase ``done_when`` like ``npx tsc --noEmit`` runs inside a FRESH detached
-    worktree of the integration tip that carries only COMMITTED files. The
-    gitignored dependency dirs (``node_modules`` / ``.venv`` / ...) are absent
-    there, so the check resolves the wrong stub and fails deterministically
-    regardless of code correctness, every build gate is structurally unpassable.
-
-    This block declares, per ecosystem and never hardcoded, how to restore those
-    dirs into a worktree before checks run: ``cmd`` installs them, ``env_dirs``
-    names the repo-relative gitignored dirs it produces (and that checks need),
-    and ``cache_key_files`` names the repo-relative lockfiles whose content hash
-    keys a snapshot cache (``.grindstone/cache/env/<hash>/``) so an unchanged
-    lockfile reuses the install instead of re-running ``cmd``.
-
-    ``None`` on the whole config (the default) = no materialization, existing
-    runs are byte-unchanged.
-    """
-
-    model_config = _FROZEN
-    cmd: str
-    env_dirs: list[str]
-    cache_key_files: list[str]
-
-    @field_validator("env_dirs", "cache_key_files")
-    @classmethod
-    def _non_empty(cls, v: list[str]) -> list[str]:
-        if not v:
-            raise ValueError("must list at least one path")
-        return v
-
-
 class GrindstoneConfig(BaseModel):
     """The whole per-repo config; unknown keys at any level are rejected.
 
-    The bones config knows only ROLES (the rig wiring), the per-run epoch backstop,
-    and optional dependency ``prepare``. Phases, floors, vision, infra-repair,
-    polish and the size/verify machinery are gone (BONES): host mutations are a
-    planner-declared ``setup`` seam in the decision, and per-epoch acceptance is
-    the agentic critic, not a deterministic gate.
+    The bones config knows only ROLES (the rig wiring) and the per-run epoch
+    backstop. Phases, floors, vision, infra-repair, polish, dependency
+    materialization and the size/verify machinery are gone (BONES): host mutations
+    are a planner-declared ``setup`` seam in the decision (the orchestrator runs
+    them before the tasks), and per-epoch acceptance is the agentic critic, not a
+    deterministic gate.
     """
 
     model_config = _FROZEN
@@ -268,10 +236,6 @@ class GrindstoneConfig(BaseModel):
     #: model #2, involuntary trigger). ``None`` = the CLI's built-in default, NEVER
     #: unbounded (a stuck planner that spins without progress must be bounded).
     max_epochs: int | None = None
-    #: Declared dependency materialization (optional). ``None`` (absent block) =
-    #: OFF, worktrees carry only committed files. Present = the gitignored
-    #: dependency dirs are restored (cached) before workers run.
-    prepare: PrepareConfig | None = None
 
     @field_validator("max_epochs")
     @classmethod

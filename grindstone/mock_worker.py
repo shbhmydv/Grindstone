@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import random
+import threading
 from dataclasses import dataclass, field
 
 from grindstone.worker import (
@@ -127,6 +128,75 @@ class MockWorker:
         (request.scratch / CRITIC_VERDICT_FILENAME).write_text(
             json.dumps({"outcome": outcome, "reason": f"mock critic {outcome}"}),
             encoding="utf-8",
+        )
+
+
+@dataclass
+class LoopWorker:
+    """A concurrency-safe loop test double (the flat-script ``MockWorker`` is
+    positional, so it cannot drive an epoch's CONCURRENT fan-out). Every worker
+    dispatch writes exactly the files the task CLAIMS (each ``file_ownership`` path
+    for implement, the ``artifact_out`` for non-write), so the scope + citation gates
+    pass by construction, and emits a DONE handoff; every critic dispatch writes the
+    same ``critic_outcome`` (default ``PASS``). No positional cursor, so concurrent
+    tasks never race.
+
+    Knobs: ``read_cite`` makes a non-write task READ a file from the integration-tip
+    ``read_root`` and fold it into its artifact + citations (the integration-tip-read
+    proof); ``rate_limit_once`` makes the FIRST worker dispatch raise ``RateLimited``
+    exactly once (the node-#1 park + epoch-restart proof), then behave.
+    """
+
+    critic_outcome: str = "PASS"
+    read_cite: str | None = None
+    rate_limit_once: bool = False
+    _rl_fired: bool = False
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def run(self, request: WorkerRequest) -> None:
+        if request.critic is not None:
+            (request.scratch / CRITIC_VERDICT_FILENAME).write_text(
+                json.dumps(
+                    {"outcome": self.critic_outcome, "reason": f"loop {self.critic_outcome}"}
+                ),
+                encoding="utf-8",
+            )
+            return
+
+        if self.rate_limit_once:
+            with self._lock:
+                if not self._rl_fired:
+                    self._rl_fired = True
+                    raise RateLimited("loop mock first-dispatch rate limit")
+
+        task = request.task
+        cited: list[str] = []
+        if request.mode == "implement":
+            for rel in task.file_ownership:
+                path = request.scratch / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                # Content keyed on the task id so each epoch's commit is a real diff.
+                path.write_text(f"# {request.task_id}\nvalue = {request.task_id!r}\n",
+                                encoding="utf-8")
+                cited.append(rel)
+            (request.scratch / REVIEW_FILENAME).write_text(
+                "loop review: no findings\n", encoding="utf-8"
+            )
+        else:
+            assert task.artifact_out is not None
+            body = f"# artifact {request.task_id}\n"
+            if self.read_cite is not None:
+                assert request.read_root is not None, "non-write task needs a read_root"
+                tip = (request.read_root / self.read_cite).read_text(encoding="utf-8")
+                body += f"reviewed integration-tip file {self.read_cite}:\n{tip}"
+                cited.append(self.read_cite)  # resolves against read_root (the tip)
+            out = request.scratch / task.artifact_out
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(body, encoding="utf-8")
+            cited.append(task.artifact_out)
+
+        (request.scratch / "handoff.json").write_text(
+            json.dumps(_valid_handoff(request, cited)), encoding="utf-8"
         )
 
 

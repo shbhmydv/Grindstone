@@ -1,5 +1,5 @@
-"""Config loading: roles/rig/slots, the optional prepare + epoch backstop, the
-unknown-key hard error, and the script-path RCE guard."""
+"""Config loading: roles/rig/slots + the epoch backstop, the unknown-key hard
+error, and the script-path RCE guard."""
 
 from __future__ import annotations
 
@@ -65,25 +65,6 @@ def test_senior_is_optional(tmp_path: Path) -> None:
     cfg = load_config(tmp_path)
     assert cfg is not None and cfg.roles.senior is None
     assert cfg.max_epochs is None  # backstop defaults to the CLI built-in
-
-
-def test_prepare_block_loads(tmp_path: Path) -> None:
-    _write_config(
-        tmp_path,
-        """
-        roles:
-          planner: { rig: claude, slots: 1, timeout_s: 600 }
-          worker:  { rig: local,  slots: 1, timeout_s: 1800 }
-        prepare:
-          cmd: npm ci
-          env_dirs: [node_modules]
-          cache_key_files: [package-lock.json]
-        """,
-    )
-    cfg = load_config(tmp_path)
-    assert cfg is not None and cfg.prepare is not None
-    assert cfg.prepare.cmd == "npm ci"
-    assert cfg.prepare.env_dirs == ["node_modules"]
 
 
 def test_unknown_key_is_a_hard_error(tmp_path: Path) -> None:

@@ -49,6 +49,7 @@ from grindstone.contracts.models import (
     HandoffMode,
     Task,
     Verdict,
+    VerdictOutcome,
     parse_handoff,
     parse_verdict,
 )
@@ -117,6 +118,11 @@ class WorkerRequest:
     When ``critic`` is set the dispatch is the CRITIC pass: the prompt builder
     branches to ``build_critic_prompt`` and the result channel is ``verdict.json``,
     not a handoff.
+
+    ``read_root`` is the integration-tip checkout a NON-WRITE task reads + grounds
+    its citations against (set by the epoch driver to a read-only worktree of the
+    run-branch tip, so a research / review task sees what prior epochs built, not the
+    stale base). ``None`` for implement tasks (they read + write their own worktree).
     """
 
     task: Task
@@ -128,6 +134,7 @@ class WorkerRequest:
     failure_context: tuple[str, ...] = ()
     prior_work_present: bool = False
     critic: CriticBrief | None = None
+    read_root: Path | None = None
 
 
 class WorkerTransport(Protocol):
@@ -136,6 +143,17 @@ class WorkerTransport(Protocol):
     artifact there; it returns nothing and raises to signal a transport failure."""
 
     def run(self, request: WorkerRequest) -> None: ...
+
+
+class AttemptEvents(Protocol):
+    """Optional per-attempt event sink the epoch driver threads in so the gate +
+    triage land in the journal LIVE during a real run (default ``None`` keeps
+    ``run_task`` standalone for the unit tests). The driver's adapter maps these to
+    ``handoff_accepted`` / ``handoff_rejected`` / ``verdict`` journal events."""
+
+    def handoff_accepted(self, task_id: str) -> None: ...
+    def handoff_rejected(self, task_id: str, reason: str) -> None: ...
+    def verdict(self, task_id: str, outcome: VerdictOutcome, reason: str) -> None: ...
 
 
 # --- per-backend concurrency seam (BONES concurrency ruling) -------------------
@@ -322,6 +340,14 @@ def build_worker_prompt(request: WorkerRequest) -> str:
     artifact_line = ""
     if task.mode != "implement" and task.artifact_out is not None:
         artifact_line = f"\nProduce the artifact at log key `{task.artifact_out}`.\n"
+    read_root_block = ""
+    if task.mode != "implement" and request.read_root is not None:
+        read_root_block = (
+            "\n<read_root>\nRead the repository AT ITS CURRENT IN-RUN STATE under "
+            f"`{request.read_root}` (the integration tip, including everything prior "
+            "epochs built). Ground your citations in files under that path; do NOT "
+            "read the operator's base checkout.\n</read_root>\n"
+        )
     plan = "\n" + _MODE_GUIDANCE[task.mode]
     if task.mode == "implement":
         plan += _file_ownership_block(task)
@@ -345,7 +371,7 @@ def build_worker_prompt(request: WorkerRequest) -> str:
 </task>
 {artifact_line}
 {_WORKTREE_CONTRACT}
-<inputs>
+{read_root_block}<inputs>
 {_render_inputs(request)}
 </inputs>
 {plan}{_domain_skills_block(request)}{prior_work_block}{context_block}
@@ -644,24 +670,31 @@ def _run_attempt(
     *,
     scratch: Path,
     repo: Path | None,
+    read_root: Path | None,
     epoch_base: str | None,
     backends: Backends,
     domain_skills: dict[str, str],
     failure_context: tuple[str, ...],
     prior_work_present: bool,
     run_dir: RunDir,
+    events: AttemptEvents | None,
 ) -> _AttemptOutput:
     """Dispatch one worker attempt and collect its handoff. For a DONE implement
     task: strip orchestration, commit, scope-check against the EPOCH base, and reject
     a zero-diff DONE. For a DONE non-write task: publish the deliverable to its log
     key. Raises ``_Rejected`` on any failure; lets ``RateLimited`` escape.
 
-    The backend slot is held ONLY around the model dispatch (not the git/disk work),
-    so a concurrent same-backend task cannot land a second call on the single local
-    slot mid-grind, while cross-backend tasks run free."""
+    A NON-WRITE task grounds its citations against ``read_root`` (the integration
+    tip) when set, never the stale base, so a review / research task sees what prior
+    epochs built. The backend slot is held ONLY around the model dispatch (not the
+    git/disk work), so a concurrent same-backend task cannot land a second call on
+    the single local slot mid-grind, while cross-backend tasks run free."""
 
     implement = task.mode == "implement"
-    _install_validator(scratch, task_id=task_id, mode=task.mode, repo=repo)
+    #: A non-write task reads + cites the integration tip (``read_root``) when the
+    #: driver provided one, else the base repo (the standalone-test fallback).
+    cite_root = repo if implement else (read_root if read_root is not None else repo)
+    _install_validator(scratch, task_id=task_id, mode=task.mode, repo=cite_root)
     inputs = {key: run_dir.resolve(key) for key in task.inputs}
     request = WorkerRequest(
         task=task,
@@ -672,6 +705,7 @@ def _run_attempt(
         domain_skills=domain_skills,
         failure_context=failure_context,
         prior_work_present=prior_work_present,
+        read_root=None if implement else cite_root,
     )
     try:
         with backends.slot(task.tier) as transport:
@@ -682,8 +716,10 @@ def _run_attempt(
         raise _Rejected(f"transport error: {type(exc).__name__}: {exc}") from exc
 
     handoff = _collect_handoff(
-        scratch, run_dir=run_dir, expected_task_id=task_id, mode=task.mode, repo=repo
+        scratch, run_dir=run_dir, expected_task_id=task_id, mode=task.mode, repo=cite_root
     )
+    if handoff.status == "DONE" and events is not None:
+        events.handoff_accepted(task_id)
     if handoff.status != "DONE":
         # BLOCKED / FAILED / PARTIAL are honest non-DONE statuses returned to the
         # caller (which routes BLOCKED to the planner and retries the others).
@@ -726,6 +762,8 @@ def run_task(
     repo: Path | None,
     base: str | None,
     backends: Backends,
+    read_root: Path | None = None,
+    events: AttemptEvents | None = None,
 ) -> TaskResult:
     """Run ONE task to a triage verdict (reusable, safe to call concurrently).
 
@@ -735,6 +773,10 @@ def run_task(
     tier-matched critic (PASS -> merge-ready, RETRY -> bounded same-tier retry that
     inherits the prior wip, ESCALATE -> planner); INVALID / FAILED / PARTIAL -> a
     failed attempt (bounded retry, then escalate). ``RateLimited`` escapes un-burned.
+
+    A non-write task reads + grounds against ``read_root`` (the integration tip) when
+    the driver supplies one. ``events`` (optional) lands the gate + triage in the
+    journal live; ``None`` keeps this callable standalone for the unit tests.
     """
 
     implement = task.mode == "implement"
@@ -762,13 +804,17 @@ def run_task(
         try:
             attempt = _run_attempt(
                 task, task_id,
-                scratch=scratch, repo=repo, epoch_base=base, backends=backends,
+                scratch=scratch, repo=repo, read_root=read_root, epoch_base=base,
+                backends=backends,
                 domain_skills=domain_skills,
                 failure_context=tuple(failure_context),
                 prior_work_present=implement and prior_branch is not None,
                 run_dir=run_dir,
+                events=events,
             )
         except _Rejected as rej:
+            if events is not None:
+                events.handoff_rejected(task_id, rej.reason)
             failure_context.append(rej.reason)
             prior_branch = _carry_or_discard(
                 rej, repo=repo, scratch=scratch, branch=branch, implement=implement,
@@ -785,6 +831,8 @@ def run_task(
             )
         if handoff.status != "DONE":  # FAILED / PARTIAL: a failed attempt
             reason = "; ".join(handoff.not_done) or handoff.resulting_state
+            if events is not None:
+                events.handoff_rejected(task_id, f"handoff status {handoff.status}: {reason}")
             failure_context.append(f"handoff status {handoff.status}: {reason}")
             prior_branch = _carry_partial(repo, scratch, branch, implement, task_id)
             continue
@@ -802,6 +850,8 @@ def run_task(
                 task_id, "escalated", attempts=attempts, handoff=handoff,
                 reason=str(exc),
             )
+        if events is not None:
+            events.verdict(task_id, verdict.outcome, verdict.reason)
 
         if verdict.outcome == "PASS":
             return TaskResult(
