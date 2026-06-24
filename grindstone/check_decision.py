@@ -1,16 +1,17 @@
 """Planner-facing decision validator: ground the planner like the workers.
 
-The worker writes ``handoff.json`` and loops on ``check_handoff.py`` until it exits
-0 before handing back; the planner gets the SAME discipline for its epoch JSON. It
-writes ``decision.json`` into its worktree CWD, runs
+The worker's deliverable is gated on deterministic facts (its committed diff /
+produced artifact) plus the critic, so its free-form ``handoff.md`` needs no
+self-validator; the planner, by contrast, emits structured JSON the core MUST parse,
+so it gets a self-validate-on-disk loop. It writes ``decision.json`` into its
+worktree CWD, runs
 ``python3 check_decision.py decision.json``, and fixes every violation the script
 prints until it exits 0. The core then reads the already-validated file back as the
 disk contract and re-runs ``parse_decision`` as defense in depth (parsing stays in
 core), so the planner stops burning blind re-asks on a schema it guessed wrong.
 
-Unlike the worker validator (a stdlib schema walk for a target repo that has no
-grindstone on its path), this one runs on the grindstone HOST, so it does NOT
-re-implement the schema: it re-execs the REAL core gate (``parse_decision``).
+This validator runs on the grindstone HOST, so it does NOT re-implement the schema:
+it re-execs the REAL core gate (``parse_decision``).
 ``parse_decision`` is the single source of truth; ``write_validator`` drops a tiny
 stdlib wrapper that re-execs it through the grindstone interpreter. The tolerant
 JSON extractor lives here too (it is the other half of "parse untrusted planner

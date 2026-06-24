@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # worker_request.sh, the DEFAULT `worker` worker role. Runs Claude (Opus) headless
 # via `claude -p` one-shot IN the task worktree, with edit + exec permissions so
-# it can modify files, run the done_when checks, and write handoff.json.
+# it can modify files, run the done_when checks, and write a handoff.md report.
 #
 # This is the shipped default rig: a fresh cloner with Claude Code installed runs
 # with zero setup. An operator's own local worker (e.g. a local-GPU model) goes in
@@ -9,15 +9,13 @@
 #
 # Grindstone passes only a worktree, a prompt file, a log dir, a handle-out path
 # and a timeout; it never learns the transport or the model behind the role. The
-# agent writes handoff.json into the worktree; that file is the ONLY result
-# channel, stdout is never parsed. We propagate claude's exit code and forward its
+# agent commits its work / writes its artifact in the worktree (the gate) plus a
+# free-form handoff.md report; stdout is never parsed. We propagate claude's exit code and forward its
 # stderr to ours so the caller can grep `rate|limit|429`.
 set -euo pipefail
 
 # Portable timeout prefix (resolves `timeout`, else `gtimeout`, else none).
 source "$(dirname "$0")/../_common/_timeout_prefix.sh"
-# guarantee_handoff: synthesize a FAILED handoff if the agent left none.
-source "$(dirname "$0")/../_common/_handoff_guarantee.sh"
 
 # Model identity is THIS script's concern. The owner's decision is Opus for every
 # role. Override for your own rig via $GRINDSTONE_LOCAL_MODEL (any `claude --model`
@@ -45,7 +43,6 @@ done
 
 # Resolve paths to absolute BEFORE we cd into the worktree.
 worktree="$(cd "$worktree" && pwd)"
-prompt_text="$(cat "$prompt")"
 mkdir -p "$log_dir"; log_dir="$(cd "$log_dir" && pwd)"
 mkdir -p "$(dirname "$handle_out")"
 handle_out="$(cd "$(dirname "$handle_out")" && pwd)/$(basename "$handle_out")"
@@ -56,7 +53,7 @@ handle_out="$(cd "$(dirname "$handle_out")" && pwd)/$(basename "$handle_out")"
 pgid="$(ps -o pgid= -p $$ | tr -d '[:space:]')"
 echo "$pgid" > "$handle_out"
 
-# CWD = worktree (where the agent writes handoff.json); fence git's upward repo
+# CWD = worktree (where the agent writes its work + handoff.md); fence git's upward repo
 # discovery at the worktree's parent (ports the GIT_CEILING_DIRECTORIES scar).
 export GIT_CEILING_DIRECTORIES="$(dirname "$worktree")"
 cd "$worktree"
@@ -70,9 +67,9 @@ build_timeout_prefix "$timeout"
 # The `local` role is the on-rig grinder: build the task and verify it. The
 # worktree is an isolated, throwaway checkout, so --dangerously-skip-permissions
 # (full tool access: Edit/Write/Bash) is safe and required for a headless run that
-# must edit files, run the done_when checks, and write handoff.json without ever
+# must edit files, run the done_when checks, and write handoff.md without ever
 # blocking on a permission prompt.
-sys_append="You are the LOCAL grinder for a grindstone task. Work only inside this worktree (your CWD): write every file with a path RELATIVE to your CWD, never an absolute path and never outside it. Make the change, run the done_when checks, and write handoff.json exactly as the task instructs."
+sys_append="You are the LOCAL grinder for a grindstone task. Work only inside this worktree (your CWD): write every file with a path RELATIVE to your CWD, never an absolute path and never outside it. Make the change, COMMIT it, run the done_when checks, and write a short free-form handoff.md report for the reviewer exactly as the task instructs."
 
 # The prompt is fed to claude on STDIN (`claude -p` reads the prompt from stdin),
 # never as an argv string: a large prior-failure context could otherwise exceed
@@ -106,14 +103,10 @@ if [[ "$rc" -ne 0 ]] \
   exit "$rc"
 fi
 
-# Otherwise: whether claude exited 0 or non-zero (ran out of budget, crashed
-# mid-task), GUARANTEE a handoff exists before we return. If the agent already
-# wrote one this is a no-op; if not we synthesize a schema-valid FAILED handoff
-# with a diagnosis + log tails. We then exit 0 so grindstone READS that handoff
-# (a non-zero exit would short-circuit collection and trigger a blind retry).
-guarantee_handoff "$worktree" "$prompt_text" "$log_out" "$log_err" "$rc"
-
+# Otherwise propagate claude's exit code. The worker is gated on its committed diff /
+# produced artifact, NOT a handoff file, so a non-rate-limit non-zero exit is a real
+# transport failure: grindstone retries the attempt, then escalates to the planner.
 if [[ "$rc" -ne 0 ]]; then
-  echo "worker_request: claude exited $rc (model=$model); synthesized/kept a FAILED handoff" >&2
+  echo "worker_request: claude exited $rc (model=$model)" >&2
 fi
-exit 0
+exit "$rc"

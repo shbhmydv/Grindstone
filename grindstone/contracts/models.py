@@ -1,16 +1,19 @@
 """Pydantic v2 wire contracts for the bones rewrite.
 
-Three lenient structs the core works with, stringly JSON is parsed here exactly
+Two lenient structs the core works with, stringly JSON is parsed here exactly
 once, at the boundary, and never crosses inward:
 
 * ``Decision`` -- what the planner emits each boundary: an EPOCH (1..N tasks) or
   an END (a phase handoff / pending-summary that seeds the next appendable run).
-* ``Handoff`` -- what a worker writes to disk in its CWD (the disk file is the
-  gate, stdout is never parsed). Carries a self-reported ``BLOCKED`` status so an
-  environment blocker routes straight to the planner, skipping the critic.
 * ``Verdict`` -- the critic's triage: ``PASS`` | ``RETRY`` | ``ESCALATE`` plus a
   short free-text reason. Deliberately NOT a rigid multi-field schema, that shape
   is what a weak model fumbled (run 051645Z), rejecting work for a machinery fault.
+
+The worker's ``handoff.md`` is deliberately NOT modelled here: it is a FREE-FORM
+prose report the worker writes for the critic, never a wire contract the state
+machine parses or schema-gates (BONES: the machine disposes on DETERMINISTIC facts
+-- the git diff + file existence -- plus the critic's lenient verdict, nothing
+else). It is relocated to the keyed log verbatim and handed to the critic as text.
 
 Every model is frozen and forbids unknown keys, so a parsed value is immutable
 and complete. The JSON Schemas in ``schemas/`` mirror these models; the schema is
@@ -25,7 +28,6 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    StrictBool,
     StringConstraints,
     TypeAdapter,
     model_validator,
@@ -39,14 +41,9 @@ LogKey = Annotated[
     str, StringConstraints(pattern=r"^[A-Za-z0-9][a-zA-Z0-9._/-]{0,127}$")
 ]
 
-#: The four worker intents. Picks the worker prompt/skill and the handoff rules
-#: (research/review must cite). Carried on each task and echoed by the handoff.
+#: The four worker intents. Picks the worker prompt/skill and the critic's
+#: grounding bar (research/review must cite real files). Carried on each task.
 HandoffMode = Literal["implement", "research", "review", "artifact"]
-
-#: Total serialized handoff size cap (ARCHITECTURE.md): references, not payloads.
-#: Kept here (formerly contracts/semantics.py) so ``check_handoff`` and any later
-#: gate share one constant.
-HANDOFF_MAX_BYTES = 8192
 
 
 class _Frozen(BaseModel):
@@ -190,70 +187,6 @@ def parse_decision(payload: object) -> Decision:
     """Parse untrusted JSON into the typed decision union (raises on invalid)."""
 
     return _DECISION_ADAPTER.validate_python(payload)
-
-
-# --- handoff (the COPY bone, plus a BLOCKED self-report) -----------------------
-
-
-class WhatChanged(_Frozen):
-    kind: Literal["file", "interface", "artifact"]
-    ref: Annotated[str, StringConstraints(min_length=1, max_length=256)]
-
-
-class Citation(_Frozen):
-    file: Annotated[str, StringConstraints(min_length=1, max_length=256)]
-    line: Annotated[int, Field(ge=1)] | None = None
-
-
-class CheckResult(_Frozen):
-    check: Annotated[str, StringConstraints(max_length=512)]
-    exit_code: int
-
-
-class Occupancy(_Frozen):
-    compacted: bool
-    subagent_splits: Annotated[int, Field(ge=0)]
-    peak_context_tokens: Annotated[int, Field(ge=0)] | None = None
-
-
-class Handoff(_Frozen):
-    """Worker handoff written to disk; the disk file is the gate, not stdout.
-
-    ``status`` adds ``BLOCKED`` to the bone: a worker that hits a hard environment
-    blocker (missing dep, needs a host mutation it may not make) writes ``BLOCKED``
-    so the orchestrator routes it STRAIGHT to the planner, skipping the critic (no
-    point critiquing env-blocked work).
-    """
-
-    schema_version: Literal["1"]
-    task_id: Annotated[
-        str, StringConstraints(pattern=r"^P[1-9][0-9]?/E[1-9][0-9]?/T[1-8]$")
-    ]
-    status: Literal["DONE", "FAILED", "PARTIAL", "BLOCKED"]
-    what_changed: Annotated[list[WhatChanged], Field(max_length=16)] = Field(
-        default_factory=list
-    )
-    resulting_state: Annotated[str, StringConstraints(min_length=1, max_length=1500)]
-    downstream_needs: Annotated[list[LogKey], Field(max_length=8)] = Field(
-        default_factory=list
-    )
-    not_done: Annotated[
-        list[Annotated[str, StringConstraints(max_length=256)]], Field(max_length=8)
-    ] = Field(default_factory=list)
-    citations: Annotated[list[Citation], Field(max_length=12)] = Field(
-        default_factory=list
-    )
-    checks: Annotated[list[CheckResult], Field(max_length=8)]
-    occupancy: Occupancy
-
-
-_HANDOFF_ADAPTER: TypeAdapter[Handoff] = TypeAdapter(Handoff)
-
-
-def parse_handoff(payload: object) -> Handoff:
-    """Parse untrusted JSON into the typed handoff model (raises on invalid)."""
-
-    return _HANDOFF_ADAPTER.validate_python(payload)
 
 
 # --- verdict (the critic's triage, lenient by design) --------------------------

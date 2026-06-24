@@ -4,19 +4,33 @@ BONES: one task is run to a triage verdict, reusable and safe to call
 concurrently. ``run_task`` isolates the work in a throwaway worktree off an
 EXTERNAL base (so a worker that strips its CWD to the repo root cannot reach the
 operator checkout), dispatches the tier's rig behind the uniform ``WorkerTransport``
-seam, collects the handoff from disk (the disk file is the gate, stdout is never
-parsed), then either routes a self-reported BLOCKED straight to the planner or runs
-a tier-matched CRITIC that TRIAGES the work (PASS | RETRY | ESCALATE). A bounded
-same-tier retry (no tier escalation) absorbs the cheap self-heals; anything else
-becomes context the planner sees next boundary.
+seam, then disposes on DETERMINISTIC FACTS plus the critic's lenient verdict, and
+NOTHING ELSE. The worker's ``handoff.md`` is a FREE-FORM prose report for the
+critic; the state machine never parses or schema-gates it.
+
+The two deterministic invariants the Python owns (everything else is agentic):
+
+* implement: after the grind, is there a non-empty commit, and are the changed
+  paths within the declared ``file_ownership`` (the GIT DIFF is scope-checked via
+  ``worktree.scope_violations``, never the handoff)? A zero-diff or out-of-scope
+  attempt is a failed attempt; in-scope work then disjoint-merges (Part 3).
+* non-write (research / review / artifact): does the ``artifact_out`` file exist
+  at its keyed-log path? Missing -> a failed attempt.
+
+A gate-clean attempt ALWAYS runs the tier-matched CRITIC, which now OWNS every
+judgment that used to be a Python gate: done-vs-blocked-vs-incomplete, grounding /
+citation quality (research / review must cite real files under the read-tip;
+ungrounded -> RETRY / ESCALATE), and retry-worthiness. An unrecoverable
+environmental blocker the worker reports in ``handoff.md`` becomes a critic
+ESCALATE (this replaces the old worker-self-declared BLOCKED path).
 
 The control flow, per BONES failure model (two nodes, everything routes to #2):
 
 * worker RATE-LIMITED -> the exception escapes (NOT a burned attempt): the epoch
   loop parks and re-runs (#1).
-* handoff INVALID / FAILED / PARTIAL -> a failed attempt: bounded same-tier retry,
-  the retry INHERITS the prior attempt's stripped wip; exhausted -> escalate (#2).
-* handoff BLOCKED -> skip the critic, surface to the planner (#2, honest blocker).
+* attempt fails the deterministic gate (missing / zero-diff / out-of-scope /
+  missing artifact) -> a failed attempt: bounded same-tier retry, the retry
+  INHERITS the prior attempt's stripped wip; exhausted -> escalate (#2).
 * critic PASS -> return the merge-ready worktree result (Part 3 integrates).
 * critic RETRY -> bounded same-tier retry (a defect the SAME worker can fix).
 * critic ESCALATE -> surface to the planner (#2).
@@ -38,33 +52,27 @@ from pathlib import Path
 from typing import Iterator, Literal, Protocol
 
 from grindstone import worktree as wt
-from grindstone.check_handoff import (
-    CHECK_COMMAND,
-    CHECK_SCRIPT_NAME,
-    generate_check_script,
-)
 from grindstone.contracts.models import (
-    HANDOFF_MAX_BYTES,
-    Handoff,
     HandoffMode,
     Task,
     Verdict,
     VerdictOutcome,
-    parse_handoff,
     parse_verdict,
 )
 from grindstone.domain_skills import load_domain_skill
 from grindstone.rundir import RunDir
 
-#: The implement-mode self-review artifact a worker writes in its CWD before the
-#: handoff (a quality step; the independent CRITIC is the real gate). Stripped
-#: before commit like every other orchestration file. (Verified mechanism: a
-#: review demanded as a gated artifact fires; prose instructions do not.)
-REVIEW_FILENAME = "review.md"
+#: The worker's FREE-FORM report, written in its CWD: a short prose note (what I
+#: did, what is done, what is blocked / unfinished, which files I touched, grounding
+#: as prose). NOT a wire contract: never parsed or schema-gated. Relocated to the
+#: keyed log verbatim (the planner's optional context + the journal) and handed to
+#: the critic as text. Stripped before an implement commit like every orchestration
+#: file.
+HANDOFF_FILENAME = "handoff.md"
 
 #: The critic's only result channel: a ``verdict.json`` written in the critic's CWD
-#: (a re-read disk contract, like the handoff). Relocated into the run dir and
-#: re-validated with Pydantic; stdout is never parsed.
+#: (a re-read disk contract). Relocated into the run dir and re-validated with
+#: Pydantic; stdout is never parsed.
 CRITIC_VERDICT_FILENAME = "verdict.json"
 
 #: Bounded SAME-tier retry budget (BONES: keep a tiny 1-2x local retry that absorbs
@@ -96,15 +104,20 @@ class CriticBrief:
     """Marks a dispatch as the CRITIC pass (not a worker grind).
 
     Carries the task's OWN claimed ``goal`` (the anchor the critic judges against,
-    not its own taste) and a pointer to the produced work: ``diff_base`` is the base
-    ref an implement critic diffs HEAD against (it runs in the post-commit worktree),
-    and ``artifact_path`` is the CWD-relative deliverable a non-write critic reads.
+    not its own taste), the worker's free-form ``handoff_text`` report, and a pointer
+    to the produced work: ``diff_base`` is the base ref an implement critic diffs HEAD
+    against (it runs in the post-commit worktree), and ``artifact_path`` is the
+    CWD-relative deliverable a non-write critic reads. ``read_root`` is the repository
+    a non-write critic reads to VERIFY the artifact's citations are grounded in real
+    files (None for implement, which judges the diff directly).
     """
 
     goal: str
     mode: HandoffMode
+    handoff_text: str = ""
     diff_base: str | None = None
     artifact_path: str | None = None
+    read_root: str | None = None
 
 
 @dataclass(frozen=True)
@@ -149,7 +162,9 @@ class AttemptEvents(Protocol):
     """Optional per-attempt event sink the epoch driver threads in so the gate +
     triage land in the journal LIVE during a real run (default ``None`` keeps
     ``run_task`` standalone for the unit tests). The driver's adapter maps these to
-    ``handoff_accepted`` / ``handoff_rejected`` / ``verdict`` journal events."""
+    ``handoff_accepted`` / ``handoff_rejected`` / ``verdict`` journal events.
+    ``handoff_accepted`` now fires when the DETERMINISTIC gate passes (a non-empty
+    in-scope commit, or a present artifact), before the critic runs."""
 
     def handoff_accepted(self, task_id: str) -> None: ...
     def handoff_rejected(self, task_id: str, reason: str) -> None: ...
@@ -213,16 +228,18 @@ class TaskResult:
     * ``passed``: merge-ready. For an implement task ``branch`` (+ ``head``) is the
       wip the loop disjoint-merges into the run branch; for a non-write task
       ``artifact_key`` is the deliverable already relocated into the run dir.
-    * ``blocked``: a worker-reported environment blocker -> the planner (critic
-      skipped). ``handoff`` carries the BLOCKED self-report; ``reason`` summarizes.
-    * ``escalated``: a critic ESCALATE or an exhausted retry ladder -> the planner.
-      ``reason`` is the surfaced context.
+    * ``escalated``: a critic ESCALATE (an environmental blocker the worker reported,
+      an ambiguous spec, a decision needed) or an exhausted retry ladder -> the
+      planner. ``reason`` is the surfaced context.
+
+    ``handoff_path`` is the relocated free-form report (the planner's optional context
+    + the journal), ``None`` when the worker wrote none.
     """
 
     task_id: str
-    outcome: Literal["passed", "blocked", "escalated"]
+    outcome: Literal["passed", "escalated"]
     attempts: int
-    handoff: Handoff | None = None
+    handoff_path: Path | None = None
     verdict: Verdict | None = None
     branch: str | None = None
     head: str | None = None
@@ -234,8 +251,8 @@ class TaskResult:
 
 
 class _Rejected(Exception):
-    """One attempt was rejected (invalid/missing handoff, a non-DONE status, or an
-    out-of-scope write). ``chainable`` is False for a poisoned worktree (an
+    """One attempt failed the deterministic gate (missing / zero-diff / out-of-scope
+    write / missing artifact). ``chainable`` is False for a poisoned worktree (an
     out-of-scope write): the next retry restarts clean from the epoch base rather
     than inheriting the poison."""
 
@@ -271,12 +288,11 @@ discarded, and corrupts the run.
 #: (the tier only selects which rig SCRIPT runs it).
 _MODE_GUIDANCE: dict[HandoffMode, str] = {
     "implement": (
-        "Make the change inside your file_ownership. If your checks need project "
-        "dependencies (npm ci, pip install, yarn), you MAY install them INSIDE THIS "
-        "WORKTREE as part of your work (setup does not reach here). Run whatever "
-        "checks you write to convince yourself it works, then self-review your diff "
-        f"and record a short note in `{REVIEW_FILENAME}` in your CWD before handing "
-        "off."
+        "Make the change inside your file_ownership, then COMMIT it (the orchestrator "
+        "gates the git diff in this worktree, not your words). If your checks need "
+        "project dependencies (npm ci, pip install, yarn), you MAY install them INSIDE "
+        "THIS WORKTREE as part of your work (setup does not reach here). Run whatever "
+        "checks you write to convince yourself it works."
     ),
     "research": (
         "Investigate, then write your findings to the artifact log key below. "
@@ -324,9 +340,9 @@ def _file_ownership_block(task: Task) -> str:
 <file_ownership>
 You may create or edit files ONLY within these globs:
 {globs}
-Changing ANY other file fails the attempt. (`handoff.json`, `{CHECK_SCRIPT_NAME}`
-and `{REVIEW_FILENAME}` are orchestration files, write them in the CWD as
-instructed; the orchestrator excludes them from this rule.)
+Changing ANY other file fails the attempt. (`{HANDOFF_FILENAME}` is an
+orchestration file, write it in the CWD as instructed; the orchestrator excludes
+it from this rule and from your commit.)
 </file_ownership>
 """
 
@@ -336,7 +352,8 @@ def build_worker_prompt(request: WorkerRequest) -> str:
 
     Skeleton: goal, the worktree-isolation contract, resolved inputs, the per-mode
     guidance, the dynamic per-task lane (implement ownership), selected domain
-    skills, prior-failure context, prior-work note, and the handoff disk contract.
+    skills, prior-failure context, prior-work note, and the free-form handoff
+    report instruction (NOT a schema; the critic reads it as prose).
     """
 
     task = request.task
@@ -379,23 +396,15 @@ def build_worker_prompt(request: WorkerRequest) -> str:
 </inputs>
 {plan}{_domain_skills_block(request)}{prior_work_block}{context_block}
 <handoff>
-When finished, write a file named exactly `handoff.json` in your current working
-directory. It is the ONLY thing the orchestrator reads; stdout is ignored.
-  - JSON object, schema_version "1"; task_id MUST be exactly "{request.task_id}".
-  - status: "DONE" if you accomplished the goal; "BLOCKED" if a hard environment
-    blocker (a missing dependency, a host change you may not make) stops you;
-    else "FAILED" / "PARTIAL".
-  - resulting_state: one short sentence for the planner (references, not bodies).
-  - what_changed: list of {{"kind": "file"|"interface"|"artifact", "ref": <path>}}.
-  - downstream_needs / not_done: short strings; fill on FAILED / PARTIAL / BLOCKED.
-  - citations: list of {{"file": <path>, "line": <int optional>}} grounding your
-    claims in real files (required for research / review). Paths resolve against
-    your CWD (or the target repo root for non-implement tasks) and must stay inside.
-  - checks: echo any checks you ran as {{"check": <text>, "exit_code": <int>}}.
-  - occupancy: {{"compacted": <bool>, "subagent_splits": <int>}}, report honestly.
-  - The whole file must serialize under {HANDOFF_MAX_BYTES} bytes (references, not payloads).
-After writing handoff.json run `{CHECK_COMMAND}` (it is in your CWD) and fix every
-violation it prints until it exits 0.
+When finished, write a SHORT free-form report named exactly `{HANDOFF_FILENAME}` in
+your current working directory, for the independent reviewer who reads your work
+next. Plain prose (no required schema): what you did, what is DONE, what is still
+blocked or unfinished and why, which files you touched, and any grounding /
+citations as prose. If a hard ENVIRONMENTAL blocker stopped you (a dependency you
+cannot install, a host change you may not make, a decision only a human can take),
+SAY SO plainly here so the reviewer can route it onward. This report is for the
+reviewer; the orchestrator gates your actual work (the committed diff or the
+produced artifact), never this file.
 </handoff>
 """
 
@@ -407,8 +416,10 @@ def build_critic_prompt(request: WorkerRequest, brief: CriticBrief) -> str:
     "did it accomplish what it claimed", lenient on polish/style; (2) the bar is
     "good enough to build on", not perfect, so PASS-with-notes when torn; (3) the
     single retry-vs-escalate question, "can the SAME worker plausibly fix this
-    itself?" yes -> RETRY, no -> ESCALATE. Bias to PASS when unsure. The critic
-    ROUTES, it does not grade.
+    itself?" yes -> RETRY, no -> ESCALATE. The critic now OWNS the judgments the
+    Python used to gate: done-vs-blocked, grounding / citation quality (research /
+    review must cite real files), and an environmental blocker -> ESCALATE. Bias to
+    PASS when unsure. The critic ROUTES, it does not grade.
     """
 
     if brief.mode == "implement":
@@ -417,11 +428,23 @@ def build_critic_prompt(request: WorkerRequest, brief: CriticBrief) -> str:
             "this worktree to see exactly what the worker changed, and read the "
             "changed files."
         )
+        grounding = ""
     else:
         work_line = (
             f"The work is an artifact at `{brief.artifact_path}` (relative to this "
             "directory). Read it in full and judge its actual content, not a summary."
         )
+        root = brief.read_root or "the repository"
+        grounding = (
+            "\n<grounding>\nThis is a research / review artifact: its claims MUST be "
+            f"grounded in real files under `{root}`. VERIFY the citations resolve to "
+            "files that exist and actually support each claim. A claim with no "
+            "citation, or one citing a file that does not exist or does not say what "
+            "is claimed, is UNGROUNDED: if the worker can plausibly fix it (add or "
+            "correct citations) -> RETRY; if the underlying claim is wrong or "
+            "unverifiable -> ESCALATE.\n</grounding>\n"
+        )
+    report = brief.handoff_text.strip() or "(the worker wrote no handoff report)"
     return f"""<critic id="{request.task_id}">
 You are an INDEPENDENT critic. You did NOT write this work. Do NOT edit anything.
 Your job is to TRIAGE it into one of three routes, not to grade it.
@@ -434,10 +457,17 @@ style. Intermediate red (a reference to something a later task will build) is fi
 {brief.goal}
 </claimed_goal>
 
+<worker_report>
+The worker's own free-form report (its claims, not the ground truth; verify against
+the actual work). If it reports a hard environmental blocker it could not resolve,
+that is an ESCALATE, not a RETRY:
+{report}
+</worker_report>
+
 <the_work>
 {work_line}
 </the_work>
-
+{grounding}
 <triage>
 The bar is "GOOD ENOUGH TO BUILD ON", not "perfect". Decide ONE outcome:
   - PASS: it accomplished the claimed goal well enough to build on. Minor
@@ -470,110 +500,42 @@ def build_prompt(request: WorkerRequest) -> str:
     return build_worker_prompt(request)
 
 
-# --- handoff collection + the core gate (the disk file is the gate) ------------
+# --- handoff relocation (free-form; NEVER parsed or schema-gated) --------------
 
 
-def _read_disk_artifact(path: Path) -> object:
-    """Read + JSON-parse a re-read disk artifact, with the DoS guard. Raises on a
-    missing / oversized / non-JSON file (the caller maps that to a rejection)."""
+def _relocate_handoff(
+    scratch: Path, *, run_dir: RunDir, task_id: str
+) -> tuple[Path | None, str]:
+    """Relocate the worker's FREE-FORM ``handoff.md`` to the keyed log and return its
+    ``(path, text)``.
 
-    if not path.is_file():
-        raise _Rejected(f"no {path.name} written")
-    if path.stat().st_size > _DISK_READ_MAX_BYTES:
-        raise _Rejected(
-            f"{path.name} over the {_DISK_READ_MAX_BYTES}-byte DoS guard; rejecting"
-        )
+    The report is NEVER parsed or schema-gated: it is the worker's prose for the
+    critic + the planner's optional context. A missing or pathologically-large report
+    is fine (the deterministic gate is the diff / artifact, not this file), so return
+    ``(None, "")`` and let the critic judge the actual work."""
+
+    src = scratch / HANDOFF_FILENAME
+    if not src.is_file() or src.stat().st_size > _DISK_READ_MAX_BYTES:
+        return None, ""
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise _Rejected(f"{path.name} is not valid JSON: {exc}") from exc
-
-
-#: Modes whose DONE handoff must carry >= 1 citation (mirrors check_handoff).
-_CITATION_MODES: tuple[HandoffMode, ...] = ("research", "review")
-
-
-def _gate_handoff(
-    handoff: Handoff,
-    *,
-    mode: HandoffMode,
-    expected_task_id: str,
-    scratch: Path,
-    repo: Path | None,
-) -> list[str]:
-    """The core handoff gate beyond the Pydantic schema (BONES minimal checks):
-    exact task_id echo, the research/review citation requirement (DONE only), every
-    cited file exists inside an allowed root, and the canonical size cap. The
-    grounding roots mirror the worker-facing validator: the scratch CWD always, plus
-    the target repo for a non-implement task (its scratch is a plain dir)."""
-
-    out: list[str] = []
-    if handoff.task_id != expected_task_id:
-        out.append(f"task_id {handoff.task_id!r} != dispatched {expected_task_id!r}")
-    if handoff.status == "DONE" and mode in _CITATION_MODES and not handoff.citations:
-        out.append("research/review handoff requires >= 1 citation")
-    roots = [scratch.resolve()]
-    if repo is not None and mode != "implement":
-        roots.append(repo.resolve())
-    for cite in handoff.citations:
-        ok = False
-        for root in roots:
-            c = (root / cite.file).resolve()
-            if c.is_file() and c.is_relative_to(root):
-                ok = True
-                break
-        if not ok:
-            out.append(f"citation missing or outside allowed roots: {cite.file}")
-    canonical = json.dumps(
-        handoff.model_dump(exclude_none=True), sort_keys=True, separators=(",", ":")
-    ).encode()
-    if len(canonical) > HANDOFF_MAX_BYTES:
-        out.append(f"handoff exceeds {HANDOFF_MAX_BYTES} bytes: {len(canonical)}")
-    return out
-
-
-def _collect_handoff(
-    scratch: Path,
-    *,
-    run_dir: RunDir,
-    expected_task_id: str,
-    mode: HandoffMode,
-    repo: Path | None,
-) -> Handoff:
-    """Relocate + fully validate one attempt's handoff; raise ``_Rejected``.
-
-    Read the scratch handoff, relocate parseable bytes to the keyed log, parse with
-    Pydantic, then run the core gate. On any failure the relocated record is removed
-    (zero dead artifacts). The DISK FILE is the gate; stdout is never parsed."""
-
-    src = scratch / "handoff.json"
-    payload = _read_disk_artifact(src)
-    dest = run_dir.resolve(f"{expected_task_id}/handoff.json")
+        text = src.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None, ""
+    dest = run_dir.resolve(f"{task_id}/{HANDOFF_FILENAME}")
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(src, dest)
-    try:
-        handoff = parse_handoff(payload)
-    except ValueError as exc:
-        dest.unlink(missing_ok=True)
-        raise _Rejected(f"handoff parse failed: {exc}") from exc
-    violations = _gate_handoff(
-        handoff, mode=mode, expected_task_id=expected_task_id, scratch=scratch, repo=repo
-    )
-    if violations:
-        dest.unlink(missing_ok=True)
-        raise _Rejected("; ".join(violations))
-    return handoff
+    return dest, text
 
 
 # --- orchestration-file hygiene ------------------------------------------------
 
 
 def _strip_orchestration_files(scratch: Path) -> None:
-    """Drop the metadata an implement worker leaves in its scratch (handoff.json,
-    the validator, the self-review, any critic verdict, and the worker's per-cwd
-    ``.pi/settings.json``) so none of it enters a commit or trips the scope check."""
+    """Drop the metadata an implement worker leaves in its scratch (the free-form
+    handoff, any critic verdict, and the worker's per-cwd ``.pi/settings.json``) so
+    none of it enters a commit or trips the scope check."""
 
-    for name in ("handoff.json", CHECK_SCRIPT_NAME, REVIEW_FILENAME, CRITIC_VERDICT_FILENAME):
+    for name in (HANDOFF_FILENAME, CRITIC_VERDICT_FILENAME):
         (scratch / name).unlink(missing_ok=True)
     settings = scratch / ".pi" / "settings.json"
     settings.unlink(missing_ok=True)
@@ -601,21 +563,6 @@ def _load_domain_skills(repo: Path | None, task: Task) -> dict[str, str]:
     return out
 
 
-def _install_validator(
-    scratch: Path, *, task_id: str, mode: HandoffMode, repo: Path | None
-) -> None:
-    """Drop the worker-facing ``check_handoff.py`` validator in the attempt CWD so
-    the worker can self-validate before handing off. The core re-validates the disk
-    file independently. Non-implement tasks bake the repo as a second citation root."""
-
-    (scratch / CHECK_SCRIPT_NAME).write_text(
-        generate_check_script(
-            task_id=task_id, mode=mode, repo_root=repo if mode != "implement" else None
-        ),
-        encoding="utf-8",
-    )
-
-
 def _critic_verdict(
     task: Task,
     task_id: str,
@@ -623,6 +570,8 @@ def _critic_verdict(
     scratch: Path,
     base: str | None,
     artifact_rel: str | None,
+    handoff_text: str,
+    critic_read_root: Path | None,
     run_dir: RunDir,
     backends: Backends,
 ) -> Verdict:
@@ -630,11 +579,14 @@ def _critic_verdict(
     its ``verdict.json``, return the parsed lenient ``Verdict``. A missing / invalid
     verdict or a transport raise is a ``CriticError`` (fail-safe, never a pass)."""
 
+    implement = task.mode == "implement"
     brief = CriticBrief(
         goal=task.goal,
         mode=task.mode,
-        diff_base=base if task.mode == "implement" else None,
+        handoff_text=handoff_text,
+        diff_base=base if implement else None,
         artifact_path=artifact_rel,
+        read_root=None if implement or critic_read_root is None else str(critic_read_root),
     )
     request = WorkerRequest(
         task=task, task_id=task_id, mode=task.mode, scratch=scratch, critic=brief
@@ -662,7 +614,11 @@ def _critic_verdict(
 
 @dataclass
 class _AttemptOutput:
-    handoff: Handoff
+    """A gate-clean attempt: the free-form report (path + text for the critic) and
+    the produced work (implement HEAD, or the published artifact log key)."""
+
+    handoff_path: Path | None
+    handoff_text: str
     head: str | None
     artifact_rel: str | None
 
@@ -682,22 +638,23 @@ def _run_attempt(
     run_dir: RunDir,
     events: AttemptEvents | None,
 ) -> _AttemptOutput:
-    """Dispatch one worker attempt and collect its handoff. For a DONE implement
-    task: strip orchestration, commit, scope-check against the EPOCH base, and reject
-    a zero-diff DONE. For a DONE non-write task: publish the deliverable to its log
-    key. Raises ``_Rejected`` on any failure; lets ``RateLimited`` escape.
+    """Dispatch one worker attempt and gate it on DETERMINISTIC FACTS. For an
+    implement task: relocate the free-form handoff, strip orchestration, commit,
+    scope-check against the EPOCH base, and reject a zero-diff commit. For a non-write
+    task: ensure the ``artifact_out`` file exists and publish it to its log key.
+    Raises ``_Rejected`` on any gate failure; lets ``RateLimited`` escape. The
+    handoff report is NEVER parsed.
 
-    A NON-WRITE task grounds its citations against ``read_root`` (the integration
-    tip) when set, never the stale base, so a review / research task sees what prior
-    epochs built. The backend slot is held ONLY around the model dispatch (not the
-    git/disk work), so a concurrent same-backend task cannot land a second call on
-    the single local slot mid-grind, while cross-backend tasks run free."""
+    A NON-WRITE task grounds its citations against ``read_root`` (the integration tip)
+    when set, never the stale base. The backend slot is held ONLY around the model
+    dispatch (not the git/disk work), so a concurrent same-backend task cannot land a
+    second call on the single local slot mid-grind, while cross-backend tasks run
+    free."""
 
     implement = task.mode == "implement"
     #: A non-write task reads + cites the integration tip (``read_root``) when the
     #: driver provided one, else the base repo (the standalone-test fallback).
     cite_root = repo if implement else (read_root if read_root is not None else repo)
-    _install_validator(scratch, task_id=task_id, mode=task.mode, repo=cite_root)
     inputs = {key: run_dir.resolve(key) for key in task.inputs}
     request = WorkerRequest(
         task=task,
@@ -718,15 +675,9 @@ def _run_attempt(
     except Exception as exc:
         raise _Rejected(f"transport error: {type(exc).__name__}: {exc}") from exc
 
-    handoff = _collect_handoff(
-        scratch, run_dir=run_dir, expected_task_id=task_id, mode=task.mode, repo=cite_root
+    handoff_path, handoff_text = _relocate_handoff(
+        scratch, run_dir=run_dir, task_id=task_id
     )
-    if handoff.status == "DONE" and events is not None:
-        events.handoff_accepted(task_id)
-    if handoff.status != "DONE":
-        # BLOCKED / FAILED / PARTIAL are honest non-DONE statuses returned to the
-        # caller (which routes BLOCKED to the planner and retries the others).
-        return _AttemptOutput(handoff=handoff, head=None, artifact_rel=None)
 
     if implement:
         assert repo is not None and epoch_base is not None
@@ -734,27 +685,41 @@ def _run_attempt(
         wt.commit_all(scratch, f"grind({task_id}): {task.goal.splitlines()[0][:72]}")
         changed = wt.changed_paths(scratch, epoch_base)
         if not changed:
+            if handoff_path is not None:
+                handoff_path.unlink(missing_ok=True)
             raise _Rejected(
-                "no committed work: implement task handed off DONE but left a "
-                "zero-diff branch"
+                "no committed work: implement task left a zero-diff branch"
             )
         out_of_scope = wt.scope_violations(changed, list(task.file_ownership))
         if out_of_scope:
+            if handoff_path is not None:
+                handoff_path.unlink(missing_ok=True)
             raise _Rejected(
                 f"out-of-scope writes: {', '.join(out_of_scope)}", chainable=False
             )
-        return _AttemptOutput(handoff=handoff, head=wt.head_commit(scratch), artifact_rel=None)
+        if events is not None:
+            events.handoff_accepted(task_id)
+        return _AttemptOutput(
+            handoff_path=handoff_path, handoff_text=handoff_text,
+            head=wt.head_commit(scratch), artifact_rel=None,
+        )
 
-    # Non-write DONE: publish the produced deliverable to its log key.
+    # Non-write: the produced deliverable must exist; publish it to its log key.
     assert task.artifact_out is not None
     produced = scratch / task.artifact_out
     if not produced.is_file():
-        run_dir.resolve(f"{task_id}/handoff.json").unlink(missing_ok=True)
+        if handoff_path is not None:
+            handoff_path.unlink(missing_ok=True)
         raise _Rejected(f"artifact_out not produced in CWD: {task.artifact_out}")
     published = run_dir.resolve(task.artifact_out)
     published.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(produced, published)
-    return _AttemptOutput(handoff=handoff, head=None, artifact_rel=task.artifact_out)
+    if events is not None:
+        events.handoff_accepted(task_id)
+    return _AttemptOutput(
+        handoff_path=handoff_path, handoff_text=handoff_text,
+        head=None, artifact_rel=task.artifact_out,
+    )
 
 
 def run_task(
@@ -771,11 +736,12 @@ def run_task(
     """Run ONE task to a triage verdict (reusable, safe to call concurrently).
 
     Each attempt grinds in a fresh isolated worktree (implement) or scratch dir
-    (non-write) off the EXTERNAL base, dispatches the tier's rig, collects the
-    handoff from disk, and routes: BLOCKED -> planner (skip critic); DONE -> the
-    tier-matched critic (PASS -> merge-ready, RETRY -> bounded same-tier retry that
-    inherits the prior wip, ESCALATE -> planner); INVALID / FAILED / PARTIAL -> a
-    failed attempt (bounded retry, then escalate). ``RateLimited`` escapes un-burned.
+    (non-write) off the EXTERNAL base, dispatches the tier's rig, and gates on
+    DETERMINISTIC FACTS (a non-empty in-scope commit, or a present artifact). A
+    gate-clean attempt ALWAYS runs the tier-matched critic, which routes: PASS ->
+    merge-ready, RETRY -> bounded same-tier retry that inherits the prior wip,
+    ESCALATE -> planner. A failed gate is a failed attempt (bounded retry, then
+    escalate). ``RateLimited`` escapes un-burned.
 
     A non-write task reads + grounds against ``read_root`` (the integration tip) when
     the driver supplies one. ``events`` (optional) lands the gate + triage in the
@@ -784,6 +750,7 @@ def run_task(
 
     implement = task.mode == "implement"
     slug = task_id.replace("/", "-")
+    critic_read_root = read_root if read_root is not None else repo
     try:
         domain_skills = _load_domain_skills(repo, task)
     except _Rejected as rej:
@@ -825,47 +792,35 @@ def run_task(
             )
             continue
 
-        handoff = attempt.handoff
-        if handoff.status == "BLOCKED":
-            _discard(repo, scratch, branch, implement)
-            return TaskResult(
-                task_id, "blocked", attempts=attempts, handoff=handoff,
-                reason=_blocked_reason(handoff),
-            )
-        if handoff.status != "DONE":  # FAILED / PARTIAL: a failed attempt
-            reason = "; ".join(handoff.not_done) or handoff.resulting_state
-            if events is not None:
-                events.handoff_rejected(task_id, f"handoff status {handoff.status}: {reason}")
-            failure_context.append(f"handoff status {handoff.status}: {reason}")
-            prior_branch = _carry_partial(repo, scratch, branch, implement, task_id)
-            continue
-
-        # DONE -> the tier-matched critic triages it (in the same scratch: the
+        # Gate-clean -> the tier-matched critic triages it (in the same scratch: the
         # post-commit worktree for implement, the artifact dir for a non-write task).
         try:
             verdict = _critic_verdict(
                 task, task_id, scratch=scratch, base=base,
-                artifact_rel=attempt.artifact_rel, run_dir=run_dir, backends=backends,
+                artifact_rel=attempt.artifact_rel, handoff_text=attempt.handoff_text,
+                critic_read_root=critic_read_root, run_dir=run_dir, backends=backends,
             )
         except CriticError as exc:
             _discard(repo, scratch, branch, implement)
             return TaskResult(
-                task_id, "escalated", attempts=attempts, handoff=handoff,
-                reason=str(exc),
+                task_id, "escalated", attempts=attempts,
+                handoff_path=attempt.handoff_path, reason=str(exc),
             )
         if events is not None:
             events.verdict(task_id, verdict.outcome, verdict.reason)
 
         if verdict.outcome == "PASS":
             return TaskResult(
-                task_id, "passed", attempts=attempts, handoff=handoff, verdict=verdict,
+                task_id, "passed", attempts=attempts,
+                handoff_path=attempt.handoff_path, verdict=verdict,
                 branch=branch, head=attempt.head, artifact_key=attempt.artifact_rel,
             )
         if verdict.outcome == "ESCALATE":
             _discard(repo, scratch, branch, implement)
             return TaskResult(
-                task_id, "escalated", attempts=attempts, handoff=handoff,
-                verdict=verdict, reason=verdict.reason or "critic escalated to planner",
+                task_id, "escalated", attempts=attempts,
+                handoff_path=attempt.handoff_path, verdict=verdict,
+                reason=verdict.reason or "critic escalated to planner",
             )
         # RETRY: a defect the same worker can fix; chain the committed wip.
         failure_context.append(f"critic RETRY: {verdict.reason}")
@@ -921,12 +876,8 @@ def _carry_partial(
 def _discard(
     repo: Path | None, scratch: Path, branch: str | None, implement: bool
 ) -> None:
-    """Tear down an attempt that leaves nothing to merge (BLOCKED / ESCALATE / a
-    poisoned worktree): worktree removed + branch deleted (zero dead artifacts)."""
+    """Tear down an attempt that leaves nothing to merge (ESCALATE / a poisoned
+    worktree): worktree removed + branch deleted (zero dead artifacts)."""
 
     if implement and repo is not None and branch is not None:
         wt.discard_attempt(repo, scratch, branch)
-
-
-def _blocked_reason(handoff: Handoff) -> str:
-    return "; ".join(handoff.not_done) or handoff.resulting_state or "worker reported BLOCKED"

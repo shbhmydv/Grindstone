@@ -2,10 +2,14 @@
 
 A test double for the loop's worker seam. The script is a list of behaviors
 consumed one entry per ``run()`` call, so a test pins the exact failure sequence
-with zero randomness: ``["rate_limit", "bad_json", "ok"]`` raises, then writes
-garbage, then behaves. ``fuzz_script`` generates seeded unscripted sequences for
-the one fuzz test that proves the loop always terminates (the only sanctioned
+with zero randomness: ``["rate_limit", "empty", "ok"]`` raises, then leaves no
+work, then behaves. ``fuzz_script`` generates seeded unscripted sequences for the
+one fuzz test that proves the loop always terminates (the only sanctioned
 randomness).
+
+The worker writes a FREE-FORM ``handoff.md`` report (never a JSON schema): the
+state machine gates the deterministic facts (the committed diff / the produced
+artifact), and the critic reads the report as prose.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ from dataclasses import dataclass, field
 
 from grindstone.worker import (
     CRITIC_VERDICT_FILENAME,
-    REVIEW_FILENAME,
+    HANDOFF_FILENAME,
     RateLimited,
     TransportError,
     WorkerRequest,
@@ -28,7 +32,7 @@ from grindstone.worker import (
 #: scriptable behavior too (a quota window: the driver parks and retries rather
 #: than burning the attempt) but is kept OUT of ``BEHAVIORS`` so the fuzz generator
 #: never emits it (a real park would make the termination-fuzz test sleep).
-BEHAVIORS: tuple[str, ...] = ("ok", "rate_limit", "bad_json", "empty", "timeout")
+BEHAVIORS: tuple[str, ...] = ("ok", "rate_limit", "empty", "timeout")
 
 #: The critic-dispatch vocabulary (consumed when a run carries a ``CriticBrief``):
 #: the lenient triage outcome the mock writes to ``verdict.json``, plus ``no_verdict``
@@ -36,35 +40,31 @@ BEHAVIORS: tuple[str, ...] = ("ok", "rate_limit", "bad_json", "empty", "timeout"
 CRITIC_OUTCOMES: tuple[str, ...] = ("PASS", "RETRY", "ESCALATE", "no_verdict")
 
 
-def _valid_handoff(
-    request: WorkerRequest, cited: list[str], *, status: str = "DONE"
-) -> dict[str, object]:
-    """A schema- and semantic-valid handoff for the dispatched task."""
+def _handoff_md(request: WorkerRequest, *, blocked: bool = False) -> str:
+    """A short free-form worker report. ``blocked`` flavors it as an environmental
+    blocker the worker could not resolve (the critic reads this prose and ESCALATEs)."""
 
-    return {
-        "schema_version": "1",
-        "task_id": request.task_id,
-        "status": status,
-        "what_changed": [{"kind": "file", "ref": f} for f in cited],
-        "resulting_state": "toy work complete"
-        if status == "DONE"
-        else "toy worker reported a blocker",
-        "downstream_needs": [],
-        "not_done": [] if status == "DONE" else ["a host dependency the worker may not install"],
-        "citations": [{"file": f} for f in cited],
-        "checks": [{"check": "self-check", "exit_code": 0}],
-        "occupancy": {"compacted": False, "subagent_splits": 0},
-    }
+    if blocked:
+        return (
+            f"# handoff {request.task_id}\n\n"
+            "BLOCKED: a host dependency I may not install stopped me; this needs a "
+            "human decision. I could not finish the work.\n"
+        )
+    return (
+        f"# handoff {request.task_id}\n\n"
+        "Did the work; everything is DONE. Files touched are listed in the diff / "
+        "artifact. Grounded in the real files.\n"
+    )
 
 
 @dataclass
 class MockWorker:
     """A worker whose every ``run()`` follows the next scripted behavior.
 
-    ``artifacts`` maps a scratch-relative path to its content; on ``ok`` the worker
-    writes them (the files the handoff citations point at) and emits a valid
-    handoff. The script must be long enough for the calls the loop will make;
-    running past its end raises.
+    ``artifacts`` maps a scratch-relative path to its content; on ``ok`` / ``blocked``
+    the worker writes them (the implement files or the non-write artifact_out) and a
+    free-form ``handoff.md`` report. The script must be long enough for the calls the
+    loop will make; running past its end raises.
     """
 
     script: list[str]
@@ -80,43 +80,31 @@ class MockWorker:
             self._critic(request, behavior)
             return
 
-        handoff = request.scratch / "handoff.json"
+        handoff = request.scratch / HANDOFF_FILENAME
 
         if behavior in ("rate_limit", "session_limit"):
             raise RateLimited(f"mock {behavior}")
-        if behavior == "bad_json":
-            handoff.write_text("{ this is not valid json", encoding="utf-8")
-            return
         if behavior == "empty":
+            # No work and no report: a zero-diff / missing-artifact gate failure.
             return
         if behavior == "timeout":
-            # Hung-then-killed: a partial file lands, then the supervisor kills the
+            # Hung-then-killed: a partial report lands, then the supervisor kills the
             # worker. No real sleep, the kill is modelled as a raise.
-            handoff.write_text('{"schema_version": "1"', encoding="utf-8")
+            handoff.write_text("# handoff (partial", encoding="utf-8")
             raise TransportError("mock hang killed")
         if behavior in ("ok", "blocked"):
-            cited = self._write_artifacts(request)
-            if request.mode == "implement" and behavior == "ok":
-                # A compliant implement worker self-reviews before handing off.
-                (request.scratch / REVIEW_FILENAME).write_text(
-                    "mock review: no findings\n", encoding="utf-8"
-                )
-            status = "DONE" if behavior == "ok" else "BLOCKED"
+            self._write_artifacts(request)
             handoff.write_text(
-                json.dumps(_valid_handoff(request, cited, status=status)),
-                encoding="utf-8",
+                _handoff_md(request, blocked=behavior == "blocked"), encoding="utf-8"
             )
             return
         raise ValueError(f"unknown mock behavior: {behavior!r}")
 
-    def _write_artifacts(self, request: WorkerRequest) -> list[str]:
-        cited: list[str] = []
+    def _write_artifacts(self, request: WorkerRequest) -> None:
         for rel, content in self.artifacts.items():
             path = request.scratch / rel
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
-            cited.append(rel)
-        return cited
 
     def _critic(self, request: WorkerRequest, outcome: str) -> None:
         """Write the scripted critic ``verdict.json`` (or, for ``no_verdict``,
@@ -137,15 +125,15 @@ class LoopWorker:
     """A concurrency-safe loop test double (the flat-script ``MockWorker`` is
     positional, so it cannot drive an epoch's CONCURRENT fan-out). Every worker
     dispatch writes exactly the files the task CLAIMS (each ``file_ownership`` path
-    for implement, the ``artifact_out`` for non-write), so the scope + citation gates
-    pass by construction, and emits a DONE handoff; every critic dispatch writes the
-    same ``critic_outcome`` (default ``PASS``). No positional cursor, so concurrent
-    tasks never race.
+    for implement, the ``artifact_out`` for non-write), so the deterministic gate
+    passes by construction, plus a free-form ``handoff.md`` report; every critic
+    dispatch writes the same ``critic_outcome`` (default ``PASS``). No positional
+    cursor, so concurrent tasks never race.
 
     Knobs: ``read_cite`` makes a non-write task READ a file from the integration-tip
-    ``read_root`` and fold it into its artifact + citations (the integration-tip-read
-    proof); ``rate_limit_once`` makes the FIRST worker dispatch raise ``RateLimited``
-    exactly once (the node-#1 park + epoch-restart proof), then behave.
+    ``read_root`` and fold it into its artifact (the integration-tip-read proof);
+    ``rate_limit_once`` makes the FIRST worker dispatch raise ``RateLimited`` exactly
+    once (the node-#1 park + epoch-restart proof), then behave.
     """
 
     critic_outcome: str = "PASS"
@@ -171,7 +159,6 @@ class LoopWorker:
                     raise RateLimited("loop mock first-dispatch rate limit")
 
         task = request.task
-        cited: list[str] = []
         if request.mode == "implement":
             for rel in task.file_ownership:
                 path = request.scratch / rel
@@ -179,10 +166,6 @@ class LoopWorker:
                 # Content keyed on the task id so each epoch's commit is a real diff.
                 path.write_text(f"# {request.task_id}\nvalue = {request.task_id!r}\n",
                                 encoding="utf-8")
-                cited.append(rel)
-            (request.scratch / REVIEW_FILENAME).write_text(
-                "loop review: no findings\n", encoding="utf-8"
-            )
         else:
             assert task.artifact_out is not None
             body = f"# artifact {request.task_id}\n"
@@ -190,14 +173,12 @@ class LoopWorker:
                 assert request.read_root is not None, "non-write task needs a read_root"
                 tip = (request.read_root / self.read_cite).read_text(encoding="utf-8")
                 body += f"reviewed integration-tip file {self.read_cite}:\n{tip}"
-                cited.append(self.read_cite)  # resolves against read_root (the tip)
             out = request.scratch / task.artifact_out
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(body, encoding="utf-8")
-            cited.append(task.artifact_out)
 
-        (request.scratch / "handoff.json").write_text(
-            json.dumps(_valid_handoff(request, cited)), encoding="utf-8"
+        (request.scratch / HANDOFF_FILENAME).write_text(
+            _handoff_md(request), encoding="utf-8"
         )
 
 
@@ -217,17 +198,16 @@ def fuzz_script(seed: int, length: int) -> list[str]:
 #: task's outcome is a PURE function of ``(seed, task_id)`` (a per-task
 #: ``random.Random``), so the result is deterministic regardless of the order
 #: concurrent fan-out threads dispatch in, AND stable across a rate-limit
-#: epoch-restart (which re-enters ``run_task`` fresh). The four map onto the loop's
-#: real routes: ``pass`` -> merged; ``retry_pass`` -> a FAILED first attempt then a
-#: DONE retry (the bounded same-tier self-heal); ``failed`` -> FAILED every attempt
-#: (retries exhaust -> escalated to the planner); ``blocked`` -> a worker-reported
-#: BLOCKED (straight to the planner, critic skipped).
-STOCHASTIC_OUTCOMES: tuple[str, ...] = ("pass", "retry_pass", "failed", "blocked")
+#: epoch-restart (which re-enters ``run_task`` fresh). The three map onto the loop's
+#: real routes: ``pass`` -> merged; ``retry_pass`` -> a failed first attempt then a
+#: clean retry (the bounded same-tier self-heal); ``failed`` -> no work every attempt
+#: (retries exhaust -> escalated to the planner).
+STOCHASTIC_OUTCOMES: tuple[str, ...] = ("pass", "retry_pass", "failed")
 
 #: Default outcome weights: mostly-pass with a tail of self-heals + hard failures,
 #: so a multi-epoch run converges most of the time while every failure route is
 #: exercised across a seed sweep.
-DEFAULT_OUTCOME_WEIGHTS: tuple[float, float, float, float] = (0.6, 0.2, 0.1, 0.1)
+DEFAULT_OUTCOME_WEIGHTS: tuple[float, float, float] = (0.6, 0.2, 0.2)
 
 
 @dataclass
@@ -242,15 +222,17 @@ class StochasticWorker:
 
     Retry is detected statelessly from ``request.failure_context`` (a retry attempt
     carries the prior rejection), so no per-task counter can drift across a restart.
-    Every DONE handoff writes exactly what the task CLAIMS (each ``file_ownership``
-    path + ``review.md`` for implement, the ``artifact_out`` for a non-write task),
-    so the scope + citation gates pass by construction; the critic dispatch always
-    rubber-stamps PASS (a DONE handoff here is honest work, the rubber-stamp SAFETY
-    net is tested separately against a critic that passes BROKEN work).
+    A clean outcome writes exactly what the task CLAIMS (each ``file_ownership`` path
+    for implement, the ``artifact_out`` for a non-write task) plus a free-form
+    ``handoff.md``, so the deterministic gate passes by construction; a ``failed``
+    outcome writes NOTHING (a zero-diff / missing-artifact gate failure that exhausts
+    to an escalate). The critic dispatch always rubber-stamps PASS (a clean outcome
+    here is honest work; the rubber-stamp SAFETY net is tested separately against a
+    critic that passes BROKEN work).
     """
 
     seed: int
-    weights: tuple[float, float, float, float] = DEFAULT_OUTCOME_WEIGHTS
+    weights: tuple[float, float, float] = DEFAULT_OUTCOME_WEIGHTS
     rate_limit_once: bool = False
     _rl_fired: bool = False
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -274,26 +256,20 @@ class StochasticWorker:
 
         outcome = self._outcome(request.task_id)
         is_retry = bool(request.failure_context)
-        if outcome == "blocked":
-            status = "BLOCKED"
-        elif outcome == "failed":
-            status = "FAILED"
-        elif outcome == "retry_pass":
-            status = "DONE" if is_retry else "FAILED"
-        else:
-            status = "DONE"
-
-        cited = self._write_work(request) if status == "DONE" else []
-        (request.scratch / "handoff.json").write_text(
-            json.dumps(_valid_handoff(request, cited, status=status)), encoding="utf-8"
+        clean = outcome == "pass" or (outcome == "retry_pass" and is_retry)
+        if not clean:
+            # No work and no report: the deterministic gate rejects the attempt.
+            return
+        self._write_work(request)
+        (request.scratch / HANDOFF_FILENAME).write_text(
+            _handoff_md(request), encoding="utf-8"
         )
 
-    def _write_work(self, request: WorkerRequest) -> list[str]:
-        """Write exactly the claimed deliverables for a DONE handoff (mirrors the
-        ``LoopWorker`` happy path) and return the citation paths."""
+    def _write_work(self, request: WorkerRequest) -> None:
+        """Write exactly the claimed deliverables (mirrors the ``LoopWorker`` happy
+        path) so the deterministic gate passes."""
 
         task = request.task
-        cited: list[str] = []
         if request.mode == "implement":
             for rel in task.file_ownership:
                 path = request.scratch / rel
@@ -302,17 +278,11 @@ class StochasticWorker:
                     f"# {request.task_id}\nvalue = {request.task_id!r}\n",
                     encoding="utf-8",
                 )
-                cited.append(rel)
-            (request.scratch / REVIEW_FILENAME).write_text(
-                "stochastic review: no findings\n", encoding="utf-8"
-            )
         else:
             assert task.artifact_out is not None
             out = request.scratch / task.artifact_out
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(f"# artifact {request.task_id}\n", encoding="utf-8")
-            cited.append(task.artifact_out)
-        return cited
 
 
 class SimulatedKill(BaseException):

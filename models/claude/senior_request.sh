@@ -11,16 +11,14 @@
 # different web-search stack) goes in models/personal/senior_request.sh (gitignored,
 # highest priority).
 #
-# The agent writes handoff.json into the worktree (the ONLY result channel); we
-# propagate claude's exit code and forward stderr so the caller can grep
-# `rate|limit|429`. local and senior use the SAME model (Opus); they differ only by
+# The agent commits its work / writes its artifact in the worktree (the gate) plus a
+# free-form handoff.md report; we propagate claude's exit code and forward stderr so the
+# caller can grep `rate|limit|429`. local and senior use the SAME model (Opus); they differ only by
 # ROLE WORDING (below), per the owner's "Opus handling all" decision.
 set -euo pipefail
 
 # Portable timeout prefix (resolves `timeout`, else `gtimeout`, else none).
 source "$(dirname "$0")/../_common/_timeout_prefix.sh"
-# guarantee_handoff: synthesize a FAILED handoff if the agent left none.
-source "$(dirname "$0")/../_common/_handoff_guarantee.sh"
 
 # Model identity is THIS script's concern. Override via $GRINDSTONE_SENIOR_MODEL.
 model="${GRINDSTONE_SENIOR_MODEL:-opus}"
@@ -46,7 +44,6 @@ done
 
 # Resolve paths to absolute BEFORE we cd into the worktree.
 worktree="$(cd "$worktree" && pwd)"
-prompt_text="$(cat "$prompt")"
 mkdir -p "$log_dir"; log_dir="$(cd "$log_dir" && pwd)"
 mkdir -p "$(dirname "$handle_out")"
 handle_out="$(cd "$(dirname "$handle_out")" && pwd)/$(basename "$handle_out")"
@@ -55,7 +52,7 @@ handle_out="$(cd "$(dirname "$handle_out")" && pwd)/$(basename "$handle_out")"
 pgid="$(ps -o pgid= -p $$ | tr -d '[:space:]')"
 echo "$pgid" > "$handle_out"
 
-# CWD = worktree (where the agent writes handoff.json); fence git's upward repo
+# CWD = worktree (where the agent writes its work + handoff.md); fence git's upward repo
 # discovery at the worktree's parent (ports the GIT_CEILING_DIRECTORIES scar).
 export GIT_CEILING_DIRECTORIES="$(dirname "$worktree")"
 cd "$worktree"
@@ -70,7 +67,7 @@ build_timeout_prefix "$timeout"
 # The worktree is an isolated, throwaway checkout, so --dangerously-skip-permissions
 # (full tool access incl. web search/fetch + Bash) is safe and required for a
 # headless run that never blocks on a permission prompt.
-sys_append="You are the SENIOR escalation worker for a grindstone task. Investigate thoroughly: use web search when researching, and INDEPENDENTLY re-derive the claims you judge rather than merely confirm expected sections exist. Work only inside this worktree (your CWD): write every file with a path RELATIVE to your CWD, never an absolute path and never outside it, run the done_when checks, and write handoff.json exactly as the task instructs."
+sys_append="You are the SENIOR escalation worker for a grindstone task. Investigate thoroughly: use web search when researching, and INDEPENDENTLY re-derive the claims you judge rather than merely confirm expected sections exist. Work only inside this worktree (your CWD): write every file with a path RELATIVE to your CWD, never an absolute path and never outside it, COMMIT your work, run the done_when checks, and write a short free-form handoff.md report for the reviewer exactly as the task instructs."
 
 # The prompt is fed to claude on STDIN (`claude -p` reads the prompt from stdin),
 # never as an argv string: a large prior-failure context could otherwise exceed
@@ -102,12 +99,10 @@ if [[ "$rc" -ne 0 ]] \
   exit "$rc"
 fi
 
-# Otherwise GUARANTEE a handoff before returning (no-op if the agent wrote one,
-# else a synthesized schema-valid FAILED handoff with a diagnosis + log tails),
-# then exit 0 so grindstone reads it instead of retrying a missing handoff blind.
-guarantee_handoff "$worktree" "$prompt_text" "$log_out" "$log_err" "$rc"
-
+# Otherwise propagate claude's exit code. The worker is gated on its committed diff /
+# produced artifact, NOT a handoff file, so a non-rate-limit non-zero exit is a real
+# transport failure: grindstone retries the attempt, then escalates to the planner.
 if [[ "$rc" -ne 0 ]]; then
-  echo "senior_request: claude exited $rc (model=$model); synthesized/kept a FAILED handoff" >&2
+  echo "senior_request: claude exited $rc (model=$model)" >&2
 fi
-exit 0
+exit "$rc"

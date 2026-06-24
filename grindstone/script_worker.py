@@ -6,8 +6,9 @@ script owns transport, model identity, GPU arbitration and the killable process
 group. ``ScriptWorker`` builds the prompt (worker OR critic, via ``build_prompt``),
 ``Popen``s the script as a group leader, supervises wall-clock, and on timeout
 delegates the kill to ``stop.sh``. The disk is the only result channel: on success
-``run`` returns and ``run_task`` reads ``handoff.json`` / ``verdict.json`` from the
-scratch; stdout is never parsed.
+``run`` returns and ``run_task`` gates the worker's committed diff / produced
+artifact (reading its free-form ``handoff.md``) or reads the critic's
+``verdict.json`` from the scratch; stdout is never parsed.
 
 BONES drops the v7 SessionLimited node: a non-zero exit whose output names a rate /
 quota limit raises ``RateLimited`` (the loop parks ~1/hr, failure model #1); every

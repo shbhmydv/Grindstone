@@ -571,9 +571,7 @@ def _carry(results: list[TaskResult], integration: _Integration) -> tuple[str, .
 
     out: list[str] = []
     for result in results:
-        if result.outcome == "blocked":
-            out.append(f"{result.task_id} BLOCKED: {result.reason}")
-        elif result.outcome == "escalated":
+        if result.outcome == "escalated":
             out.append(f"{result.task_id} escalated: {result.reason}")
     if integration.conflict is not None:
         out.append(integration.conflict)
