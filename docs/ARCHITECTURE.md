@@ -1,22 +1,63 @@
 # Grindstone Architecture
 
 Grindstone is an **epoch-based deep-work orchestrator**. You hand it a job spec;
-a strong cloud planner proposes one small, verifiable epoch at a time; local
-workers fan out and grind through the tasks; deterministic checks and disk
-contracts gate everything; and the loop repeats until the job's exit criteria
-pass. It is Python with Pydantic at every boundary and `mypy --strict` clean.
+a stateless planner proposes one small epoch at a time; workers fan out and grind
+through the epoch's tasks in isolated git worktrees; an independent critic triages
+each task; and the loop repeats until the planner declares the job done. It is
+Python with Pydantic at every boundary and `mypy --strict` clean.
+
+It is a subagent that does not lose context, does not have to be babysat, and uses
+cheap local compute when the work is checkable. Nothing more.
 
 ## The thesis: model proposes, state machine disposes
 
-The differentiator is the loop itself. It is **not** a stateful "leader" model
-that owns the run and drifts over a long horizon. It is a fixed, deterministic
-state machine with provable invariants (termination, no orphaned tasks, budget
-caps). The only model that steers the run, the planner, is a **stateless
-one-shot call**: Grindstone reconstructs its full input from durable state every
-time, so model drift has nowhere to accumulate. The model *proposes* one decision
-as constrained JSON; the state machine *validates and disposes* of it,
-re-evaluates every check itself, and never takes a model's word that a task or
-phase is done.
+The differentiator is the loop itself. It is **not** a stateful "leader" model that
+owns the run and drifts over a long horizon. The only model that steers the run,
+the planner, is a **stateless one-shot call**: each boundary Grindstone
+reconstructs its full input fresh from durable disk state, so context is
+re-derived, never accumulated, and no window rots or goes quadratic. The model
+*proposes* one decision as constrained JSON; the state machine *validates and
+disposes* of it.
+
+Python here is a pure function of disk state plus a handful of enum/boolean
+signals, mapping to the next node. It makes **no quality judgment**. It owns
+exactly:
+
+- the synchronous state machine (the epoch loop, the two failure nodes, resume);
+- **two deterministic invariants** and nothing more (the disjoint-ownership merge
+  of the git diff, and one final acceptance running the job's own `done_when`
+  once);
+- the durable append-only event log, rebuild-from-disk, and crash-only resume;
+- assembling the planner's bounded fresh-from-disk context (it **lists**
+  references, never summarizes them);
+- the trust boundary (the untrusted worker confined to its worktree, host-global
+  mutations only from the trusted planner's declared list, and an RCE guard on
+  every configured repo script);
+- infra (spawning rig subprocesses, the worktree lifecycle, per-backend
+  semaphores, relocating artifacts and handoffs, rendering the journal).
+
+Every other judgment (is this code good, is this research grounded, is this task
+done or blocked or retryable) is delegated to a model.
+
+## The five properties that define it
+
+1. **Externalized context.** No model holds the whole history. The memory is the
+   git tip plus the durable keyed log plus the event log. Each epoch reconstructs
+   a bounded, fresh window from disk: the job, the integration-tip file list, the
+   keyed-log index, and the prior epoch's carried failures. The planner is
+   stateless per call.
+2. **Local when it can.** Per-task tier: `local` (Qwen) for mechanical or
+   checkable work, `senior` (Claude) for judgment and taste. The planner picks the
+   tier; Python just maps it to a rig.
+3. **Right skills.** A repo-owned domain-skill catalogue, selected per task.
+   Retrieve, do not concatenate.
+4. **Verifiable checkpoints.** Every step is gated by exactly two deterministic
+   invariants plus an agentic review. The worker writes a free-form report the
+   critic reads; the state machine never parses or schema-gates it. Deterministic
+   facts (git, file existence) and one lenient verdict are the only things Python
+   disposes on, so a run can be trusted and left alone.
+5. **Parallel fan-out.** Multiple workers per epoch on disjoint file ownership.
+   The throughput win and the local-GPU leverage.
 
 ## The three roles, each behind a script
 
@@ -27,329 +68,261 @@ entirely in `models/`.
 
 | role | what it does | shipped default adapter (`models/claude/`) |
 |---|---|---|
-| **planner** | plans one epoch at a time as a constrained tool-call | `planner_request.sh` → Claude (Opus) via `claude -p`, read-only |
-| **worker** | the on-rig grinders that fan out across an epoch's tasks | `worker_request.sh` → Claude (Opus) via `claude -p` in the worktree |
-| **senior** | optional escalation / web-research / taste tier | `senior_request.sh` → Claude (Opus) via `claude -p`, web search on |
+| **planner** | proposes one epoch at a time as constrained JSON | `planner_request.sh` -> Claude (Opus) via `claude -p`, read-only |
+| **worker** | the on-rig grinders that fan out across an epoch's tasks | `worker_request.sh` -> Claude (Opus) via `claude -p` in the worktree |
+| **senior** | optional judgment / taste / synthesis tier | `senior_request.sh` -> Claude (Opus) via `claude -p`, web search on |
+
+There is **one executor role**: a `senior`-tier task reuses the same worker
+prompts (the tier only selects which rig script runs it). The critic is dispatched
+on the task's own tier.
 
 `models/` is layered as a rig stack: `claude/` is the tracked Claude rig (the
-shipped floor) a fresh clone runs with zero setup; `codex/` is a bundled
-alternative (a `codex exec` planner, opt in via `grindstone init --rig codex`);
-and `personal/` (gitignored) is the operator's personal per-file rig. Resolution
-splits on whether a rig is named: an explicit `--rig codex` searches `codex/`
-then the `claude/` floor (never `personal/`, so a selected rig is exact and
-reproducible), while the implicit default searches `personal/` then `claude/`,
-letting the operator's scripts win where present. Either way `init` bakes the
-absolute resolved path into `.grindstone/config.yaml`. `stop.sh` +
-`_timeout_prefix.sh` are backend-agnostic kill/timeout helpers under `_common/`,
-the shared-helper floor under both modes. Two optional scripts back the taste
-features when a rig supplies them: `vision_review.sh` (the screenshot-judge gate)
-and `codex_polish.sh` (the final-polish pass). All scripts are **reference
-adapters**: point them at your own backends, or drop a replacement into
-`personal/`. The per-repo `.grindstone/config.yaml` names each role's script plus
-its `slots` (per-role concurrency) and `timeout_s`; `planner` + `worker` are
-required, `senior` is optional (its absence means a worker-only escalation ladder).
+shipped floor) a fresh clone runs with zero setup; `local/` is a bundled all-Qwen
+rig; and `personal/` (gitignored) is the operator's personal per-file rig.
+Resolution splits on whether a rig is named: an explicit rig (e.g. `--rig local`)
+searches `[rig, claude, _common]`, never `personal/`, so a selected rig is exact
+and reproducible; the implicit default searches `[personal, claude, _common]`,
+letting the operator's scripts win where present. `_common/` (e.g. `stop.sh`) is
+the shared-helper floor under both modes. The per-repo `.grindstone/config.yaml`
+names each role by a bundled `rig:` name OR an explicit `script:` path, plus its
+`slots` (per-role concurrency) and `timeout_s`; `planner` + `worker` are required,
+`senior` is optional (its absence falls every tier back to the worker rig).
 
 `grindstone/config.py` loads that YAML into a frozen, unknown-key-rejecting
 Pydantic object, and refuses any configured `script:` path that does not resolve
 under the bundled `models/` dir (a cloned repo's config is attacker-controlled,
 and every configured script is executed) unless `GRINDSTONE_ALLOW_REPO_SCRIPTS=1`
-opts a trusted repo in.
+opts a trusted repo in. The core ships no rig-specific defaults: an absent config
+is a hard error toward `grindstone init`.
 
 ## The run lifecycle
 
-The spine is `grindstone/run_loop.py` (`run_grind` / `resume_grind`), driving a
-stateless planner against the deterministic core:
+The spine is `grindstone/loop.py` (`start_run` / `resume_run`), a synchronous,
+deterministic loop. There are **no phases, no skeleton, no exit criteria, and no
+epoch budget**: the stateless planner self-steers, one epoch at a time, until the
+job is met.
 
 ```
-loop:
-  input    = stable_head(job, skeleton) + volatile_tail(state, last_epoch, request)
-  raw      = planner.plan(input)                         # role script → cloud model
-  decision = extract → schema → typed → semantic → position-legality  (re-ask ≤ 2)
-  dispatch on tool name:
-    propose_skeleton → store the phase skeleton (legal only as the first decision)
-    implement | research | review | artifact → run one epoch; its report feeds the next call
-    revise_phases    → replace the current phase onward
-    escalate_run     → terminal: hand to a human
-    complete_run     → re-run the evidence checks deterministically;
-                       pass → success, fail → re-ask with the failing evidence
+loop (until the planner ends or the max-epochs backstop fires):
+  context  = job + integration tip (file list) + keyed-log index + carried failures
+  decision = planner.decide(context)          # ONE typed Decision, self-validated on disk
+  if decision is END:
+    run the one final acceptance (job done_when) ONCE
+    pass -> completed ; otherwise -> a clean partial-end (resumable)
+  else (an EPOCH of 1..8 disjoint tasks):
+    run the planner-declared setup commands (the trusted host-mutation seam)
+    fan the tasks out (tier-routed, each in its own worktree):
+      worker grinds -> writes a free-form handoff.md report in its CWD
+      deterministic gate (in-scope commit, or the artifact exists)
+      tier-matched critic reads the report + the diff/artifact -> a lenient verdict
+        PASS -> merge-ready ; RETRY -> bounded same-tier retry ; ESCALATE -> the planner
+    integrate the PASSing implement tasks by the disjoint-ownership merge invariant
+    fast-forward the durable run branch (only on epoch completion)
+    carry any non-merged outcome forward as context for the next boundary
 ```
-
-### Skeleton and phases
-
-The first decision is always `propose_skeleton`, which lays down a 2-10 phase
-skeleton. Each phase carries an `exit_criterion` and an `epoch_budget`. The
-`exit_criterion` is a **build-health floor**, not an auto-pass gate: on every loop
-pass, once a skeleton exists, the core freshly evaluates it **against the
-integration tip** in a throwaway worktree, but a green floor never ends a phase on
-its own; it is a regression signal surfaced to the planner each call. A phase ends
-only when the **planner** emits `phase_complete`, judging the phase GOAL met
-against the cumulative repo state and citing the concrete deliverables that satisfy
-it; the core then re-checks each cited deliverable EXISTS at the tip (existence
-only, never a quality judgement) and bounces the decision back to planning if any
-is missing. The last phase completing does *not* auto-complete the run; the planner
-still owns `complete_run`. A phase whose budget is exhausted with its floor still
-red fires a one-shot **phase escalation**, after which only `revise_phases` /
-`escalate_run` are legal until it clears.
 
 ### Epochs and tasks
 
-Each work decision opens one **epoch** (`grindstone/epoch_loop.py`): 1-8
-independent tasks fan out on a bounded thread pool, each running the single-task
-state machine in `grindstone/task_loop.py`:
+A **decision** is one of two shapes (`grindstone/contracts/models.py`): an
+**epoch** (a titled bundle of 1 to 8 independent tasks) or an **end** (a summary
+that seeds the next appendable run). Each task carries an `id` (`T1`..`T8`), a
+`mode` (`implement` / `research` / `review` / `artifact`), a routing `tier`
+(`local` default, `senior` for judgment), a prose `goal` that states its own
+notion of done, and the disk-shape fields the orchestrator needs to isolate and
+merge it (`file_ownership` for implement, `artifact_out` for the rest, plus
+optional `skills` and `inputs`). There is no rigid acceptance schema: semantic
+acceptance is judged agentically by the critic against the task's own claimed goal.
 
-- **implement** tasks each grind in a fresh per-attempt git worktree branched
-  from the epoch base. On a successful handoff the **core** (never the model)
-  commits the worktree and checks that every committed path falls inside the
-  task's `file_ownership` globs. Because ownership is pairwise-disjoint and
-  scope-checked, integration is fast-forward merges in task order that *cannot
-  conflict*; any conflict is treated as a structural bug and aborts the epoch.
-  A passed epoch fast-forwards one durable run branch, `grind/{run_id}` (the only
-  ref that survives a boundary); the per-attempt and per-epoch staging branches
-  all live under a transient `grind-wip/*` namespace and are pruned once their
-  work is absorbed into the run branch.
+Tasks fan out concurrently (`grindstone/loop.py`), bounded by the per-backend
+semaphores (below), not a global pool:
+
+- **implement** tasks each grind in a fresh per-attempt git worktree branched from
+  the epoch base. After the grind the **core** (never the model) commits the
+  worktree and deterministically checks that every committed path falls inside the
+  task's `file_ownership` globs; a zero-diff or out-of-scope commit is a failed
+  attempt. A passed epoch fast-forwards one durable run branch, `grind/<run-id>`
+  (the only ref that survives a boundary); per-attempt and per-epoch staging
+  branches all live under a transient `grind-wip/*` namespace and are pruned once
+  their work is absorbed.
 - **research / review / artifact** tasks run in a plain run-dir scratch directory
   with no worktree and no git: a non-write task is never handed the live repo as
-  its CWD. They publish their `artifact_out` to the keyed log.
+  its CWD. They publish their `artifact_out` to the keyed log. A non-write task is
+  given a read-only checkout of the integration tip (`_read_tip`) to read and cite,
+  so it sees what prior epochs built, not the stale base.
 
-A task gets up to three attempts on its starting tier, then one attempt per
-higher ladder rung; exhausting the ladder marks it FAILED and the epoch
-continues. Each task picks its own starting tier by its `senior` flag: a
-`senior: true` task (judgment / taste / synthesis) starts on the senior tier when
-one exists, everything else starts on the worker tier. A same-tier retry bases its
-worktree on the prior attempt's branch (keeping that work, the worker may fix it
-in place or reset and redo); a first attempt and a tier escalation start fresh from
-the epoch base.
+A task gets a small bounded **same-tier retry** (`MAX_ATTEMPTS`, currently 2);
+there is **no tier escalation**. A retry that the critic asked for inherits the
+prior attempt's committed work-in-progress (chained off the prior wip branch); an
+out-of-scope write poisons its worktree and the retry instead restarts clean. When
+the retries are exhausted, the task escalates and becomes context the planner
+handles next boundary.
 
-### The handoff disk contract
+### The two deterministic invariants
 
-Every worker writes `handoff.json` **in its own CWD** and self-validates it.
-Grindstone relocates that file to the task's log key and re-validates it from
-scratch: schema → typed parse → semantic rules → a **grounding spot-check** that
-every cited `{file, line}` actually exists → a re-run of the task's `done_when`.
-Only a `DONE` handoff whose checks all pass is accepted; any failure deletes the
-relocated record (zero dead artifacts) and re-queues the attempt. **Stdout is
-never parsed**; the disk file is the only result channel.
+Python disposes on exactly two deterministic checks. Everything else is grounded
+and judged agentically.
 
-The worker owns a narrow lane: it edits ONLY files within its `file_ownership`
-(or, for a non-write task, only its CWD), writing every path RELATIVE to that CWD,
-never to an absolute path and never outside the worktree (the executor prompt
-carries this worktree-isolation contract explicitly, since a worker that strips its
-CWD back to the repo root must not be able to reach the real checkout). Grindstone
-(the core) owns all git
-staging and committing and may keep its own bookkeeping files in the tree, so the
-worker must NOT git-commit, must NOT touch orchestration files, and "working tree
-clean" is grindstone's concern, never the worker's. Because a *missing*
-`handoff.json` would otherwise make grindstone retry blind, the role scripts
-guarantee one: if the agent exits (out of turn budget, a crash) without writing a
-handoff, the script synthesizes a schema-valid `FAILED` handoff carrying a
-diagnosis and a tail of the agent logs, and exits 0 so the core consumes it as a
-reasoned failed attempt. A genuine infra failure (rate limit / 429) is exempt: it
-keeps propagating a non-zero exit so the transport raises `RateLimited`.
+1. **Disjoint-ownership merge** (`_integrate`, `_ownership_overlap`). Parallel
+   implement tasks declare the files they own; the core enforces that each wrote
+   only within its declared globs and that the realized ownership is pairwise
+   disjoint, then fast-forward-merges the passing wip branches (in task order) onto
+   a staging branch and fast-forwards the durable run branch to it. An ownership
+   overlap or a merge conflict aborts integration as a hard error (carried to the
+   planner, the run branch left untouched). This is the one check that prevents
+   silent corruption. The artifact analogue is enforced at parse time: two tasks
+   may not declare the same `artifact_out`.
+2. **One final acceptance** (`make_acceptance`). When the planner emits END,
+   Grindstone checks out the integration tip in a throwaway worktree and runs the
+   job's own `done_when` **once**: exit 0 means the run is `completed`; any other
+   exit makes the END a clean partial-end (`ended`) whose summary seeds the next
+   run. This is deliberately the **only** deterministic build gate; it exists so
+   "done" still means something when every per-epoch check is agentic. When no
+   `done_when` is configured, the planner's END is trusted.
 
-### Deterministic gates
+There is **no per-epoch build gate**. Intermediate red is by design: epoch 1 may
+write a module epoch 2 will build against. Only judgment can tell "incrementally
+incomplete" from "broken", so between-epoch build-health is carried as context the
+critic notes and the next epoch resolves, never a deterministic gate.
 
-`run_loop.evaluate_checks` is the single evaluator behind both phase exit
-criteria and `complete_run` evidence: command checks run in a tip worktree,
-`artifact_exists` checks resolve against the keyed log, and `vision_review`
-checks render a verdict (below). `complete_run` is never trusted on the planner's
-word; its `evidence` is re-run deterministically and the completion is rejected
-(and re-asked) if anything fails.
+### The critic: triage, not grade
 
-## Gate rebalance: three verification sources
+A gate-clean attempt always runs the **tier-matched critic** (an independent
+agentic pass that did not write the work). It **routes**, it does not grade,
+emitting a lenient `Verdict` (an `outcome` enum plus a free-text reason):
 
-Three consecutive dogfood failures were the same shape: a planner-authored
-`done_when` failed for an *environmental* reason while the work itself was
-correct (a build gate re-run with no `node_modules`, a `test -f package-lock.json`
-on a partial attempt, a `rg`-based content-grep returning exit 127 because
-ripgrep is not a host binary). The planner is a poor author of verification
-commands, so it stops authoring them. Verification now splits into three sources
-by *who owns each*, and a failure is classified before it is charged to anyone.
+- **PASS** (including good-enough-with-notes): merge; notes carry forward. Minor
+  imperfections are carried information, not a gate. The critic biases here when
+  unsure.
+- **RETRY**: a defect the **same** worker can plausibly fix (a typo, a wrong value,
+  a missing piece). The bounded same-tier retry.
+- **ESCALATE**: anything the worker cannot fix on its own (a missing dependency, an
+  ambiguous or wrong spec, a decision needed, an environmental blocker). Routes to
+  the planner.
 
-1. **The deterministic floor** (repo config + core invariants). The floor is
-   owned by the repo and the core, never the planner. The **core invariants** run
-   on every gate: the worktree is clean (nothing written outside a task's
-   `file_ownership`), `handoff.json` is present and schema-valid, and the work is
-   actually committed on the task branch. The repo's own canonical commands live
-   in the `floor:` config block (below) and are re-run in the eval worktree
-   *after* `prepare` materializes dependencies, with the same pass/fail semantics
-   as a `done_when` (exit 0 == pass, captured output surfaced on failure). A
-   floor-check failure fails the gate exactly like a failed exit criterion. The
-   planner never restates the floor.
-2. **Structural `checks`** (per task, authored by the planner). Deterministic
-   *structural* facts only: a project build / test / type-check command's exit
-   code, or `test -f` file existence. A **content-grep** (`rg` / `grep` / `egrep`
-   / `fgrep` / `ag` / `ack` for a token, in any pipeline segment) is **rejected**
-   by the planner validator, the brittle proxy class is deleted at the source.
-3. **Natural-language `criteria`** (per task). Prose acceptance statements ("the
-   plan maps every Honey/Sky/Pink/Ink ramp to a React Native equivalent"). No
-   commands; these feed the agentic pass below.
+The retry-vs-escalate split is one question: "can the same worker plausibly fix
+this itself?". A research / review critic additionally verifies that the artifact's
+citations resolve to real files under the read tip; an ungrounded claim routes to
+RETRY or ESCALATE.
 
-### The end-of-epoch agentic verification pass
+A worker that hits a hard environmental blocker says so in its free-form
+`handoff.md`. The critic reads that report, and an unrecoverable blocker becomes a
+critic ESCALATE. There is **no separate Python BLOCKED gate**: collapsing blocked
+into the critic's ESCALATE keeps one judge of "is this done / blocked / retryable"
+and avoids trusting a self-declared status. A missing or invalid verdict is a
+fail-safe escalate, never a silent pass.
 
-After every task in an epoch clears its deterministic floor and the epoch would
-otherwise complete, *if* the epoch carries any `criteria` and a worker tier is
-wired, the core runs one **adversarial** verification pass on the **worker** tier
-(`grindstone/verify.py`). It runs in a worktree of the epoch's integration tip
-with dependencies materialized, is a *separate* invocation from the worker (given
-only the epoch goal + criteria + the produced artifacts, told to find gaps and
-**default to FAIL** on uncertainty), and its only output is `verdict.json`, a
-re-read disk contract the core re-validates with Pydantic (`EpochVerdict`); stdout
-is never parsed, the same pattern as `vision_review`. The pass **can only fail an
-epoch the floor already cleared, never rubber-stamp past it**: a verdict that
-cannot be produced (the transport raised, no file, an invalid one) is itself a
-fail-safe FAIL. A `pass=false` verdict's `gaps` become a `FailedEpochInfo` and
-route through `handle_failed_epoch` (the same machinery as a task-failure epoch),
-so the planner sees the unmet criteria and disposes: `retry` with the gaps as
-feedback, `escalate_senior`, or `halt`. The pass is gated by `verify_epochs`
-(default on) and the senior `review` epoch stays the deeper phase/run-level pass;
-this worker pass is the cheap per-epoch semantic filter.
+### The handoff disk convention (not a schema gate)
 
-### The automatic infra-repair loop
+Every worker writes a **free-form** `handoff.md` report in its own CWD: plain prose
+(what I did, what is done, what is blocked or unfinished, which files I touched,
+grounding as prose). Grindstone relocates it verbatim to the task's log key for the
+critic and the planner's optional context. It is **never parsed or schema-validated
+by Python**; stdout is never parsed either. The deterministic gate is the committed
+diff or the produced artifact, not this file. A missing or pathologically large
+report is fine: the critic judges the actual work.
 
-Before each boundary the core re-evaluates the current phase gate *infra-aware*.
-A failed `cmd` check is run through the shared classifier (`grindstone/infra.py`,
-the single source of truth used by both the gate evaluator and the task-loop
-`done_when` re-run, so the two can never drift), which is deliberately
-**conservative**: a check is INFRA only on exit 127 or a narrow environmental
-signature (`command not found`, `Cannot find module`, `ModuleNotFoundError`, an
-`npm`/`pip`/`cargo` install failure), and a plain `exit 1` carrying ordinary test
-output stays *semantic* so a real assertion failure is never mistaken for infra.
+The worker owns a narrow lane, stated in the worktree-isolation contract: it edits
+only files within its `file_ownership`, writing every path relative to its CWD,
+never to an absolute path and never outside the worktree (a worker that strips its
+CWD back to the repo root must not be able to reach the real checkout). The core
+owns all git staging and committing; the worker must not commit and must not touch
+orchestration files. The critic's verdict is a `verdict.json` written in the
+critic's CWD, relocated and re-validated with Pydantic (a re-read disk contract,
+stdout ignored).
 
-When the gate is infra-failing and an `infra_repair:` policy + a senior tier
-exist, the core does **not** charge the worker or open a semantic failed epoch.
-It auto-dispatches a **senior** infra-repair against a worktree of the gate tip
-(a focused brief: the failing commands, their captured output, and the host
-guard), told to make the environment satisfiable *without* rewriting application
-logic. The core (never the model) commits the edits and re-runs only the failing
-commands against the repair commit, the authoritative judge, never the senior's
-handoff. A repair that sticks is adopted as the new integration tip so the
-ordinary gate that follows now passes; the run proceeds with no worker charged.
-The loop is bounded by `infra_repair.attempts`; on exhaustion the run escalates to
-a human, naming the unsatisfiable command. A **host-command guard**
-(`allow_host_commands`) keeps repo-local fixes (an `npm install` landing in
-`package.json`, editing config inside the repo) fully automatic while host-level /
-privileged actions (`sudo`, `apt`, writes outside the repo) are **deny by
-default**; the allowlist is carried into the repair dispatch and surfaced in the
-prompt.
+## The safety boundary
 
-### The new config blocks
+Review is post-hoc and sees the **diff**: it flags unsafe *code*, not unsafe
+*actions* already taken during execution. For an untrusted local worker, "be
+lenient, install what you need" equals arbitrary code execution on the host, and
+review cannot un-run it. Therefore:
 
-All three are optional blocks in `.grindstone/config.yaml`; absent, every
-existing run is byte-unchanged.
+- The **planner** (the trusted tier) declares any **host-global** setup/install
+  commands in the epoch's `setup` list; the orchestrator runs them, in order,
+  before the tasks, in a throwaway checkout of the epoch base (torn down after, so
+  setup can never dirty the operator checkout). The untrusted worker never
+  improvises host mutations.
+- Project-**local** dependency installs (`npm ci`, `pip install`) do **not** go in
+  `setup`: that throwaway checkout is not the task worktrees, so an install there
+  would not reach them. An implement task installs the project deps it needs inside
+  its **own** worktree as part of its work.
+- Worktree isolation contains every worker file write.
 
-- **`floor:`** the repo's canonical verification commands.
-  ```yaml
-  floor:
-    checks:
-      - "npx tsc --noEmit"
-      - "npm test --silent"
-  ```
-  `checks` may be **empty** (a fresh project starts with a minimal floor and grows
-  it); an empty *command string* in the list is a config typo and is rejected.
-  Absent (`None`) means only the core invariants apply.
-- **`infra_repair:`** the automatic senior infra-repair policy.
-  ```yaml
-  infra_repair:
-    attempts: 2            # repair cycles per gate (>= 0; 0 disables auto-repair)
-    allow_host_commands:   # the host-command guard, deny-by-default (empty)
-      - "apt-get"
-  ```
-  `attempts` defaults to **2** (0 disables auto-repair, so an infra fail escalates
-  immediately). `allow_host_commands` defaults to **empty** (nothing host-level
-  allowed). Absent (`None`) means no auto-repair, an infra fail routes through the
-  ordinary failed-epoch path.
-- **`verify_epochs:`** a bool (default **`true`**) toggling the end-of-epoch
-  agentic pass. The pass never runs (and never errors) when an epoch has no
-  `criteria` or there is no worker tier; set `false` to disable it entirely (the
-  deterministic floor + planner `review` epochs still gate).
+The principle: fully agentic on **judgment** (is this code good), a hard boundary
+on **actions** (what may touch the host). This replaces an entire infra-repair
+state machine with one field in the decision.
+
+## The failure model: two nodes
+
+Every interruption routes to exactly one of two handlers.
+
+1. **Rate limit / quota** (on the planner, the worker, or the critic): **park**,
+   back off (about once an hour, injectable), then re-enter. A planner rate-limit
+   re-issues the boundary call; a mid-epoch worker rate-limit razes the in-flight
+   epoch's throwaway worktrees and **restarts the epoch whole** (partial state is
+   never trusted).
+2. **Cannot continue** (any other epoch failure): the failure becomes carried
+   context the planner sees next boundary and steers around, or the planner ends
+   cleanly by writing a summary (the resume seed). The `max_epochs` backstop is the
+   **involuntary** trigger of the same clean end, so a planner that spins without
+   progress is always bounded. An unexpected error escaping the worktree or
+   integration machinery is razed and carried; a run of consecutive such aborts
+   clean-ends the run rather than looping forever.
+
+There is no infra-repair node, no session-limited node, no worker-timeout node, and
+no tier-escalation state machine. A hung worker is just a task failure that routes
+to node 2.
 
 ## The run-dir layout
 
-All run state lives under `.grindstone/runs/<run-id>/` in the **target** repo
-(`grindstone/rundir.py`). Log keys *are* relative paths under this dir, guarded
-so nothing resolves outside it:
+All durable run state lives under `.grindstone/runs/<run-id>/` in the **target**
+repo (`grindstone/rundir.py`). Log keys *are* relative paths under this dir,
+guarded so nothing resolves outside it:
 
 ```
 .grindstone/runs/<run-id>/
   events.ndjson        append-only journal, the durable source of truth
-  run_state.json       run-level cursor (RunState): skeleton, phase, counters
-  state.json           in-flight epoch cursor (EpochState): per-task status
   journal.md           human-facing markdown post-mortem (derived; latest run only)
-  P1/E1/T1/handoff.json …   the keyed log: relocated handoffs, outcomes, artifacts
-  worktrees/_planner_tip    the orchestrator-managed planner-READ tip checkout only
+  P1/E1/T1/handoff.md  the keyed log: relocated free-form handoffs, verdicts, artifacts
   artifacts/           scratch CWDs for non-write tasks
-  worker_logs/         per-worker stdout/stderr
-  vision/, polish/     verdict scratch for the taste gates
+  logs/                per-worker / per-critic raw stdout (ephemeral, reaped each epoch)
+  _planner_tip/        the orchestrator-managed planner read/write tip checkout
 ```
 
-The model-WRITTEN executor worktrees (task attempts, infra-repair, polish) and the
-orchestrator's scratch + staging trees no longer nest under the run dir: they live
-on an **external base**, `/tmp/cache/grindstone/<repo-id>/<run-id>/worktrees`
-(`GRINDSTONE_WORKTREE_BASE` to relocate; `rundir.worktrees_root`). A worktree nested
-inside the target repo lets a worker that strips its CWD back to the repo root write
-into the MAIN checkout instead of its isolated worktree, so hosting them externally
-removes the nesting the strip relies on. Only the orchestrator-managed `_planner_tip`
-read checkout stays under `worktrees/` here, since the sandboxed planner rigs (codex
-`-C repo` read-only, claude cwd=repo) must reach it inside the repo and it is never
-model-written.
+The model-written executor worktrees (task attempts, staging) and the
+orchestrator's scratch trees do **not** nest under the run dir: they live on an
+external base, `/tmp/cache/grindstone/<repo-id>/<run-id>/worktrees`
+(`GRINDSTONE_WORKTREE_BASE` to relocate; `rundir.worktrees_root`). A worktree
+nested inside the target repo would let a worker that strips its CWD back to the
+repo root write into the main checkout instead of its isolated worktree, so hosting
+them externally removes the nesting the strip relies on. Only the
+orchestrator-managed `_planner_tip` checkout stays under the run dir, since the
+sandboxed planner rig must reach it inside the repo and it is never model-written.
 
-The **journal** (`grindstone/events.py`, `grindstone/journal.py`) is the
-backbone: a frozen vocabulary of Pydantic events (`run_started`, `phase_passed`,
-`epoch_started`, `task_done`, `handoff_rejected`, …) written one-per-line,
-flushed and fsynced, with strictly monotonic `seq`. `replay()` folds the event
-stream into a run → phase → epoch → task tree; the same fold powers the live
-`watch` TUI and the post-mortem `journal.md`. The event stream alone is
-sufficient to render the whole run; `journal.md` is a derived view that carries
-no trust and is never read back into the loop.
+Because the durable run branch fast-forwards **only** on epoch completion, its tip
+is always at a clean boundary. The raw stdout per task is hundreds of megabytes of
+pure debugging scratch, so each epoch's start **reaps** the prior epoch's raw logs
+(keeping only the latest epoch's), while the small keyed log and the event journal
+are kept forever.
 
-## Navigating large repos
+## The journal and resume
 
-A job spec and a usually-empty repo-memory digest are not enough to plan against
-a thousand-file codebase. The planner is given a checkout of the current
-integration tip as its workdir and PULLS what it needs on demand (grep + read),
-rather than having a structural map pushed into every boundary; each worker greps
-and reads inside its own worktree. Pull-not-push keeps the byte-stable head
-cacheable and pays the navigation cost only when a model actually reaches for it.
+The **journal** (`grindstone/events.py`, `grindstone/journal.py`) is the backbone:
+a frozen vocabulary of Pydantic events (`run_started`, `epoch_started`,
+`task_dispatched`, `handoff_accepted`, `handoff_rejected`, `verdict`,
+`epoch_carried`, `epoch_completed`, `run_completed`, `run_ended`, `rate_limited`,
+`run_resumed`) written one per line, fsynced, with strictly monotonic `seq`. The
+event stream alone is sufficient to render the whole run -> epoch -> task tree;
+`journal.md` is a derived view that carries no trust and is never read back into the
+loop.
 
-## Taste and vision features
-
-Grindstone can build and judge work that is evaluated by how it *looks*:
-
-- **The per-task `senior` flag** routes a judgment/taste task (layout, polish,
-  synthesis) to the **senior** tier (the stronger taste-builder) instead of the
-  worker default, per task, so a UI epoch's mechanical scaffolding stays local.
-- **The `vision_review` gate** is a deterministic phase check: after a `cmd`
-  check builds and screenshots the UI into the tip worktree, a `vision_review`
-  check shows that screenshot to a vision model (via the rig's `vision_review.sh`)
-  with criteria for "what polished looks like". The script writes a
-  `vision_verdict.json` that the core re-reads and validates (a disk contract,
-  never stdout, `grindstone/script_vision.py`); a failed taste verdict fails the
-  phase exactly like a failed command. The gate is "always fail, never crash":
-  any error degrades to a deterministic FAIL.
-- **The optional final-polish pass** (`grindstone/script_polish.py`, off unless
-  the config opts in): after a run's `complete_run` evidence passes, `codex` runs
-  in `workspace-write` mode against a throwaway worktree of the final branch and
-  edits it in place. The edits are **kept only if the same evidence still
-  passes**, otherwise discarded, leaving the original completion standing. They
-  are committed to a branch but **never auto-pushed**, and the pass can never turn
-  a completed run into a failure.
-
-## Durability and resume
-
-The run is fully resumable after a kill at any point (`resume_grind`), and the
-journal leads. `RunState` and the epoch's `EpochState` are atomically rewritten
-to *distinct* files, so the multi-epoch loop and the in-flight epoch never clobber
-each other.
-
-- A kill **while a planner call is in flight** leaves nothing on disk (planner
-  calls are side-effect-free), so resume simply re-issues the call, no work
-  burned.
-- A kill **mid-epoch** burns only the single in-flight worker attempt (a killed
-  worker cannot be trusted): its worktree and branch are torn down and the attempt
-  is abandoned, while DONE tasks keep their branches and handoffs and are never
-  re-run. Integration then finishes idempotently: already-merged branches are
-  ancestors of the integration branch and are skipped.
-
-The keyed log, the atomic state files, and the append-only journal together mean
-every transition is recoverable from disk, and a run that ends abruptly can always
-be re-entered exactly where it left off.
+**Resume is the universal crash-only recovery primitive.** Because the run branch
+only fast-forwards on completion, the git tip needs no rewind. On resume from a
+non-ended epoch, programmatically (with no planner in the cleanup): remove the
+run's worktrees and transient `grind-wip/` branches, reap the incomplete epoch's
+partial keyed log and raw logs, **preserve** the completed-epoch keyed log and the
+append-only journal (appending a "razed incomplete epoch" marker, never
+truncating), reconstruct the carried context from the journal, and re-enter the
+loop at the planner prompt from the last clean boundary. Every interruption (kill,
+rate-limit, crash, any unhandled case) recovers the same way: resume = cleanup +
+re-plan, never a rewind.
