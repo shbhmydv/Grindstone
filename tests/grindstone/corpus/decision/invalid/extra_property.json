@@ -1,6 +1,0 @@
-{
-  "schema_version": "1",
-  "tool": "escalate_run",
-  "args": { "reason": "blocked" },
-  "surprise": true
-}

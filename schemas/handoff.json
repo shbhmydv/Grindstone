@@ -12,7 +12,7 @@
       "pattern": "^P[1-9][0-9]?/E[1-9][0-9]?/T[1-8]$",
       "description": "Fully-qualified phase/epoch/task key."
     },
-    "status": { "enum": ["DONE", "FAILED", "PARTIAL"] },
+    "status": { "enum": ["DONE", "FAILED", "PARTIAL", "BLOCKED"] },
     "what_changed": {
       "type": "array",
       "maxItems": 16,

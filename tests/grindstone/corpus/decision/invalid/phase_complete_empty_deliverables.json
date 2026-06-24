@@ -1,8 +1,0 @@
-{
-  "schema_version": "1",
-  "tool": "phase_complete",
-  "args": {
-    "summary": "phase done",
-    "deliverables": []
-  }
-}

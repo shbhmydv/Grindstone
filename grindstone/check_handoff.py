@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from grindstone.contracts.semantics import HANDOFF_MAX_BYTES, HandoffMode
+from grindstone.contracts.models import HANDOFF_MAX_BYTES, HandoffMode
 
 #: The filename the script is written as, and the done_when command that re-runs
 #: it. Co-located with the generator so the core (task_loop) reuses both.

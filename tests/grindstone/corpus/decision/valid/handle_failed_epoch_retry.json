@@ -1,9 +1,0 @@
-{
-  "schema_version": "1",
-  "tool": "handle_failed_epoch",
-  "args": {
-    "action": "retry",
-    "hint": "the build failed because the import path was wrong; use the absolute package path",
-    "escalate_tier": true
-  }
-}

@@ -1,11 +1,20 @@
-"""Hand-written Pydantic v2 mirror of ``schemas/epoch_decision.json`` and
-``schemas/handoff.json``.
+"""Pydantic v2 wire contracts for the bones rewrite.
 
-These are the typed structs the core works with: stringly JSON is parsed here
-exactly once, at the boundary, and never crosses inward. Every model is frozen
-and forbids unknown keys, so a parsed value is immutable and complete. Field
-constraints mirror the JSON Schema character-level limits one-for-one; the
-schema is the source of truth and the equivalence test guards against drift.
+Three lenient structs the core works with, stringly JSON is parsed here exactly
+once, at the boundary, and never crosses inward:
+
+* ``Decision`` -- what the planner emits each boundary: an EPOCH (1..N tasks) or
+  an END (a phase handoff / pending-summary that seeds the next appendable run).
+* ``Handoff`` -- what a worker writes to disk in its CWD (the disk file is the
+  gate, stdout is never parsed). Carries a self-reported ``BLOCKED`` status so an
+  environment blocker routes straight to the planner, skipping the critic.
+* ``Verdict`` -- the critic's triage: ``PASS`` | ``RETRY`` | ``ESCALATE`` plus a
+  short free-text reason. Deliberately NOT a rigid multi-field schema, that shape
+  is what a weak model fumbled (run 051645Z), rejecting work for a machinery fault.
+
+Every model is frozen and forbids unknown keys, so a parsed value is immutable
+and complete. The JSON Schemas in ``schemas/`` mirror these models; the schema is
+the wire contract, Pydantic stays the source of truth.
 """
 
 from __future__ import annotations
@@ -19,15 +28,25 @@ from pydantic import (
     StrictBool,
     StringConstraints,
     TypeAdapter,
-    field_validator,
+    model_validator,
 )
 
 # --- scalar aliases (mirror schema $defs / pattern constraints) ----------------
 
 #: Key into the run's durable keyed log; also the handoff downstream-needs shape.
+#: A relative path under the run dir (``rundir.resolve`` enforces containment).
 LogKey = Annotated[
     str, StringConstraints(pattern=r"^[A-Za-z0-9][a-zA-Z0-9._/-]{0,127}$")
 ]
+
+#: The four worker intents. Picks the worker prompt/skill and the handoff rules
+#: (research/review must cite). Carried on each task and echoed by the handoff.
+HandoffMode = Literal["implement", "research", "review", "artifact"]
+
+#: Total serialized handoff size cap (ARCHITECTURE.md): references, not payloads.
+#: Kept here (formerly contracts/semantics.py) so ``check_handoff`` and any later
+#: gate share one constant.
+HANDOFF_MAX_BYTES = 8192
 
 
 class _Frozen(BaseModel):
@@ -36,308 +55,123 @@ class _Frozen(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
 
-# --- checks (oneOf: a command or a required artifact) --------------------------
+# --- decision: tasks -----------------------------------------------------------
 
 
-class CmdCheck(_Frozen):
-    """Deterministic check: run a command, expect an exit code."""
+class Task(_Frozen):
+    """One unit of an epoch, fanned out to a worker in its own worktree.
 
-    cmd: Annotated[str, StringConstraints(min_length=1, max_length=512)]
-    expect_exit: int = 0
+    Minimal and lenient: a ``goal`` in prose (the worker's brief, including its own
+    notion of done), a routing ``tier`` (local mechanical/checkable vs senior
+    judgment/taste, the planner picks), an intent ``mode``, and the disk-shape
+    fields the orchestrator needs to isolate + merge the work:
 
+    * ``implement`` tasks declare ``file_ownership`` (>= 1 concrete path/glob), the
+      disjoint-merge invariant is enforced over these and a worker may write only
+      what it claimed.
+    * ``research`` / ``review`` / ``artifact`` tasks declare ``artifact_out`` (the
+      one log key the produced artifact lands at).
 
-class ArtifactExistsCheck(_Frozen):
-    """Deterministic check: a validated artifact must exist at a log key."""
-
-    artifact_exists: LogKey
-
-
-class VisionReviewSpec(_Frozen):
-    """The taste-gate's payload: a screenshot path + the criteria to judge it by.
-
-    ``screenshot`` is a path RELATIVE TO THE EVAL WORKTREE, a prior cmd check in
-    the same criterion list renders the UI there (e.g. ``ui/screen.png``). The
-    pattern forbids a leading ``/`` and any ``..`` segment so a planner-supplied
-    path cannot escape the worktree (codex reads the image with ``-i``, an
-    absolute/traversal path would be an arbitrary on-disk file read). ``criteria``
-    is prose describing what polished/correct looks like; the core feeds both to
-    codex, which returns a structured verdict (``vision_verdict``).
+    ``skills`` selects domain skills by name from the target repo's catalogue
+    (retrieve-not-concatenate); ``inputs`` names prior log keys this task reads.
+    No rigid acceptance schema, semantic acceptance is judged agentically by the
+    critic against the task's own claimed ``goal``.
     """
 
-    screenshot: Annotated[str, StringConstraints(min_length=1, max_length=256)]
-    criteria: Annotated[str, StringConstraints(min_length=1, max_length=2048)]
-
-    @field_validator("screenshot")
-    @classmethod
-    def _relative_no_traversal(cls, v: str) -> str:
-        # Mirrors the schema's screenshot ``pattern`` (whose look-ahead the
-        # Pydantic regex engine cannot express): a worktree-relative path with no
-        # leading ``/`` and no ``..`` segment, so it can never escape the worktree.
-        if v.startswith("/") or ".." in v.split("/"):
-            raise ValueError(
-                "screenshot must be a worktree-relative path with no '..' segments"
-            )
-        return v
-
-
-class VisionReviewCheck(_Frozen):
-    """Taste check (B3): codex looks at a rendered-UI screenshot + criteria and
-    emits a pass/fail verdict, layered on top of the deterministic functional
-    floor. The verdict is a re-read disk contract (``vision_verdict.json``), never
-    stdout, identical in spirit to the worker handoff."""
-
-    vision_review: VisionReviewSpec
-
-
-Check = Union[CmdCheck, ArtifactExistsCheck, VisionReviewCheck]
-
-
-# --- phases --------------------------------------------------------------------
-
-
-class Phase(_Frozen):
-    """Skeleton milestone: id, title, machine-checkable exit, epoch budget."""
-
-    id: Annotated[str, StringConstraints(pattern=r"^P[1-9][0-9]?$")]
-    title: Annotated[str, StringConstraints(min_length=1, max_length=120)]
-    exit_criterion: Annotated[list[Check], Field(min_length=1, max_length=8)]
-    epoch_budget: Annotated[int, Field(ge=1, le=20)]
-
-
-# --- tasks ---------------------------------------------------------------------
-
-
-class _TaskBase(_Frozen):
     id: Annotated[str, StringConstraints(pattern=r"^T[1-8]$")]
-    goal: Annotated[str, StringConstraints(min_length=1, max_length=1024)]
+    mode: HandoffMode
+    goal: Annotated[str, StringConstraints(min_length=1, max_length=2048)]
+    #: Routing tier. ``local`` (default) is the Qwen rig (mechanical / checkable);
+    #: ``senior`` is the Claude rig (judgment / taste). A rig with no senior tier
+    #: falls back to local.
+    tier: Literal["local", "senior"] = "local"
+    file_ownership: Annotated[
+        list[Annotated[str, StringConstraints(min_length=1, max_length=256)]],
+        Field(max_length=32),
+    ] = Field(default_factory=list)
+    artifact_out: LogKey | None = None
+    skills: Annotated[
+        list[Annotated[str, StringConstraints(min_length=1, max_length=64)]],
+        Field(max_length=6),
+    ] = Field(default_factory=list)
     inputs: Annotated[list[LogKey], Field(max_length=12)] = Field(default_factory=list)
-    done_when: Annotated[list[Check], Field(min_length=1, max_length=6)]
-    #: Natural-language semantic acceptance statements, judged later by an agentic
-    #: verification pass (gate rebalance), NOT by a shell command. Deterministic
-    #: ``done_when`` / ``checks`` cover structural facts (build, test, type-check,
-    #: file existence); content/semantic acceptance ("the plan maps every ramp to
-    #: an RN equivalent") belongs here. Optional, defaults to an empty list; each
-    #: entry is a non-empty prose statement (mirrors the schema's ``criteria``).
-    criteria: Annotated[
+
+    @model_validator(mode="after")
+    def _shape_by_mode(self) -> Task:
+        # The one cross-field rule: an implement task owns files; a non-write task
+        # produces an artifact at a log key. Kept minimal (not a criteria schema).
+        if self.mode == "implement":
+            if not self.file_ownership:
+                raise ValueError(
+                    f"task {self.id}: implement tasks must declare file_ownership"
+                )
+            if self.artifact_out is not None:
+                raise ValueError(
+                    f"task {self.id}: implement tasks do not declare artifact_out"
+                )
+        else:
+            if self.artifact_out is None:
+                raise ValueError(
+                    f"task {self.id}: {self.mode} tasks must declare artifact_out"
+                )
+            if self.file_ownership:
+                raise ValueError(
+                    f"task {self.id}: {self.mode} tasks do not own files"
+                )
+        return self
+
+
+class Epoch(_Frozen):
+    """One epoch the planner proposes: a titled bundle of disjoint tasks.
+
+    ``setup`` is the trusted-tier host-mutation seam (BONES safety boundary): the
+    PLANNER (Claude) declares any install/setup commands the orchestrator runs
+    before the tasks; the untrusted local worker never improvises host mutations.
+    Empty by default.
+    """
+
+    title: Annotated[str, StringConstraints(min_length=1, max_length=120)]
+    rationale: Annotated[str, StringConstraints(max_length=2048)] = ""
+    tasks: Annotated[list[Task], Field(min_length=1, max_length=8)]
+    setup: Annotated[
         list[Annotated[str, StringConstraints(min_length=1, max_length=512)]],
         Field(max_length=8),
     ] = Field(default_factory=list)
-    skills: Annotated[
-        list[Annotated[str, StringConstraints(max_length=64)]], Field(max_length=6)
-    ] = Field(default_factory=list)
-    #: Per-task tier routing: True routes THIS task to the senior tier (judgment /
-    #: taste work, e.g. layout, polish, an approach synthesis, a design-quality
-    #: verdict), False (the default) runs it on the local rig (mechanical /
-    #: factual work, e.g. scaffolding, tokens, boilerplate, web-search fact
-    #: gathering, a structural review). Routing is per TASK, not per epoch, so one
-    #: epoch can split a mechanical local slice from a taste senior slice and the
-    #: senior quota is spent only where judgment is needed. A rig with no senior
-    #: tier falls back to local. Optional, defaults False (a decision without the
-    #: field parses unchanged); ``StrictBool`` mirrors the schema's ``boolean``
-    #: type, so a non-bool is rejected at both layers. It also picks the size-gate
-    #: file-count cap (senior tasks get the larger bound).
-    senior: StrictBool = False
 
 
-class ImplementTask(_TaskBase):
-    """Write task: additionally owns disjoint path globs (merge-correctness)."""
-
-    file_ownership: Annotated[
-        list[Annotated[str, StringConstraints(min_length=1, max_length=256)]],
-        Field(min_length=1, max_length=32),
-    ]
+# --- decision: the two shapes (discriminated on ``kind``) ----------------------
 
 
-class ArtifactTask(_TaskBase):
-    """Non-write task (research/review/artifact): produces one artifact log key."""
+class EpochDecision(_Frozen):
+    """Propose one epoch to grind."""
 
-    artifact_out: LogKey
-    targets: (
-        Annotated[
-            list[Annotated[str, StringConstraints(max_length=256)]],
-            Field(max_length=32),
-        ]
-        | None
-    ) = None
+    kind: Literal["epoch"]
+    epoch: Epoch
 
 
-# --- epoch args ----------------------------------------------------------------
+class EndDecision(_Frozen):
+    """End the run. ``summary`` is the phase handoff / pending-summary: the resume
+    seed that lets the work continue as the next appendable run (a clean end, the
+    planner's #2 disposition, or a satisfied done)."""
+
+    kind: Literal["end"]
+    summary: Annotated[str, StringConstraints(min_length=1, max_length=4096)]
 
 
-class _EpochArgsBase(_Frozen):
-    epoch_title: Annotated[str, StringConstraints(min_length=1, max_length=120)]
-    rationale: Annotated[str, StringConstraints(max_length=2048)]
-
-
-class ImplementEpochArgs(_EpochArgsBase):
-    tasks: Annotated[list[ImplementTask], Field(min_length=1, max_length=8)]
-
-
-class ArtifactEpochArgs(_EpochArgsBase):
-    tasks: Annotated[list[ArtifactTask], Field(min_length=1, max_length=8)]
-
-
-class SkeletonArgs(_Frozen):
-    phases: Annotated[list[Phase], Field(min_length=2, max_length=10)]
-
-
-class RevisePhasesArgs(_Frozen):
-    reason: Annotated[str, StringConstraints(min_length=1, max_length=1024)]
-    phases: Annotated[list[Phase], Field(min_length=1, max_length=10)]
-
-
-class RetryFailedEpochArgs(_Frozen):
-    """Retry the failed epoch, optionally with corrective guidance + a tier bump."""
-
-    action: Literal["retry"]
-    hint: Annotated[str, StringConstraints(min_length=1, max_length=2048)]
-    escalate_tier: StrictBool = False
-
-
-class EscalateSeniorFailedEpochArgs(_Frozen):
-    """Hand the failed epoch to the senior tier with a diagnosis."""
-
-    action: Literal["escalate_senior"]
-    diagnosis: Annotated[str, StringConstraints(min_length=1, max_length=2048)]
-
-
-class HaltFailedEpochArgs(_Frozen):
-    """Stop the run for a human: the epoch is not satisfiable as specified."""
-
-    action: Literal["halt"]
-    reason: Annotated[str, StringConstraints(min_length=1, max_length=2048)]
-
-
-#: The three focused dispositions of a FAILED epoch, discriminated on ``action``
-#: (mirrors the schema's ``handle_failed_epoch_args`` oneOf). NOT a phase replan
-#: (revise_phases) and NOT a fresh work epoch.
-HandleFailedEpochArgs = Annotated[
-    Union[
-        RetryFailedEpochArgs,
-        EscalateSeniorFailedEpochArgs,
-        HaltFailedEpochArgs,
-    ],
-    Field(discriminator="action"),
+Decision = Annotated[
+    Union[EpochDecision, EndDecision], Field(discriminator="kind")
 ]
 
-
-class PhaseCompleteArgs(_Frozen):
-    """The planner's judgement that the CURRENT phase is complete (deliverable met).
-
-    ``summary`` says why the phase goal is satisfied; ``deliverables`` are the
-    concrete repo-relative artifact paths that satisfy it, each existence-checked
-    in the integration-tip tree before the phase ends (existence only, NOT a
-    quality judgement). The path list is bounded like ``ImplementTask`` ``file_ownership``;
-    a missing cited path bounces the decision back into planning, never halts."""
-
-    summary: Annotated[str, StringConstraints(min_length=1, max_length=2048)]
-    deliverables: Annotated[
-        list[Annotated[str, StringConstraints(min_length=1, max_length=256)]],
-        Field(min_length=1, max_length=32),
-    ]
+_DECISION_ADAPTER: TypeAdapter[Decision] = TypeAdapter(Decision)
 
 
-class EscalateRunArgs(_Frozen):
-    reason: Annotated[str, StringConstraints(min_length=1, max_length=2048)]
-    needed_from_human: (
-        Annotated[str, StringConstraints(max_length=1024)] | None
-    ) = None
-
-
-class CompleteRunArgs(_Frozen):
-    summary: Annotated[str, StringConstraints(min_length=1, max_length=2048)]
-    evidence: Annotated[list[Check], Field(min_length=1, max_length=8)]
-
-
-# --- decisions (discriminated union on ``tool``) -------------------------------
-
-
-class ProposeSkeletonDecision(_Frozen):
-    schema_version: Literal["1"]
-    tool: Literal["propose_skeleton"]
-    args: SkeletonArgs
-
-
-class ImplementDecision(_Frozen):
-    schema_version: Literal["1"]
-    tool: Literal["implement"]
-    args: ImplementEpochArgs
-
-
-class ResearchDecision(_Frozen):
-    schema_version: Literal["1"]
-    tool: Literal["research"]
-    args: ArtifactEpochArgs
-
-
-class ReviewDecision(_Frozen):
-    schema_version: Literal["1"]
-    tool: Literal["review"]
-    args: ArtifactEpochArgs
-
-
-class ArtifactDecision(_Frozen):
-    schema_version: Literal["1"]
-    tool: Literal["artifact"]
-    args: ArtifactEpochArgs
-
-
-class RevisePhasesDecision(_Frozen):
-    schema_version: Literal["1"]
-    tool: Literal["revise_phases"]
-    args: RevisePhasesArgs
-
-
-class HandleFailedEpochDecision(_Frozen):
-    schema_version: Literal["1"]
-    tool: Literal["handle_failed_epoch"]
-    args: HandleFailedEpochArgs
-
-
-class PhaseCompleteDecision(_Frozen):
-    schema_version: Literal["1"]
-    tool: Literal["phase_complete"]
-    args: PhaseCompleteArgs
-
-
-class EscalateRunDecision(_Frozen):
-    schema_version: Literal["1"]
-    tool: Literal["escalate_run"]
-    args: EscalateRunArgs
-
-
-class CompleteRunDecision(_Frozen):
-    schema_version: Literal["1"]
-    tool: Literal["complete_run"]
-    args: CompleteRunArgs
-
-
-EpochDecision = Annotated[
-    Union[
-        ProposeSkeletonDecision,
-        ImplementDecision,
-        ResearchDecision,
-        ReviewDecision,
-        ArtifactDecision,
-        RevisePhasesDecision,
-        HandleFailedEpochDecision,
-        PhaseCompleteDecision,
-        EscalateRunDecision,
-        CompleteRunDecision,
-    ],
-    Field(discriminator="tool"),
-]
-
-_DECISION_ADAPTER: TypeAdapter[EpochDecision] = TypeAdapter(EpochDecision)
-
-
-def parse_decision(payload: object) -> EpochDecision:
+def parse_decision(payload: object) -> Decision:
     """Parse untrusted JSON into the typed decision union (raises on invalid)."""
 
     return _DECISION_ADAPTER.validate_python(payload)
 
 
-# --- handoff -------------------------------------------------------------------
+# --- handoff (the COPY bone, plus a BLOCKED self-report) -----------------------
 
 
 class WhatChanged(_Frozen):
@@ -362,13 +196,19 @@ class Occupancy(_Frozen):
 
 
 class Handoff(_Frozen):
-    """Worker handoff written to disk; the disk file is the gate, not stdout."""
+    """Worker handoff written to disk; the disk file is the gate, not stdout.
+
+    ``status`` adds ``BLOCKED`` to the bone: a worker that hits a hard environment
+    blocker (missing dep, needs a host mutation it may not make) writes ``BLOCKED``
+    so the orchestrator routes it STRAIGHT to the planner, skipping the critic (no
+    point critiquing env-blocked work).
+    """
 
     schema_version: Literal["1"]
     task_id: Annotated[
         str, StringConstraints(pattern=r"^P[1-9][0-9]?/E[1-9][0-9]?/T[1-8]$")
     ]
-    status: Literal["DONE", "FAILED", "PARTIAL"]
+    status: Literal["DONE", "FAILED", "PARTIAL", "BLOCKED"]
     what_changed: Annotated[list[WhatChanged], Field(max_length=16)] = Field(
         default_factory=list
     )
@@ -382,8 +222,6 @@ class Handoff(_Frozen):
     citations: Annotated[list[Citation], Field(max_length=12)] = Field(
         default_factory=list
     )
-    # Cap 8, not the task's 6: an honest echo includes the planner's done_when
-    # (max 6) plus the core-appended validator and implement-mode review gates.
     checks: Annotated[list[CheckResult], Field(max_length=8)]
     occupancy: Occupancy
 
@@ -397,86 +235,30 @@ def parse_handoff(payload: object) -> Handoff:
     return _HANDOFF_ADAPTER.validate_python(payload)
 
 
-# --- vision verdict (B3 taste gate disk contract) ------------------------------
+# --- verdict (the critic's triage, lenient by design) --------------------------
+
+#: The critic ROUTES, it does not grade. PASS -> merge (notes carry forward);
+#: RETRY -> the bounded same-worker retry (a defect the worker can plausibly fix);
+#: ESCALATE -> the planner (anything the worker cannot fix: missing dep, ambiguous
+#: spec, a decision, environmental).
+VerdictOutcome = Literal["PASS", "RETRY", "ESCALATE"]
 
 
-class VisionVerdict(_Frozen):
-    """codex's verdict for a ``vision_review`` check, mirroring
-    ``schemas/vision_verdict.json``: a strict ``pass`` boolean (``StrictBool``
-    rejects a stringy/numeric verdict) and the reasons behind it. Parsed from the
-    re-read verdict file at the boundary; the field is aliased to ``pass`` (a
-    Python keyword) but read as ``.passed``."""
+class Verdict(_Frozen):
+    """The agentic critic's triage of one task. Lenient ON PURPOSE: an outcome enum
+    plus free-text ``reason``, nothing a weak model can fumble into a schema-invalid
+    rejection. ``reason`` defaults to empty so ``{"outcome": "PASS"}`` validates; it
+    is unbounded because the verdict is delivered to the planner BY REFERENCE (read
+    from its persisted file), never byte-capped into a prompt."""
 
-    passed: StrictBool = Field(alias="pass")
-    reasons: Annotated[
-        list[Annotated[str, StringConstraints(max_length=512)]], Field(max_length=16)
-    ]
+    outcome: VerdictOutcome
+    reason: str = ""
 
 
-_VERDICT_ADAPTER: TypeAdapter[VisionVerdict] = TypeAdapter(VisionVerdict)
+_VERDICT_ADAPTER: TypeAdapter[Verdict] = TypeAdapter(Verdict)
 
 
-def parse_vision_verdict(payload: object) -> VisionVerdict:
-    """Parse untrusted JSON into the typed vision verdict (raises on invalid)."""
+def parse_verdict(payload: object) -> Verdict:
+    """Parse untrusted JSON into the typed critic verdict (raises on invalid)."""
 
     return _VERDICT_ADAPTER.validate_python(payload)
-
-
-# --- epoch verdict (G4 agentic verification pass disk contract) ----------------
-
-
-class CriterionJudgement(_Frozen):
-    """One criterion's adversarial judgement, mirroring ``schemas/epoch_verdict.json``:
-    the verbatim ``criterion``, a strict ``met`` boolean (``StrictBool`` rejects a
-    stringy/numeric value), and the artifact ``evidence`` behind it.
-
-    The free-text ``criterion`` / ``evidence`` are UNBOUNDED in length: the verdict is
-    an agent INPUT delivered to the planner BY REFERENCE (the full ``verdict.json`` is
-    persisted on disk and the planner reads the file), never byte-capped-and-embedded
-    into a prompt, so a verbose verifier can never lose information or reject a verdict
-    on length alone (the old whole-verdict-rejection bug is impossible)."""
-
-    criterion: str
-    met: StrictBool
-    evidence: str
-
-
-class EpochVerdict(_Frozen):
-    """The local-tier verification pass's verdict for an epoch (G4), mirroring
-    ``schemas/epoch_verdict.json``: a strict ``pass`` boolean, the per-criterion
-    judgements, and the concrete ``gaps`` surfaced to the planner on a fail. Parsed
-    from the re-read ``verdict.json`` at the boundary (stdout is never parsed); the
-    field is aliased to ``pass`` (a Python keyword) but read as ``.passed``. The
-    agentic pass can only FAIL an epoch the deterministic floor already cleared, so
-    the core treats a missing/invalid verdict as a fail-safe (no rubber-stamp).
-
-    The free-text ``gaps`` and ``digest`` are UNBOUNDED in length: the whole verdict is
-    persisted on disk and delivered to the planner BY REFERENCE (it reads the file), so
-    nothing is byte-capped-and-embedded into a prompt and no length can reject it. The
-    structural validation (``pass`` is a bool, ``per_criterion`` is a list of the right
-    shape) is unchanged; only the length caps are gone."""
-
-    passed: StrictBool = Field(alias="pass")
-    per_criterion: Annotated[list[CriterionJudgement], Field(max_length=16)]
-    gaps: list[str]
-    #: A descriptive steering summary the verifier emits in the SAME pass (G10): what
-    #: the epoch actually produced, key structure/decisions, what is notably incomplete
-    #: or risky, written for the planner choosing the NEXT epoch. It is NOT a grade and
-    #: NEVER affects ``passed``; absent (older/malformed verdicts) defaults to "". It
-    #: travels to the planner by FILE (the persisted verdict), never embedded in a prompt.
-    digest: str = ""
-
-
-_EPOCH_VERDICT_ADAPTER: TypeAdapter[EpochVerdict] = TypeAdapter(EpochVerdict)
-
-
-def parse_epoch_verdict(payload: object) -> EpochVerdict:
-    """Parse untrusted JSON into the typed epoch verdict (raises on invalid).
-
-    STRUCTURAL validation only (``pass`` is a bool, ``per_criterion`` is a list of the
-    right shape, no unknown keys): a long ``evidence`` / ``criterion`` / ``gaps`` /
-    ``digest`` parses fine and is preserved IN FULL. The verdict is an agent input
-    delivered by reference (persisted on disk, the planner reads it), never embedded in
-    a prompt, so there is no length to cap and no truncation."""
-
-    return _EPOCH_VERDICT_ADAPTER.validate_python(payload)

@@ -1,8 +1,0 @@
-{
-  "schema_version": "1",
-  "task_id": "P1/E1/T1",
-  "status": "DONE",
-  "resulting_state": "tokenizer implemented and tests pass",
-  "checks": [{ "check": "pytest tests/tokenizer", "exit_code": 0 }],
-  "occupancy": { "compacted": false, "subagent_splits": 0 }
-}

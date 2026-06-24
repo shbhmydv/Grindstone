@@ -1,33 +1,21 @@
-"""Contract layer: runtime schema gate, typed models, semantic validators."""
+"""Contract layer: the lenient typed boundary models (decision / handoff / verdict)."""
 
-from grindstone.contracts.gate import (
-    decision_schema_errors,
-    handoff_schema_errors,
-)
 from grindstone.contracts.models import (
-    EpochDecision,
+    HANDOFF_MAX_BYTES,
+    Decision,
     Handoff,
+    Verdict,
     parse_decision,
     parse_handoff,
-)
-from grindstone.contracts.semantics import (
-    HANDOFF_MAX_BYTES,
-    canonical_bytes,
-    epoch_decision_violations,
-    handoff_violations,
-    implement_task_size_violations,
+    parse_verdict,
 )
 
 __all__ = [
     "HANDOFF_MAX_BYTES",
-    "EpochDecision",
+    "Decision",
     "Handoff",
-    "canonical_bytes",
-    "decision_schema_errors",
-    "epoch_decision_violations",
-    "handoff_schema_errors",
-    "handoff_violations",
-    "implement_task_size_violations",
+    "Verdict",
     "parse_decision",
     "parse_handoff",
+    "parse_verdict",
 ]

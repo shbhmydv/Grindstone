@@ -1,10 +1,14 @@
 """Journal event vocabulary + NDJSON I/O + the replay fold.
 
-ARCHITECTURE.md: the event stream alone must be sufficient to render the full
-run -> phase -> epoch -> task tree with statuses, and ``planner_calls_per_run``
-must be derivable. ``replay`` is the proof: it folds an event list into a
-``RunTree`` snapshot. The vocabulary is frozen at S0, the TUI (S4) and resume
-both consume it.
+The append-only ``events.ndjson`` is the single source of truth for a run: the
+stream alone must render the full run -> epoch -> task tree with statuses, and
+resume reads it to find the last clean boundary. ``replay`` folds an event list
+into a ``RunTree`` snapshot.
+
+The bones taxonomy is small (BONES "epochs only, no phases"): the run lifecycle,
+the epoch and task lifecycle, the handoff gate, the critic ``verdict`` triage,
+and the one backoff signal ``rate_limited``. No phases, no infra-repair, no
+vision, no session-limit / failed-epoch state-machine events.
 """
 
 from __future__ import annotations
@@ -28,112 +32,51 @@ class _Event(BaseModel):
     ts: str
 
 
-class PhaseRef(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
-    id: str
-    title: str
-
-
 class TaskRef(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     id: str
     mode: str
 
 
+# --- run lifecycle -------------------------------------------------------------
+
+
 class RunStarted(_Event):
     event: Literal["run_started"] = "run_started"
     run_id: str
     job_path: str
-    #: The planner-call backstop in force (None = off, a test-only seam). Carried
-    #: in the journal so a watcher can show "n/N" without reading run state.
-    max_planner_calls: int | None = None
+    #: The epoch backstop in force (None = off). Carried so a watcher can show
+    #: "n/N" epochs without reading run state.
+    max_epochs: int | None = None
 
 
 class RunResumed(_Event):
+    # Re-entry from a killed / rate-limited / crashed run. ``razed_epoch`` records
+    # the incomplete epoch the programmatic cleanup tore down (BONES resume): the
+    # journal is appended, never truncated, so the marker is permanent.
     event: Literal["run_resumed"] = "run_resumed"
     run_id: str
+    razed_epoch: str | None = None
 
 
 class RunCompleted(_Event):
+    # The planner ended the run as DONE and the one final acceptance passed.
     event: Literal["run_completed"] = "run_completed"
 
 
-class RunEscalated(_Event):
-    event: Literal["run_escalated"] = "run_escalated"
-    reason: str
+class RunEnded(_Event):
+    # A CLEAN partial-end (BONES failure model #2): the planner wrote a phase
+    # handoff / pending-summary instead of continuing. ``summary`` is the resume
+    # seed for the next appendable run. Not an error, a deliberate stopping point.
+    event: Literal["run_ended"] = "run_ended"
+    summary: str
 
 
-class RunFailed(_Event):
-    # The production safety valve (planner-call / epoch cap) tripped. Terminal,
-    # but not an escalation, a harness bound the durable state also records. It
-    # is a vocabulary event so the journal stays self-describing (the TUI exits).
-    event: Literal["run_failed"] = "run_failed"
-    reason: str
-
-
-class FinalPolishApplied(_Event):
-    # B5: codex's optional post-completion inline polish pass was KEPT, its edits
-    # re-passed the SAME complete_run evidence, so the run completes on the polish
-    # commit. ``commit`` is that adopted commit sha (the final branch now points at
-    # it); ``changed_files`` is the polish diff's file list (`git add -A` is blind,
-    # so the changed-file set is recorded for an auditable trail of what codex
-    # touched). Defaulted so any pre-field journal still replays.
-    event: Literal["final_polish_applied"] = "final_polish_applied"
-    commit: str
-    changed_files: list[str] = Field(default_factory=list)
-
-
-class FinalPolishSkipped(_Event):
-    # B5: the polish pass made no net change to the certified run, codex changed
-    # nothing, its edits regressed the evidence (discarded), or the pass errored.
-    # The original completion stands; ``reason`` records which (self-describing).
-    event: Literal["final_polish_skipped"] = "final_polish_skipped"
-    reason: str
-
-
-class PlannerCallStarted(_Event):
-    event: Literal["planner_call_started"] = "planner_call_started"
-
-
-class PlannerCallSucceeded(_Event):
-    event: Literal["planner_call_succeeded"] = "planner_call_succeeded"
-    tool: str
-
-
-class PlannerCallFailed(_Event):
-    event: Literal["planner_call_failed"] = "planner_call_failed"
-    classification: Literal["rate_limit", "transient", "hard", "session_limit"]
-
-
-class SkeletonProposed(_Event):
-    event: Literal["skeleton_proposed"] = "skeleton_proposed"
-    phases: list[PhaseRef]
-
-
-class PhasesRevised(_Event):
-    event: Literal["phases_revised"] = "phases_revised"
-    reason: str
-    phases: list[PhaseRef]
-
-
-class PhaseStarted(_Event):
-    event: Literal["phase_started"] = "phase_started"
-    phase_id: str
-
-
-class PhasePassed(_Event):
-    event: Literal["phase_passed"] = "phase_passed"
-    phase_id: str
-
-
-class PhaseEscalated(_Event):
-    event: Literal["phase_escalated"] = "phase_escalated"
-    phase_id: str
+# --- epoch + task lifecycle ----------------------------------------------------
 
 
 class EpochStarted(_Event):
     event: Literal["epoch_started"] = "epoch_started"
-    phase_id: str
     epoch_id: str
     title: str
     tasks: list[TaskRef]
@@ -144,87 +87,10 @@ class EpochCompleted(_Event):
     epoch_id: str
 
 
-class EpochFailed(_Event):
-    # An epoch finished with one or more FAILED tasks (the retry ladder was
-    # exhausted). The run is now awaiting a focused handle_failed_epoch
-    # disposition; ``failed_tasks`` names them so the journal renders the why.
-    event: Literal["epoch_failed"] = "epoch_failed"
-    phase_id: str
-    epoch_id: str
-    failed_tasks: list[str]
-
-
-class FailedEpochHandled(_Event):
-    # The planner's focused disposition of a failed epoch (or the deterministic
-    # cap forcing one). ``action`` is retry / escalate_senior / halt / cap_halt;
-    # ``detail`` is the planner's hint/diagnosis/reason (or the cap message).
-    event: Literal["failed_epoch_handled"] = "failed_epoch_handled"
-    phase_id: str
-    epoch_id: str
-    action: str
-    detail: str
-
-
-class InfraCheckDetected(_Event):
-    # A gate check failed for an ENVIRONMENTAL reason (infra.classify_check_failure:
-    # exit 127, missing tool/dependency, install failure), not a real assertion
-    # failure. The core will auto-dispatch a senior infra-repair instead of
-    # charging the worker. ``command`` is the failing check; ``reason`` is the
-    # matched signature.
-    event: Literal["infra_check_detected"] = "infra_check_detected"
-    phase_id: str
-    command: str
-    reason: str
-
-
-class InfraRepairDispatched(_Event):
-    # A bounded, host-guarded senior infra-repair was dispatched against the gate's
-    # tip worktree to make the environment satisfiable. ``attempt`` is 1-based;
-    # ``cap`` is the configured infra_repair.attempts ceiling.
-    event: Literal["infra_repair_dispatched"] = "infra_repair_dispatched"
-    phase_id: str
-    command: str
-    attempt: int
-    cap: int
-
-
-class InfraRepairResolved(_Event):
-    # A senior infra-repair fixed the environment: the previously infra-failing
-    # gate checks now pass (re-run deterministically). ``attempt`` is the cycle
-    # that resolved it.
-    event: Literal["infra_repair_resolved"] = "infra_repair_resolved"
-    phase_id: str
-    attempt: int
-
-
-class InfraRepairExhausted(_Event):
-    # The infra-repair cap was reached and the gate is STILL infra-failing. The run
-    # escalates to a human; ``command`` names the unsatisfiable tool/command so the
-    # message is clear (not a vague worker failure).
-    event: Literal["infra_repair_exhausted"] = "infra_repair_exhausted"
-    phase_id: str
-    command: str
-    reason: str
-
-
 class TaskDispatched(_Event):
     event: Literal["task_dispatched"] = "task_dispatched"
     epoch_id: str
     task_id: str
-
-
-class TaskRetried(_Event):
-    event: Literal["task_retried"] = "task_retried"
-    epoch_id: str
-    task_id: str
-    attempt: int
-
-
-class TaskEscalated(_Event):
-    event: Literal["task_escalated"] = "task_escalated"
-    epoch_id: str
-    task_id: str
-    tier: str
 
 
 class TaskDone(_Event):
@@ -233,8 +99,11 @@ class TaskDone(_Event):
     task_id: str
 
 
-class TaskFailed(_Event):
-    event: Literal["task_failed"] = "task_failed"
+# --- gate + triage -------------------------------------------------------------
+
+
+class HandoffAccepted(_Event):
+    event: Literal["handoff_accepted"] = "handoff_accepted"
     epoch_id: str
     task_id: str
 
@@ -246,35 +115,23 @@ class HandoffRejected(_Event):
     reason: str
 
 
-class TaskVerificationStarted(_Event):
-    # One task's agentic verification began: the task cleared its deterministic floor
-    # (handoff + scope + grounding) and carries criteria, so a FRESH same-tier critic
-    # judges them against the produced artifact in the task's scratch. ``criteria`` is
-    # how many were judged; ``tier`` is the tier that built (and verifies) the task.
-    event: Literal["task_verification_started"] = "task_verification_started"
+class Verdict(_Event):
+    # The agentic critic's triage of one task. ``outcome`` is PASS / RETRY /
+    # ESCALATE; ``reason`` is its free-text note (carried forward to the planner
+    # or the retry).
+    event: Literal["verdict"] = "verdict"
     epoch_id: str
     task_id: str
-    criteria: int
-    tier: str
+    outcome: Literal["PASS", "RETRY", "ESCALATE"]
+    reason: str = ""
 
 
-class TaskVerificationPassed(_Event):
-    # The task's verification judged EVERY criterion met by the actual artifact; the
-    # task's semantic gate is clear and it counts as DONE.
-    event: Literal["task_verification_passed"] = "task_verification_passed"
-    epoch_id: str
-    task_id: str
-
-
-class TaskVerificationFailed(_Event):
-    # The task's verification found an unmet criterion (or could not produce a valid
-    # verdict, a fail-safe). It routes into the task's OWN retry ladder as a chainable
-    # failure (incremental repair against the prior-verdict anchor); ``gaps`` names what
-    # was unmet, fed to the repair worker as the corrective.
-    event: Literal["task_verification_failed"] = "task_verification_failed"
-    epoch_id: str
-    task_id: str
-    gaps: list[str]
+class RateLimited(_Event):
+    # BONES failure model #1: a rate-limit / quota refusal on a role. The loop
+    # backs off (~1/hr) and retries; ``role`` is planner / worker / senior.
+    event: Literal["rate_limited"] = "rate_limited"
+    role: str
+    detail: str = ""
 
 
 Event = Annotated[
@@ -282,35 +139,15 @@ Event = Annotated[
         RunStarted,
         RunResumed,
         RunCompleted,
-        RunEscalated,
-        RunFailed,
-        FinalPolishApplied,
-        FinalPolishSkipped,
-        PlannerCallStarted,
-        PlannerCallSucceeded,
-        PlannerCallFailed,
-        SkeletonProposed,
-        PhasesRevised,
-        PhaseStarted,
-        PhasePassed,
-        PhaseEscalated,
+        RunEnded,
         EpochStarted,
         EpochCompleted,
-        EpochFailed,
-        FailedEpochHandled,
-        InfraCheckDetected,
-        InfraRepairDispatched,
-        InfraRepairResolved,
-        InfraRepairExhausted,
         TaskDispatched,
-        TaskRetried,
-        TaskEscalated,
         TaskDone,
-        TaskFailed,
-        TaskVerificationStarted,
-        TaskVerificationPassed,
-        TaskVerificationFailed,
+        HandoffAccepted,
         HandoffRejected,
+        Verdict,
+        RateLimited,
     ],
     Field(discriminator="event"),
 ]
@@ -343,13 +180,11 @@ def _truncate_torn_tail(path: Path) -> None:
 class JournalWriter:
     """Append-only NDJSON writer: one event per line, flushed + fsynced.
 
-    Opened in append mode (crash-safe). Enforces strictly increasing ``seq`` so
-    a programming error cannot silently corrupt replay ordering.
-
-    Internally thread-safe (S2 ruling 2): a single lock guards every write, so
-    concurrent fan-out tasks may journal at the same time without corrupting the
-    stream. ``emit`` is the concurrency-safe primitive, it assigns the next seq
-    and writes the event **atomically under the lock**, so seq stays strictly
+    Opened in append mode (crash-safe). Enforces strictly increasing ``seq`` so a
+    programming error cannot silently corrupt replay ordering. Internally
+    thread-safe: a single lock guards every write, so concurrent fan-out tasks may
+    journal at the same time without corrupting the stream. ``emit`` assigns the
+    next seq and writes the event atomically under the lock, so seq stays strictly
     monotonic even when two tasks race; their events simply interleave. ``append``
     (explicit-seq, single-threaded scaffold + tests) shares the same lock.
     """
@@ -382,9 +217,9 @@ class JournalWriter:
     def emit(self, factory: Callable[[int], Event]) -> Event:
         """Assign the next seq and write the event the factory builds, atomically.
 
-        The seq is read and advanced inside the lock, so two concurrent callers
-        can never be handed the same seq nor write out of order. Returns the
-        written event (with its assigned seq) for the caller's bookkeeping.
+        The seq is read and advanced inside the lock, so two concurrent callers can
+        never be handed the same seq nor write out of order. Returns the written
+        event (with its assigned seq) for the caller's bookkeeping.
         """
 
         with self._lock:
@@ -410,8 +245,8 @@ class JournalWriter:
 def read_events(path: Path) -> list[Event]:
     """Read the journal, tolerating a truncated final line (crash mid-write).
 
-    A crash can leave a half-written last line; that line is skipped, never
-    raised. Corruption of any earlier line is a real error and propagates.
+    A crash can leave a half-written last line; that line is skipped, never raised.
+    Corruption of any earlier line is a real error and propagates.
     """
 
     with open(path, "r", encoding="utf-8") as fh:
@@ -438,11 +273,10 @@ class TaskNode:
     id: str
     mode: str
     status: str
-    attempt: int
     started_ts: str | None = None
     ended_ts: str | None = None
-    #: A transient note worth surfacing: a handoff-rejection reason (cleared on
-    #: success) or the tier a task escalated to. Most-recent wins.
+    #: A transient note worth surfacing: a handoff-rejection reason or the critic's
+    #: verdict reason (cleared on done). Most-recent wins.
     note: str | None = None
 
 
@@ -457,40 +291,21 @@ class EpochNode:
 
 
 @dataclass
-class PhaseNode:
-    id: str
-    title: str
-    status: str
-    epochs: list[EpochNode]
-    started_ts: str | None = None
-    ended_ts: str | None = None
-
-
-@dataclass
 class RunTree:
     run_id: str
     job_path: str
     status: str
-    planner_calls: int
-    phases: list[PhaseNode] = field(default_factory=list)
-    #: The planner-call backstop (from RunStarted), for an "n/N" header. None = off.
-    planner_cap: int | None = None
+    epochs: list[EpochNode] = field(default_factory=list)
+    #: The epoch backstop (from RunStarted), for an "n/N" header. None = off.
+    max_epochs: int | None = None
     started_ts: str | None = None
     ended_ts: str | None = None
-    #: ts of the most recent event seen, the journal's notion of "now", used as
-    #: the elapsed-clock reference when no wall clock is injected (e.g. snapshots).
+    #: ts of the most recent event seen, the journal's notion of "now".
     last_ts: str | None = None
-    #: RunEscalated / RunFailed reason (the terminal "why").
-    escalation_reason: str | None = None
-    #: True between a planner_call_started and its outcome (call in flight).
-    planner_waiting: bool = False
-    #: Classification of the most recent planner FAILURE, cleared on next success.
-    last_planner_failure: str | None = None
-    #: Tool of the most recent planner SUCCESS (the planner's last decision).
-    last_planner_tool: str | None = None
-    #: B5 final-polish outcome, "applied: <sha>" / "skipped: <reason>" / None
-    #: when the optional polish pass never ran (off, or run not completed).
-    final_polish: str | None = None
+    #: The RunEnded pending-summary (clean partial-end resume seed), if ended.
+    end_summary: str | None = None
+    #: The most recent rate-limit signal "role: detail", cleared on the next epoch.
+    last_rate_limit: str | None = None
 
 
 def _task(epoch: EpochNode, task_id: str) -> TaskNode:
@@ -501,19 +316,17 @@ def _task(epoch: EpochNode, task_id: str) -> TaskNode:
 
 
 def replay(events: list[Event]) -> RunTree:
-    """Fold an event list into the run -> phase -> epoch -> task tree snapshot."""
+    """Fold an event list into the run -> epoch -> task tree snapshot."""
 
     tree: RunTree | None = None
-    phases_by_id: dict[str, PhaseNode] = {}
     epochs_by_id: dict[str, EpochNode] = {}
 
     for ev in events:
         if isinstance(ev, RunStarted):
             tree = RunTree(
-                ev.run_id, ev.job_path, "running", 0,
-                planner_cap=ev.max_planner_calls, started_ts=ev.ts, last_ts=ev.ts,
+                ev.run_id, ev.job_path, "running",
+                max_epochs=ev.max_epochs, started_ts=ev.ts, last_ts=ev.ts,
             )
-            phases_by_id = {}
             epochs_by_id = {}
             continue
         if tree is None:
@@ -525,105 +338,42 @@ def replay(events: list[Event]) -> RunTree:
         elif isinstance(ev, RunCompleted):
             tree.status = "completed"
             tree.ended_ts = ev.ts
-        elif isinstance(ev, RunEscalated):
-            tree.status = "escalated"
+        elif isinstance(ev, RunEnded):
+            tree.status = "ended"
             tree.ended_ts = ev.ts
-            tree.escalation_reason = ev.reason
-        elif isinstance(ev, RunFailed):
-            tree.status = "failed"
-            tree.ended_ts = ev.ts
-            tree.escalation_reason = ev.reason
-        elif isinstance(ev, FinalPolishApplied):
-            tree.final_polish = f"applied: {ev.commit[:12]} ({len(ev.changed_files)} files)"
-        elif isinstance(ev, FinalPolishSkipped):
-            tree.final_polish = f"skipped: {ev.reason}"
-        elif isinstance(ev, PlannerCallStarted):
-            tree.planner_calls += 1
-            tree.planner_waiting = True
-        elif isinstance(ev, PlannerCallSucceeded):
-            tree.planner_waiting = False
-            tree.last_planner_tool = ev.tool
-            tree.last_planner_failure = None
-        elif isinstance(ev, PlannerCallFailed):
-            tree.planner_waiting = False
-            tree.last_planner_failure = ev.classification
-        elif isinstance(ev, SkeletonProposed):
-            for ref in ev.phases:
-                node = PhaseNode(ref.id, ref.title, "pending", [])
-                tree.phases.append(node)
-                phases_by_id[ref.id] = node
-        elif isinstance(ev, PhasesRevised):
-            kept = [ph for ph in tree.phases if ph.status != "pending"]
-            kept_ids = {ph.id for ph in kept}
-            for ref in ev.phases:
-                if ref.id in kept_ids:
-                    continue
-                kept.append(PhaseNode(ref.id, ref.title, "pending", []))
-            tree.phases = kept
-            phases_by_id = {ph.id: ph for ph in kept}
-        elif isinstance(ev, PhaseStarted):
-            phase = phases_by_id[ev.phase_id]
-            phase.status = "started"
-            phase.started_ts = ev.ts
-        elif isinstance(ev, PhasePassed):
-            phase = phases_by_id[ev.phase_id]
-            phase.status = "passed"
-            phase.ended_ts = ev.ts
-        elif isinstance(ev, PhaseEscalated):
-            phase = phases_by_id[ev.phase_id]
-            phase.status = "escalated"
-            phase.ended_ts = ev.ts
+            tree.end_summary = ev.summary
+        elif isinstance(ev, RateLimited):
+            tree.last_rate_limit = f"{ev.role}: {ev.detail}" if ev.detail else ev.role
         elif isinstance(ev, EpochStarted):
-            tasks = [TaskNode(t.id, t.mode, "pending", 0) for t in ev.tasks]
+            tasks = [TaskNode(t.id, t.mode, "pending") for t in ev.tasks]
             epoch = EpochNode(ev.epoch_id, ev.title, "started", tasks, started_ts=ev.ts)
-            phases_by_id[ev.phase_id].epochs.append(epoch)
+            tree.epochs.append(epoch)
             epochs_by_id[ev.epoch_id] = epoch
+            tree.last_rate_limit = None  # a fresh epoch supersedes a stale backoff
         elif isinstance(ev, EpochCompleted):
             epoch = epochs_by_id[ev.epoch_id]
             epoch.status = "completed"
             epoch.ended_ts = ev.ts
-        elif isinstance(ev, EpochFailed):
-            epoch = epochs_by_id[ev.epoch_id]
-            epoch.status = "failed"
-            epoch.ended_ts = ev.ts
-        elif isinstance(ev, FailedEpochHandled):
-            epochs_by_id[ev.epoch_id].status = f"failed ({ev.action})"
-        elif isinstance(ev, TaskVerificationStarted):
-            _task(epochs_by_id[ev.epoch_id], ev.task_id).status = "verifying"
-        elif isinstance(ev, TaskVerificationPassed):
-            _task(epochs_by_id[ev.epoch_id], ev.task_id).status = "verified"
-        elif isinstance(ev, TaskVerificationFailed):
-            # The per-task agentic verdict found a gap; surface it as the task note
-            # (the retry ladder will try to close it on the next attempt).
-            task = _task(epochs_by_id[ev.epoch_id], ev.task_id)
-            task.status = "verification_failed"
-            task.note = "; ".join(ev.gaps) if ev.gaps else None
         elif isinstance(ev, TaskDispatched):
             task = _task(epochs_by_id[ev.epoch_id], ev.task_id)
             task.status = "dispatched"
             if task.started_ts is None:  # first dispatch; retries keep the origin
                 task.started_ts = ev.ts
-        elif isinstance(ev, TaskRetried):
+        elif isinstance(ev, HandoffAccepted):
+            _task(epochs_by_id[ev.epoch_id], ev.task_id).status = "handoff_accepted"
+        elif isinstance(ev, HandoffRejected):
             task = _task(epochs_by_id[ev.epoch_id], ev.task_id)
-            task.status = "retried"
-            task.attempt = ev.attempt
-        elif isinstance(ev, TaskEscalated):
+            task.status = "handoff_rejected"
+            task.note = ev.reason
+        elif isinstance(ev, Verdict):
             task = _task(epochs_by_id[ev.epoch_id], ev.task_id)
-            task.status = "escalated"
-            task.ended_ts = ev.ts
-            task.note = f"→ {ev.tier}"
+            task.status = f"verdict_{ev.outcome.lower()}"
+            task.note = ev.reason or None
         elif isinstance(ev, TaskDone):
             task = _task(epochs_by_id[ev.epoch_id], ev.task_id)
             task.status = "done"
             task.ended_ts = ev.ts
-            task.note = None  # success clears any stale rejection note
-        elif isinstance(ev, TaskFailed):
-            task = _task(epochs_by_id[ev.epoch_id], ev.task_id)
-            task.status = "failed"
-            task.ended_ts = ev.ts
-        elif isinstance(ev, HandoffRejected):
-            # The worker's disk contract was rejected; surface why (until resolved).
-            _task(epochs_by_id[ev.epoch_id], ev.task_id).note = ev.reason
+            task.note = None  # success clears any stale rejection / verdict note
 
     if tree is None:
         raise ValueError("empty event stream: no run_started")

@@ -1,317 +1,90 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "grindstone/epoch_decision/v1",
-  "title": "Grindstone planner decision (one constrained tool-call per planner invocation)",
-  "type": "object",
-  "required": ["schema_version", "tool", "args"],
-  "additionalProperties": false,
-  "properties": {
-    "schema_version": { "const": "1" },
-    "tool": {
-      "enum": [
-        "propose_skeleton",
-        "research",
-        "implement",
-        "review",
-        "artifact",
-        "revise_phases",
-        "handle_failed_epoch",
-        "phase_complete",
-        "escalate_run",
-        "complete_run"
-      ]
-    },
-    "args": { "type": "object" }
-  },
-  "allOf": [
-    {
-      "if": { "properties": { "tool": { "const": "propose_skeleton" } } },
-      "then": { "properties": { "args": { "$ref": "#/$defs/skeleton_args" } } }
-    },
-    {
-      "if": { "properties": { "tool": { "const": "implement" } } },
-      "then": { "properties": { "args": { "$ref": "#/$defs/implement_epoch_args" } } }
-    },
-    {
-      "if": { "properties": { "tool": { "enum": ["research", "review", "artifact"] } } },
-      "then": { "properties": { "args": { "$ref": "#/$defs/artifact_epoch_args" } } }
-    },
-    {
-      "if": { "properties": { "tool": { "const": "revise_phases" } } },
-      "then": { "properties": { "args": { "$ref": "#/$defs/revise_phases_args" } } }
-    },
-    {
-      "if": { "properties": { "tool": { "const": "handle_failed_epoch" } } },
-      "then": { "properties": { "args": { "$ref": "#/$defs/handle_failed_epoch_args" } } }
-    },
-    {
-      "if": { "properties": { "tool": { "const": "phase_complete" } } },
-      "then": { "properties": { "args": { "$ref": "#/$defs/phase_complete_args" } } }
-    },
-    {
-      "if": { "properties": { "tool": { "const": "escalate_run" } } },
-      "then": { "properties": { "args": { "$ref": "#/$defs/escalate_run_args" } } }
-    },
-    {
-      "if": { "properties": { "tool": { "const": "complete_run" } } },
-      "then": { "properties": { "args": { "$ref": "#/$defs/complete_run_args" } } }
-    }
+  "title": "Grindstone planner decision (one boundary): propose an epoch, or end the run. Pydantic (grindstone.contracts.models) is the source of truth; this schema mirrors it.",
+  "oneOf": [
+    { "$ref": "#/$defs/epoch_decision" },
+    { "$ref": "#/$defs/end_decision" }
   ],
   "$defs": {
     "log_key": {
       "type": "string",
       "pattern": "^[A-Za-z0-9][a-zA-Z0-9._/-]{0,127}$",
-      "description": "Key into the run's durable keyed log. Validator additionally requires the key to EXIST when used as an input."
+      "description": "A relative path under the run dir's keyed log."
     },
-    "check": {
-      "description": "One deterministic check. Machine-checkable by construction: a command with an expected exit code, or a required validated artifact.",
-      "oneOf": [
-        {
-          "type": "object",
-          "required": ["cmd"],
-          "additionalProperties": false,
-          "properties": {
-            "cmd": { "type": "string", "minLength": 1, "maxLength": 512 },
-            "expect_exit": { "type": "integer", "default": 0 }
-          }
-        },
-        {
-          "type": "object",
-          "required": ["artifact_exists"],
-          "additionalProperties": false,
-          "properties": {
-            "artifact_exists": { "$ref": "#/$defs/log_key" }
-          }
-        },
-        {
-          "type": "object",
-          "required": ["vision_review"],
-          "additionalProperties": false,
-          "description": "Taste gate (B3): codex judges a rendered-UI screenshot against criteria and writes a pass/fail verdict (vision_verdict.json) the core re-reads. The screenshot is a path RELATIVE TO THE EVAL WORKTREE that a PRIOR cmd check in the same list produced.",
-          "properties": {
-            "vision_review": {
-              "type": "object",
-              "required": ["screenshot", "criteria"],
-              "additionalProperties": false,
-              "properties": {
-                "screenshot": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$", "description": "Path RELATIVE TO THE EVAL WORKTREE; no leading '/' and no '..' segment (it must not escape the worktree)." },
-                "criteria": { "type": "string", "minLength": 1, "maxLength": 2048 }
-              }
-            }
-          }
-        }
-      ]
-    },
-    "phase": {
+    "epoch_decision": {
       "type": "object",
-      "required": ["id", "title", "exit_criterion", "epoch_budget"],
+      "required": ["kind", "epoch"],
       "additionalProperties": false,
       "properties": {
-        "id": { "type": "string", "pattern": "^P[1-9][0-9]?$" },
-        "title": { "type": "string", "minLength": 1, "maxLength": 120 },
-        "exit_criterion": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/check" },
-          "minItems": 1,
-          "maxItems": 8
-        },
-        "epoch_budget": { "type": "integer", "minimum": 1, "maximum": 20 }
+        "kind": { "const": "epoch" },
+        "epoch": { "$ref": "#/$defs/epoch" }
       }
     },
-    "task_base": {
+    "end_decision": {
       "type": "object",
-      "required": ["id", "goal", "done_when"],
+      "required": ["kind", "summary"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "end" },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "description": "The phase handoff / pending-summary: the resume seed that lets the work continue as the next appendable run (a clean end, or a satisfied done)."
+        }
+      }
+    },
+    "epoch": {
+      "type": "object",
+      "required": ["title", "tasks"],
+      "additionalProperties": false,
+      "properties": {
+        "title": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "rationale": { "type": "string", "maxLength": 2048, "default": "" },
+        "tasks": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": { "$ref": "#/$defs/task" }
+        },
+        "setup": {
+          "type": "array",
+          "maxItems": 8,
+          "default": [],
+          "description": "Planner-declared (trusted-tier) host setup/install commands the orchestrator runs before the tasks. The untrusted worker never improvises host mutations.",
+          "items": { "type": "string", "minLength": 1, "maxLength": 512 }
+        }
+      }
+    },
+    "task": {
+      "type": "object",
+      "required": ["id", "mode", "goal"],
+      "additionalProperties": false,
+      "description": "One fanned-out unit. An implement task owns files; a research/review/artifact task produces one artifact at a log key (the implement-vs-artifact shape rule is enforced by the Pydantic model).",
       "properties": {
         "id": { "type": "string", "pattern": "^T[1-8]$" },
-        "goal": { "type": "string", "minLength": 1, "maxLength": 1024 },
-        "inputs": {
+        "mode": { "enum": ["implement", "research", "review", "artifact"] },
+        "goal": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "tier": { "enum": ["local", "senior"], "default": "local" },
+        "file_ownership": {
           "type": "array",
-          "items": { "$ref": "#/$defs/log_key" },
-          "maxItems": 12,
-          "default": []
+          "maxItems": 32,
+          "default": [],
+          "items": { "type": "string", "minLength": 1, "maxLength": 256 }
         },
-        "done_when": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/check" },
-          "minItems": 1,
-          "maxItems": 6
-        },
-        "criteria": {
-          "description": "Natural-language semantic acceptance statements judged later by an agentic verification pass, never by a shell command. Deterministic done_when/checks cover STRUCTURAL facts (build, test, type-check, file existence); content/semantic acceptance belongs here. Optional; each entry is a non-empty prose statement.",
-          "type": "array",
-          "items": { "type": "string", "minLength": 1, "maxLength": 512 },
-          "maxItems": 8,
-          "default": []
-        },
+        "artifact_out": { "$ref": "#/$defs/log_key" },
         "skills": {
           "type": "array",
-          "items": { "type": "string", "maxLength": 64 },
           "maxItems": 6,
-          "default": []
+          "default": [],
+          "items": { "type": "string", "minLength": 1, "maxLength": 64 }
         },
-        "senior": {
-          "description": "Per-task tier routing: true routes THIS task to the senior tier (judgment/taste work: layout, polish, approach synthesis, a design-quality verdict); false (the default) runs it on the local rig (mechanical/factual work: scaffolding, tokens, boilerplate, web-search fact gathering, a structural review). Routing is per task, not per epoch, so one epoch can split a mechanical local slice from a taste senior slice. A rig with no senior tier falls back to local. Also picks the size-gate file-count cap (senior tasks get the larger bound). Optional; defaults false.",
-          "type": "boolean",
-          "default": false
-        }
-      }
-    },
-    "implement_task": {
-      "allOf": [{ "$ref": "#/$defs/task_base" }],
-      "required": ["id", "goal", "done_when", "file_ownership"],
-      "unevaluatedProperties": false,
-      "properties": {
-        "file_ownership": {
-          "description": "Path globs this task owns. Pairwise disjoint across the epoch (validator-enforced); the task diff must stay inside them (post-return check).",
+        "inputs": {
           "type": "array",
-          "items": { "type": "string", "minLength": 1, "maxLength": 256 },
-          "minItems": 1,
-          "maxItems": 32
-        }
-      }
-    },
-    "artifact_task": {
-      "allOf": [{ "$ref": "#/$defs/task_base" }],
-      "required": ["id", "goal", "done_when", "artifact_out"],
-      "unevaluatedProperties": false,
-      "properties": {
-        "artifact_out": { "$ref": "#/$defs/log_key" },
-        "targets": {
-          "description": "Paths under review/research. Required for review epochs (semantic validator rule).",
-          "type": "array",
-          "items": { "type": "string", "maxLength": 256 },
-          "maxItems": 32
-        }
-      }
-    },
-    "epoch_args_base": {
-      "type": "object",
-      "required": ["epoch_title", "rationale", "tasks"],
-      "properties": {
-        "epoch_title": { "type": "string", "minLength": 1, "maxLength": 120 },
-        "rationale": { "type": "string", "maxLength": 2048 }
-      }
-    },
-    "implement_epoch_args": {
-      "allOf": [{ "$ref": "#/$defs/epoch_args_base" }],
-      "unevaluatedProperties": false,
-      "properties": {
-        "tasks": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/implement_task" },
-          "minItems": 1,
-          "maxItems": 8
-        }
-      }
-    },
-    "artifact_epoch_args": {
-      "allOf": [{ "$ref": "#/$defs/epoch_args_base" }],
-      "unevaluatedProperties": false,
-      "properties": {
-        "tasks": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/artifact_task" },
-          "minItems": 1,
-          "maxItems": 8
-        }
-      }
-    },
-    "skeleton_args": {
-      "type": "object",
-      "required": ["phases"],
-      "additionalProperties": false,
-      "properties": {
-        "phases": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/phase" },
-          "minItems": 2,
-          "maxItems": 10
-        }
-      }
-    },
-    "revise_phases_args": {
-      "type": "object",
-      "required": ["reason", "phases"],
-      "additionalProperties": false,
-      "properties": {
-        "reason": { "type": "string", "minLength": 1, "maxLength": 1024 },
-        "phases": {
-          "description": "Replacement TAIL of the skeleton: current phase onward. May not alter completed phases (semantic validator rule).",
-          "type": "array",
-          "items": { "$ref": "#/$defs/phase" },
-          "minItems": 1,
-          "maxItems": 10
-        }
-      }
-    },
-    "handle_failed_epoch_args": {
-      "type": "object",
-      "description": "A FOCUSED disposition of an epoch that FAILED (a task exhausted its retry ladder, and/or the phase gate kept failing). Exactly one action: retry the epoch (optionally with a corrective hint / escalated tier), escalate it to the senior tier with a diagnosis, or halt the run for a human when the epoch is not satisfiable as specified. This is NOT revise_phases (the phase STRUCTURE is fine) and NOT a fresh work epoch.",
-      "required": ["action"],
-      "oneOf": [
-        {
-          "required": ["action", "hint"],
-          "additionalProperties": false,
-          "properties": {
-            "action": { "const": "retry" },
-            "hint": { "type": "string", "minLength": 1, "maxLength": 2048, "description": "Corrective guidance fed to the retried epoch's workers (e.g. the missing step, the misread requirement)." },
-            "escalate_tier": { "type": "boolean", "default": false, "description": "Start the retried epoch on the senior tier instead of the mode default." }
-          }
-        },
-        {
-          "required": ["action", "diagnosis"],
-          "additionalProperties": false,
-          "properties": {
-            "action": { "const": "escalate_senior" },
-            "diagnosis": { "type": "string", "minLength": 1, "maxLength": 2048, "description": "Why the local rig could not satisfy the epoch; handed to the senior tier." }
-          }
-        },
-        {
-          "required": ["action", "reason"],
-          "additionalProperties": false,
-          "properties": {
-            "action": { "const": "halt" },
-            "reason": { "type": "string", "minLength": 1, "maxLength": 2048, "description": "Why the epoch is not satisfiable as specified (e.g. the gate/environment is suspect, not the code). Stops the run for human attention." }
-          }
-        }
-      ]
-    },
-    "phase_complete_args": {
-      "type": "object",
-      "description": "Judge the CURRENT phase complete against its goal. Legal only once the build-health floor is green and the phase's deliverables exist. Carries the concrete deliverable artifacts that satisfy the phase goal; the core re-checks each one EXISTS (existence only, not a quality judgement) before the phase ends, and bounces the decision back to planning if any is missing.",
-      "required": ["summary", "deliverables"],
-      "additionalProperties": false,
-      "properties": {
-        "summary": { "type": "string", "minLength": 1, "maxLength": 2048, "description": "Why the phase goal is satisfied by the cited deliverables." },
-        "deliverables": {
-          "description": "Concrete repo-relative deliverable artifact paths that satisfy the phase goal; each is existence-checked in the integration-tip tree before the phase passes. No wildcard globs: enumerate the concrete files.",
-          "type": "array",
-          "items": { "type": "string", "minLength": 1, "maxLength": 256 },
-          "minItems": 1,
-          "maxItems": 32
-        }
-      }
-    },
-    "escalate_run_args": {
-      "type": "object",
-      "required": ["reason"],
-      "additionalProperties": false,
-      "properties": {
-        "reason": { "type": "string", "minLength": 1, "maxLength": 2048 },
-        "needed_from_human": { "type": "string", "maxLength": 1024 }
-      }
-    },
-    "complete_run_args": {
-      "type": "object",
-      "required": ["summary", "evidence"],
-      "additionalProperties": false,
-      "properties": {
-        "summary": { "type": "string", "minLength": 1, "maxLength": 2048 },
-        "evidence": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/check" },
-          "minItems": 1,
-          "maxItems": 8
+          "maxItems": 12,
+          "default": [],
+          "items": { "$ref": "#/$defs/log_key" }
         }
       }
     }
