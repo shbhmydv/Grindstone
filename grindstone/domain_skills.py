@@ -1,9 +1,9 @@
 """Target-repo-owned DOMAIN skills: a catalogue the TARGET repo carries, the
 planner SELECTS per task by judgment, and the core DELIVERS into the worker prompt.
 
-Distinct from the grindstone-OWNED operating skills (``skills/operating/``,
-selected deterministically by run state, see ``config.load_operating_skill``):
-domain skills live in the TARGET repo, are chosen by the planner's JUDGMENT (a
+Distinct from the grindstone-OWNED operating instructions (the byte-stable
+``PLANNER_CORE`` + per-mode worker guidance composed in code): domain skills live
+in the TARGET repo, are chosen by the planner's JUDGMENT (a
 task's ``skills`` field), and are delivered RETRIEVE-not-concatenate, the worker
 prompt carries only the SELECTED skills, never the whole catalogue. An absent
 catalogue (no ``.grindstone/skills/`` dir, or no ``index.md``) is a graceful no-op

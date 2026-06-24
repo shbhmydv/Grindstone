@@ -40,38 +40,6 @@ _CONFIG_REL = Path(".grindstone") / "config.yaml"
 #: ``script:`` must live UNDER here unless the operator opts out (below).
 MODELS_DIR = Path(__file__).resolve().parents[1] / "models"
 
-#: This rig's bundled operating-skills directory (``skills/`` beside the package),
-#: mirrors ``MODELS_DIR``. Grindstone owns these backend-agnostic markdown skills:
-#: an operating skill is the thin, deterministically-selected guidance a ROLE
-#: (planner / worker / senior) gets for ONE call situation, composed into the
-#: prompt as plain text (never a backend flag). They live under
-#: ``skills/operating/<role>/<scenario>.md``; ``load_operating_skill`` resolves them.
-SKILLS_DIR = Path(__file__).resolve().parents[1] / "skills"
-
-#: The operating-skills subtree under ``SKILLS_DIR`` (room for repo-owned domain
-#: skills under a sibling subtree later).
-_OPERATING_SUBDIR = "operating"
-
-
-def load_operating_skill(role: str, scenario: str) -> str:
-    """Read the operating skill ``skills/operating/<role>/<scenario>.md``.
-
-    Role-generic on purpose: the planner selects one of its scenarios today, and
-    the worker / senior roles reuse the SAME loader for their own scenarios. The
-    skill is returned verbatim for the caller to compose into the prompt. Raises
-    ``FileNotFoundError`` (naming the resolved path) when the file is missing, a
-    selector that names a scenario with no skill file is a build error, never a
-    silent empty prompt.
-    """
-
-    path = SKILLS_DIR / _OPERATING_SUBDIR / role / f"{scenario}.md"
-    try:
-        return path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise FileNotFoundError(
-            f"no operating skill for role={role!r} scenario={scenario!r} at {path}"
-        ) from exc
-
 #: The tracked base rig: the shipped Claude (Opus) scripts a fresh cloner runs with
 #: zero setup. ``models_script`` always falls back here (the floor).
 _CLAUDE_FLOOR = "claude"
@@ -236,12 +204,27 @@ class GrindstoneConfig(BaseModel):
     #: model #2, involuntary trigger). ``None`` = the CLI's built-in default, NEVER
     #: unbounded (a stuck planner that spins without progress must be bounded).
     max_epochs: int | None = None
+    #: The job's OWN final acceptance (BONES invariant #2): a single shell command
+    #: run ONCE, in a throwaway checkout of the integration tip, when the planner
+    #: emits END. Exit 0 -> the run is ``completed``; non-zero -> the END is a clean
+    #: partial-end (``ended``) whose summary seeds the next run. ``None`` = trust the
+    #: planner's END (no deterministic final gate). This is the SINGLE build gate; it
+    #: is NOT a per-epoch check (those stay agentic). Owner-authored + trusted, the
+    #: same trust tier as a planner-declared ``setup`` command.
+    done_when: str | None = None
 
     @field_validator("max_epochs")
     @classmethod
     def _max_epochs_positive(cls, v: int | None) -> int | None:
         if v is not None and v < 1:
             raise ValueError("max_epochs must be >= 1")
+        return v
+
+    @field_validator("done_when")
+    @classmethod
+    def _done_when_nonempty(cls, v: str | None) -> str | None:
+        if v is not None and not v.strip():
+            raise ValueError("done_when must be a non-empty command (or omitted)")
         return v
 
 

@@ -17,7 +17,7 @@ silently lacked type checks for ``what_changed``/``not_done``/``downstream_needs
 so workers passed self-validation and burned attempts at the core gate.
 
 Hand-coded here are only the context rules the schema cannot express: exact
-``task_id`` match, the mode citation requirement (``semantics.py``), citation
+``task_id`` match, the mode citation requirement (research/review must cite), citation
 files existing on disk, and the canonical-size cap. The corpus-equivalence test
 remains the fence pinning script verdicts to the core gate.
 """
@@ -30,7 +30,7 @@ from pathlib import Path
 from grindstone.contracts.models import HANDOFF_MAX_BYTES, HandoffMode
 
 #: The filename the script is written as, and the done_when command that re-runs
-#: it. Co-located with the generator so the core (task_loop) reuses both.
+#: it. Co-located with the generator so the core (``worker.py``) reuses both.
 CHECK_SCRIPT_NAME = "check_handoff.py"
 CHECK_COMMAND = f"python3 {CHECK_SCRIPT_NAME}"
 

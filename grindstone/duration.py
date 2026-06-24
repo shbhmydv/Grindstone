@@ -1,7 +1,7 @@
-"""Elapsed-time formatting shared by the TUI and the journal render.
+"""Elapsed-time formatting for the journal render.
 
-Pure, ``rich``-free arithmetic over ISO-8601 timestamps so the core run loop can
-write the post-mortem journal without importing the terminal-UI stack.
+Pure, dependency-free arithmetic over ISO-8601 timestamps so the journal
+post-mortem (``journal.py``) can show per-epoch / per-task durations.
 """
 
 from __future__ import annotations

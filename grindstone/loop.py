@@ -48,6 +48,13 @@ from pathlib import Path
 from typing import Callable, Literal, Protocol, Sequence
 
 from grindstone import worktree as wt
+from grindstone.config import (
+    GrindstoneConfig,
+    load_config,
+    models_script,
+    resolve_role_script,
+    validate_script_paths,
+)
 from grindstone.contracts.models import (
     Decision,
     EndDecision,
@@ -73,9 +80,12 @@ from grindstone.events import (
     read_events,
 )
 from grindstone.events import Verdict as VerdictEvent
-from grindstone.planner import PlannerError
+from grindstone.journal import reap_sibling_journals, write_journal
+from grindstone.planner import PlannerError, ScriptPlanner
 from grindstone.planner import RateLimited as PlannerRateLimited
-from grindstone.rundir import RunDir
+from grindstone.rundir import RunDir, create_run_dir
+from grindstone.script_planner import ScriptPlannerTransport
+from grindstone.script_worker import build_backends
 from grindstone.worker import (
     Backends,
     RateLimited as WorkerRateLimited,
@@ -145,9 +155,51 @@ class Planner(Protocol):
 
 
 #: Invariant #2: the one final acceptance, run ONCE when the planner says done.
-#: An injected seam (a later part runs the job's own done_when in a tip worktree);
-#: ``None`` trusts the planner's word (the run completes).
+#: An injected seam: ``make_acceptance`` runs the job's own ``done_when`` in a
+#: throwaway checkout of the integration tip; ``None`` trusts the planner's word
+#: (the run completes, the default when no ``done_when`` is configured).
 AcceptanceCheck = Callable[[PlannerContext], bool]
+
+
+def make_acceptance(
+    done_when: str, *, timeout_s: float = SETUP_TIMEOUT_S
+) -> AcceptanceCheck:
+    """The single final gate (invariant #2): run the job's OWN ``done_when`` ONCE.
+
+    When the planner emits END, check out the integration tip in a throwaway
+    detached worktree and run ``done_when`` there exactly once: exit 0 -> the run is
+    ``completed``; any non-zero exit (or a failure to run) -> the planner's END is a
+    clean partial-end (``ended``) and its summary seeds the next appendable run. This
+    is deliberately the ONLY deterministic build gate (BONES: no per-epoch build
+    gates); it exists so "done" still means something when every per-epoch check is
+    agentic. With no repo / no tip there is nothing to check out, so the command runs
+    in the run dir (a degenerate but honest fallback)."""
+
+    def _check(context: PlannerContext) -> bool:
+        repo, tip = context.repo, context.tip_ref
+        if repo is None or tip is None:
+            return _run_acceptance(done_when, context.run_dir.root, timeout_s)
+        path = context.run_dir.worktrees_root / "_acceptance"
+        wt.add_worktree_detached(repo, path, ref=tip)
+        try:
+            return _run_acceptance(done_when, path, timeout_s)
+        finally:
+            wt.remove_worktree(repo, path)
+
+    return _check
+
+
+def _run_acceptance(command: str, cwd: Path, timeout_s: float) -> bool:
+    """Run the acceptance command once in ``cwd``; True iff it exits 0."""
+
+    try:
+        proc = subprocess.run(
+            command, shell=True, cwd=str(cwd), capture_output=True, text=True,
+            timeout=timeout_s,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
 
 
 @dataclass(frozen=True)
@@ -781,21 +833,116 @@ def _completed_count(events: Sequence[Event]) -> int:
     return len({e.epoch_id for e in events if isinstance(e, EpochCompleted)})
 
 
-# --- CLI seams (the real planner + backends wiring is a later part) ------------
+# --- CLI seams (config -> real planner + backends -> a process exit code) ------
+
+#: Terminal status -> process exit code: a clean ``completed`` is success; a
+#: ``ended`` partial-end is a non-zero "stopped, resumable" signal (the CLI surfaces
+#: a config / no-such-run error as 2, distinct from a real partial-end).
+_EXIT: dict[str, int] = {"completed": 0, "ended": 1}
+
+
+def _default_run_id() -> str:
+    """A UTC timestamp slug, e.g. ``20260624T142530Z`` (collision-resistant id)."""
+
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _require_config(repo: Path) -> GrindstoneConfig:
+    """Load + RCE-guard the repo config, or fail loudly toward ``grindstone init``.
+
+    The core ships no rig-specific defaults (ARCHITECTURE.md), so an absent config is
+    a hard error, and the loaded config is attacker-controlled (a cloned repo carries
+    its own), so every configured ``script:`` is path-guarded before it is ever run.
+    """
+
+    cfg = load_config(repo)
+    if cfg is None:
+        raise FileNotFoundError(
+            f"no .grindstone/config.yaml under {repo}; run `grindstone init` first "
+            "(core ships no rig defaults)"
+        )
+    validate_script_paths(cfg)
+    return cfg
+
+
+def _build_planner(cfg: GrindstoneConfig, repo: Path) -> ScriptPlanner:
+    """The real stateless planner: a ``ScriptPlanner`` over the ``planner`` role's
+    request script (the script owns transport + model identity + GPU arbitration)."""
+
+    rc = cfg.roles.planner
+    transport = ScriptPlannerTransport(
+        script=resolve_role_script("planner", rc),
+        stop_script=models_script("stop.sh", rig=rc.rig),
+        repo=repo,
+        slots=rc.slots,
+        timeout_s=rc.timeout_s,
+    )
+    return ScriptPlanner(transport=transport)
+
+
+def _acceptance_for(cfg: GrindstoneConfig) -> AcceptanceCheck | None:
+    """Invariant #2 from config: the job's ``done_when`` (run once in a tip worktree),
+    or ``None`` to trust the planner's END when no acceptance is configured."""
+
+    return make_acceptance(cfg.done_when) if cfg.done_when is not None else None
 
 
 def run(job_path: Path, repo_root: Path, *, run_id: str | None = None) -> int:
-    """Drive a job to a clean terminal (CLI seam: builds the real planner + backends
-    from config in a later part)."""
+    """Drive a FRESH job to a clean terminal: build the real planner + backends from
+    the repo config, create the run dir, and loop. Returns a process exit code
+    (``completed`` -> 0, ``ended`` -> 1). Raises ``FileNotFoundError`` / ``ValueError``
+    on a missing job, an absent config, or an unsafe config (the CLI maps those to 2)."""
 
-    raise NotImplementedError(
-        "the run wiring (config -> real planner + backends) is built in a later part"
+    repo = repo_root.resolve()
+    cfg = _require_config(repo)
+    run_id = run_id or _default_run_id()
+    run_dir = create_run_dir(repo, run_id)
+    reap_sibling_journals(run_dir)
+    log_root = run_dir.root / "logs"
+    log_root.mkdir(parents=True, exist_ok=True)
+    print(f"run {run_id} -> {run_dir.root}")
+
+    result = start_run(
+        job_path=job_path,
+        run_dir=run_dir,
+        repo=repo,
+        planner=_build_planner(cfg, repo),
+        backends=build_backends(cfg, log_root=log_root),
+        max_epochs=cfg.max_epochs if cfg.max_epochs is not None else DEFAULT_MAX_EPOCHS,
+        log_root=log_root,
+        acceptance=_acceptance_for(cfg),
     )
+    write_journal(run_dir)
+    print(f"{result.status}: {result.summary}")
+    return _EXIT[result.status]
 
 
 def resume(run_id: str, repo_root: Path) -> int:
-    """Re-enter a killed run from its last clean boundary (CLI seam: a later part)."""
+    """Re-enter a killed / crashed / rate-limited run from its last clean boundary
+    (BONES universal recovery primitive). Returns a process exit code. Raises
+    ``FileNotFoundError`` (no config, or no such run) / ``ValueError`` (unsafe config),
+    which the CLI maps to 2."""
 
-    raise NotImplementedError(
-        "the resume wiring (config -> real planner + backends) is built in a later part"
+    repo = repo_root.resolve()
+    cfg = _require_config(repo)
+    run_dir = RunDir(root=repo / ".grindstone" / "runs" / run_id)
+    if not run_dir.events_path.is_file():
+        raise FileNotFoundError(
+            f"no run {run_id!r} under {repo} (no events.ndjson at {run_dir.events_path})"
+        )
+    log_root = run_dir.root / "logs"
+    log_root.mkdir(parents=True, exist_ok=True)
+    print(f"resume {run_id} -> {run_dir.root}")
+
+    result = resume_run(
+        run_dir=run_dir,
+        repo=repo,
+        planner=_build_planner(cfg, repo),
+        backends=build_backends(cfg, log_root=log_root),
+        max_epochs=cfg.max_epochs,
+        log_root=log_root,
+        acceptance=_acceptance_for(cfg),
     )
+    write_journal(run_dir)
+    print(f"{result.status}: {result.summary}")
+    return _EXIT[result.status]

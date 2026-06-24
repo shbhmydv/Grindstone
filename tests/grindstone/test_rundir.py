@@ -1,14 +1,13 @@
-"""Run-dir layout: the keyed-log index, the log-key traversal guard, the external
-worktrees_root, and the atomic JSON write."""
+"""Run-dir layout: the keyed-log index, the log-key traversal guard, and the
+external worktrees_root."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
 
-from grindstone.rundir import RunDir, atomic_write_json, create_run_dir
+from grindstone.rundir import RunDir, create_run_dir
 
 
 def _run_dir(tmp_path: Path) -> RunDir:
@@ -21,7 +20,7 @@ def test_create_run_dir_layout(tmp_path: Path) -> None:
     rd = _run_dir(tmp_path)
     assert rd.root.is_dir()
     assert rd.events_path == rd.root / "events.ndjson"
-    assert rd.state_path == rd.root / "state.json"
+    assert rd.journal_path == rd.root / "journal.md"
 
 
 def test_create_run_dir_rejects_existing(tmp_path: Path) -> None:
@@ -39,12 +38,12 @@ def test_log_index_keys_phase_dirs_only(tmp_path: Path) -> None:
     (rd.root / "P1" / "report.md").write_text("hi", encoding="utf-8")
     # Non-phase run state must NOT appear in the keyed log.
     rd.events_path.write_text("", encoding="utf-8")
-    rd.state_path.write_text("{}", encoding="utf-8")
+    rd.journal_path.write_text("# journal\n", encoding="utf-8")
     index = rd.log_index()
     assert "P1/report.md" in index
     assert "P1/E1/T1/handoff.json" in index
     assert "events.ndjson" not in index
-    assert "state.json" not in index
+    assert "journal.md" not in index
 
 
 def test_resolve_rejects_bad_grammar(tmp_path: Path) -> None:
@@ -78,11 +77,3 @@ def test_worktrees_root_is_external_and_honors_override(
     assert not str(wroot).startswith(str(rd.root))
     assert str(wroot).startswith(str(base))
     assert wroot.name == "worktrees"
-
-
-def test_atomic_write_json_roundtrips(tmp_path: Path) -> None:
-    target = tmp_path / "state.json"
-    atomic_write_json(target, {"b": 2, "a": 1})
-    assert json.loads(target.read_text()) == {"a": 1, "b": 2}
-    # No stray temp files left beside it.
-    assert [p.name for p in tmp_path.iterdir()] == ["state.json"]

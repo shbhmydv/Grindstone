@@ -17,7 +17,7 @@ networkx stack. Mirroring the vision gate's philosophy
 missing wheel at runtime, an unparseable file, a read-only repo, an empty graph)
 returns ``None`` and the run proceeds byte-identically to a run with no map.
 
-Placement (run_loop / planner): the map reflects the CURRENT integration tip and
+Placement (loop / planner): the map reflects the CURRENT integration tip and
 is rebuilt per planner call, so it rides the VOLATILE TAIL of the planner input,
 never the byte-stable head (prefix caching depends on the head being identical
 run-long). The on-disk tag cache lives under ``<repo>/.grindstone/`` (already

@@ -27,7 +27,12 @@ from grindstone.events import (
     read_events,
     replay,
 )
-from grindstone.loop import PlannerContext, resume_run, start_run
+from grindstone.loop import (
+    PlannerContext,
+    make_acceptance,
+    resume_run,
+    start_run,
+)
 from grindstone.mock_planner import MockDecisionPlanner
 from grindstone.mock_worker import LoopWorker
 from grindstone.rundir import RunDir
@@ -313,6 +318,39 @@ def test_resume_razes_inflight_and_replans(
     # The planner re-entered at the last clean boundary and saw the completed E1.
     assert planner.contexts[0].epoch_index == 2
     assert "P1/E1/T1/handoff.json" in planner.contexts[0].log_index
+
+
+# --- the final-acceptance invariant runs done_when against the tip -------------
+
+
+def _ctx(git_repo: Path, run_dir: RunDir, tip: str | None) -> PlannerContext:
+    return PlannerContext(
+        job="j", repo=git_repo, run_dir=run_dir, run_branch="grind/run-1",
+        tip_ref=tip, tip_files=(), log_index=(), carried=(), epoch_index=1,
+        max_epochs=5,
+    )
+
+
+def test_acceptance_checks_out_the_tip(
+    git_repo: Path, run_dir: RunDir, job_path: Path
+) -> None:
+    # Build a run-branch tip carrying marker.py (off base, operator checkout untouched).
+    wt.ensure_integration_branch(git_repo, "grind/run-1", "main")
+    build = run_dir.worktrees_root / "_b"
+    wt.add_worktree_on(git_repo, build, branch="grind/run-1")
+    (build / "marker.py").write_text("x = 1\n", encoding="utf-8")
+    wt.commit_all(build, "add marker")
+    wt.remove_worktree(git_repo, build)
+    tip = wt.resolve_commit(git_repo, "grind/run-1")
+
+    # done_when is run in a throwaway checkout of that tip, so it SEES marker.py.
+    passing = make_acceptance("test -f marker.py")
+    assert passing(_ctx(git_repo, run_dir, tip)) is True
+    # The same command against the base (no marker.py) fails -> a clean partial-end.
+    base = wt.head_commit(git_repo)
+    assert passing(_ctx(git_repo, run_dir, base)) is False
+    # A non-zero command never passes.
+    assert make_acceptance("false")(_ctx(git_repo, run_dir, tip)) is False
 
 
 # --- the planner context is rebuilt from disk each boundary --------------------
