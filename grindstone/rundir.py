@@ -112,6 +112,27 @@ class RunDir:
             raise ValueError(f"invalid log key: {log_key!r}")
         return _contained(self.root, self.root / log_key)
 
+    def baton_path(self, epoch_index: int) -> Path:
+        """The keyed-log path the close-out planner's living BATON is persisted at for
+        epoch ``epoch_index`` (``E<n>/baton.md``). The latest completed epoch's baton
+        is "current"; history is free (every epoch keeps its own)."""
+
+        return self.resolve(f"E{epoch_index}/baton.md")
+
+    def read_baton(self, epoch_index: int) -> str:
+        """The prior epoch's baton text, or ``""`` when absent/unreadable (NEVER
+        raises). Seeds the next PLAN's context: epoch 1 reads ``E0/baton.md`` (absent)
+        and gets ``""``, the first-epoch signal."""
+
+        try:
+            path = self.baton_path(epoch_index)
+        except ValueError:
+            return ""
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+
     def artifacts_dir(self, task_key: str) -> Path:
         """Scratch dir for a non-write task; created, guarded for containment."""
 

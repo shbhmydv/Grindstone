@@ -37,7 +37,7 @@ source "$(dirname "$0")/../_common/_timeout_prefix.sh"
 # $GRINDSTONE_PLANNER_MODEL (any `claude --model` target).
 model="${GRINDSTONE_PLANNER_MODEL:-opus}"
 
-repo="" prompt="" out="" handle_out="" timeout="" workdir=""
+repo="" prompt="" out="" handle_out="" timeout="" workdir="" purpose="plan"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --repo)       repo="$2";   shift 2 ;;
@@ -46,6 +46,7 @@ while [[ $# -gt 0 ]]; do
     --handle-out) handle_out="$2"; shift 2 ;;
     --timeout)    timeout="$2"; shift 2 ;;
     --workdir)    workdir="$2"; shift 2 ;;
+    --purpose)    purpose="$2"; shift 2 ;;
     *) echo "planner_request: unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -88,7 +89,15 @@ if [[ -n "$workdir" ]]; then
   # call, so any edit evaporates and only decision.json is read back. The contract
   # is the disk file, not stdout; --out still captures the agent log for debugging.
   workdir="$(cd "$workdir" && pwd)"
-  sys_append="You are the grindstone planner. Decide the SINGLE next step as one JSON object: either {\"kind\":\"epoch\",\"epoch\":{...}} or {\"kind\":\"end\",\"summary\":\"...\"}. Your CWD is a throwaway worktree checkout of the current code: read and grep it to ground your plan, but any file you change here is discarded. Steps you MUST follow: (1) write your decision JSON to ./decision.json; (2) run \`python3 check_decision.py decision.json\`; (3) if it prints violations, FIX decision.json (an epoch carries title, optional rationale, and a tasks array of 1 to 8 disjoint tasks; each task carries id/mode/goal/tier, an implement task carries file_ownership and a research/review/artifact task carries artifact_out; you author NO done_when or check commands) and re-run; (4) repeat until it exits 0 with no violations. decision.json, gate-clean, is your ONLY output. Do not print the decision."
+  if [[ "$purpose" == "closeout" ]]; then
+    # CLOSE-OUT: read the staging tree + the keyed-log handoffs/verdicts and write the
+    # updated living BATON. Free-form prose (NEVER parsed, like the handoff); no
+    # decision.json, no self-validate loop. Vision is load-bearing: claude's Read views
+    # images natively, so the planner judges any rendered UI / screenshot with its eyes.
+    sys_append="You are the grindstone planner closing out the epoch you just ran. Your CWD is a throwaway checkout of the epoch's staging tree (the work that merged): read and grep it, and READ the keyed-log handoffs + verdicts named in your prompt (VIEW any images; you can see). Then write your updated living plan to ./baton.md and stop. baton.md is your ONLY output; do not print it. Follow the section skeleton in the prompt."
+  else
+    sys_append="You are the grindstone planner. Decide the SINGLE next step as one JSON object: either {\"kind\":\"epoch\",\"epoch\":{...}} or {\"kind\":\"end\",\"summary\":\"...\"}. Your CWD is a throwaway worktree checkout of the current code: read and grep it to ground your plan, but any file you change here is discarded. Steps you MUST follow: (1) write your decision JSON to ./decision.json; (2) run \`python3 check_decision.py decision.json\`; (3) if it prints violations, FIX decision.json (an epoch carries title, optional rationale, and a tasks array of 1 to 8 disjoint tasks; each task carries id/mode/goal/tier, an implement task carries file_ownership and a research/review/artifact task carries artifact_out; you author NO done_when or check commands) and re-run; (4) repeat until it exits 0 with no violations. decision.json, gate-clean, is your ONLY output. Do not print the decision."
+  fi
   ( cd "$workdir" && "${timeout_prefix[@]}" claude -p \
     --model "$model" \
     --output-format text \

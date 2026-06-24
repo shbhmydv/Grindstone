@@ -33,7 +33,7 @@ def run_planner_boundary(
     *,
     job_spec: str,
     rig: str,
-    carried: tuple[str, ...] = (),
+    baton: str = "",
     epoch_index: int = 1,
     max_epochs: int = 25,
     timeout: float = 900,
@@ -42,7 +42,7 @@ def run_planner_boundary(
 
     Builds a throwaway committed repo + run dir, assembles the boundary
     ``PlannerContext`` (the integration tip = the repo HEAD, an empty keyed log, the
-    given carried failures), and runs the real ``ScriptPlanner`` once. Returns the
+    given prior-epoch baton), and runs the real ``ScriptPlanner`` once. Returns the
     gate-clean typed ``Decision`` (``ScriptPlanner.decide`` raises ``PlannerError`` /
     ``RateLimited`` if the rig cannot produce one)."""
 
@@ -62,9 +62,8 @@ def run_planner_boundary(
             run_dir=run_dir,
             run_branch=f"grind/{run_dir.root.name}",
             tip_ref=tip,
-            tip_files=tuple(wt.list_tree(repo, tip)),
             log_index=(),
-            carried=carried,
+            baton=baton,
             epoch_index=epoch_index,
             max_epochs=max_epochs,
         )

@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Union
 
+from grindstone import worktree as wt
 from grindstone.check_decision import DECISION_FILE
 from grindstone.contracts.models import (
     Decision,
@@ -39,7 +40,37 @@ from grindstone.contracts.models import (
 from grindstone.planner import PlannerDispatch, PlannerError, RateLimited
 
 if TYPE_CHECKING:
-    from grindstone.loop import PlannerContext
+    from grindstone.loop import CloseoutContext, PlannerContext
+
+
+def render_mock_baton(context: "CloseoutContext") -> str:
+    """A deterministic four-section baton the mock planners write at close-out, so a
+    loop test can drive the full lifecycle AND assert the planner's memory carries the
+    epoch's outcomes (the escalation reasons, the integration conflict, the setup error)
+    into the next boundary's ``context.baton``."""
+
+    done = [o for o in context.task_outcomes if o.outcome == "passed"]
+    pending = [o for o in context.task_outcomes if o.outcome != "passed"]
+    lines = [
+        "## Project summary",
+        f"epoch {context.epoch_id} ({context.title}); job in progress.",
+        "## Tasks done",
+    ]
+    lines += [f"- {o.task_id} ({o.mode}) passed" for o in done] or ["- (none this epoch)"]
+    lines.append("## Tasks pending")
+    lines += [
+        f"- {o.task_id} {o.outcome}: {o.reason}" for o in pending
+    ] or ["- (none)"]
+    lines.append("## Current status")
+    if context.setup_error is not None:
+        lines.append(f"setup_error: {context.setup_error}")
+    if context.integration_conflict is not None:
+        lines.append(f"conflict: {context.integration_conflict}")
+    for o in pending:
+        lines.append(f"{o.task_id} {o.outcome}: {o.reason}")
+    if not (pending or context.setup_error or context.integration_conflict):
+        lines.append("everything passed.")
+    return "\n".join(lines) + "\n"
 
 #: An ``invalid`` token returns valid JSON that fails the decision gate (an epoch
 #: decision with an empty epoch: no title, no tasks), exercising the re-ask ladder
@@ -191,13 +222,19 @@ DecisionEntry = Union[Decision, str]
 class MockDecisionPlanner:
     """The loop's planner seam as a test double (symmetric to the worker mocks):
     ``decide`` returns the next scripted ``Decision`` (or raises a scripted failure)
-    instead of dispatching a real rig. It records every ``PlannerContext`` it was
-    handed so a test can assert the loop rebuilt the context from disk (e.g. the
-    prior epoch's carried failures landed on the next boundary)."""
+    instead of dispatching a real rig, and ``close_out`` writes a deterministic baton.
+    It records every ``PlannerContext`` and ``CloseoutContext`` it was handed so a test
+    can assert the loop rebuilt the context from disk (e.g. the prior epoch's baton
+    landed on the next boundary). ``closeout_rate_limit_once`` makes the FIRST
+    ``close_out`` raise ``RateLimited`` exactly once (the node-#1 raze + epoch-restart
+    proof), then behave."""
 
     script: Sequence[DecisionEntry]
     contexts: list["PlannerContext"] = field(default_factory=list)
+    closeout_contexts: list["CloseoutContext"] = field(default_factory=list)
+    closeout_rate_limit_once: bool = False
     _calls: int = field(default=0)
+    _closeout_rl_fired: bool = field(default=False)
 
     def decide(self, context: "PlannerContext") -> Decision:
         self.contexts.append(context)
@@ -212,6 +249,13 @@ class MockDecisionPlanner:
                 raise PlannerError(f"mock planner {entry}")
             raise ValueError(f"unknown mock decision token: {entry!r}")
         return entry
+
+    def close_out(self, context: "CloseoutContext") -> str:
+        self.closeout_contexts.append(context)
+        if self.closeout_rate_limit_once and not self._closeout_rl_fired:
+            self._closeout_rl_fired = True
+            raise RateLimited("mock planner close-out rate limit")
+        return render_mock_baton(context)
 
 
 @dataclass
@@ -238,6 +282,7 @@ class GoalPlanner:
     impl_files: tuple[str, ...]
     stage_cap: int = 4
     contexts: list["PlannerContext"] = field(default_factory=list)
+    closeout_contexts: list["CloseoutContext"] = field(default_factory=list)
     tip_history: list[str | None] = field(default_factory=list)
     _research_tries: int = 0
     _impl_tries: int = 0
@@ -247,6 +292,7 @@ class GoalPlanner:
         self.contexts.append(context)
         self.tip_history.append(context.tip_ref)
         n = context.epoch_index
+        tree = self._tip_tree(context)
 
         if not self._has_artifact(context, "research.md") and (
             self._research_tries < self.stage_cap
@@ -264,7 +310,7 @@ class GoalPlanner:
                 ],
             )
 
-        missing = [f for f in self.impl_files if f not in context.tip_files]
+        missing = [f for f in self.impl_files if f not in tree]
         if missing and self._impl_tries < self.stage_cap:
             self._impl_tries += 1
             tasks = [
@@ -294,11 +340,24 @@ class GoalPlanner:
                 ],
             )
 
-        built = [f for f in self.impl_files if f in context.tip_files]
+        built = [f for f in self.impl_files if f in tree]
         return EndDecision(
             kind="end",
             summary=f"built {len(built)} of {len(self.impl_files)} modules",
         )
+
+    def close_out(self, context: "CloseoutContext") -> str:
+        self.closeout_contexts.append(context)
+        return render_mock_baton(context)
+
+    @staticmethod
+    def _tip_tree(context: "PlannerContext") -> set[str]:
+        """The integration-tip tree, read straight from git (the real planner greps its
+        workdir; the mock reads the tree it has repo + tip_ref for)."""
+
+        if context.repo is None or context.tip_ref is None:
+            return set()
+        return set(wt.list_tree(context.repo, context.tip_ref))
 
     @staticmethod
     def _epoch(title: str, tasks: list[Task]) -> EpochDecision:

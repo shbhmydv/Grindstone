@@ -73,7 +73,7 @@ def test_render_timeline_sections_and_durations(tmp_path: Path) -> None:
     # Task T1 ran 2s..9s; reaching done clears any stale verdict note.
     assert "T1 (implement) [done]  (7s)" in md
     assert "good enough to build on" not in md
-    # A rejected task surfaces its reason as the carried note.
+    # A rejected task surfaces its reason as the gate note.
     assert "T2 (review) [gate_rejected]" in md
     assert "missing citation" in md
 

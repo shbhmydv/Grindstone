@@ -12,7 +12,7 @@ set -euo pipefail
 # Portable timeout prefix (resolves `timeout`, else `gtimeout`, else none).
 source "$(dirname "$0")/../_common/_timeout_prefix.sh"
 
-repo="" prompt="" out="" handle_out="" timeout=""
+repo="" prompt="" out="" handle_out="" timeout="" purpose="plan"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --repo)       repo="$2";   shift 2 ;;
@@ -25,9 +25,17 @@ while [[ $# -gt 0 ]]; do
     # --out and grindstone extracts + validates it (no decision.json is produced,
     # so the core falls back to --out cleanly).
     --workdir)    shift 2 ;;
+    # --purpose (plan|closeout) is accepted but does not change the invocation: codex
+    # runs read-only and cannot grind a worktree, so a CLOSE-OUT cannot write
+    # ./baton.md. The close-out PROMPT still asks for the baton; codex emits it as its
+    # final message, which lands in --out, and the core reads baton.md > --out > stdout
+    # and falls back to --out cleanly. codex is the opt-in alt rig; the north-star uses
+    # claude + local, where close-out writes baton.md in the worktree.
+    --purpose)    purpose="$2"; shift 2 ;;
     *) echo "planner_request: unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+: "${purpose:?}"  # referenced for documentation; the invocation is purpose-agnostic
 
 for req in repo prompt out handle_out; do
   if [[ -z "${!req}" ]]; then

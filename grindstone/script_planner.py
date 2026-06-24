@@ -80,6 +80,7 @@ class ScriptPlannerTransport:
                     "--handle-out", str(handle_file),
                     "--timeout", str(int(self.timeout_s)),
                     "--workdir", str(request.workdir),
+                    "--purpose", request.purpose,
                 ],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,

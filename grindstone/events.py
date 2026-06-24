@@ -83,19 +83,12 @@ class EpochStarted(_Event):
 
 
 class EpochCompleted(_Event):
+    # An epoch reached its durable boundary: the planner wrote its close-out BATON,
+    # the passing tasks' work fast-forwarded the run branch, and the baton is persisted
+    # at ``E<n>/baton.md``. ``epoch_completed`` now IMPLIES "baton written" (close-out
+    # runs immediately before this), so an aborted epoch (no baton) is never completed.
     event: Literal["epoch_completed"] = "epoch_completed"
     epoch_id: str
-
-
-class EpochCarried(_Event):
-    # BONES failure node #2: a non-merged outcome the prior epoch carried to the NEXT
-    # planner boundary (a worker-blocked or critic-escalated task, an integration
-    # ownership/merge conflict, or an unexpected infra abort). Journaled so resume can
-    # repopulate the planner's carried context instead of re-planning blind to WHY the
-    # prior epoch failed (the in-memory carried tuple does not survive a crash).
-    event: Literal["epoch_carried"] = "epoch_carried"
-    epoch_id: str
-    reason: str
 
 
 class TaskDispatched(_Event):
@@ -128,8 +121,8 @@ class WorkGateRejected(_Event):
 
 class Verdict(_Event):
     # The agentic critic's triage of one task. ``outcome`` is PASS / RETRY /
-    # ESCALATE; ``reason`` is its free-text note (carried forward to the planner
-    # or the retry).
+    # ESCALATE; ``reason`` is its free-text note (surfaced to the planner or the
+    # retry).
     event: Literal["verdict"] = "verdict"
     epoch_id: str
     task_id: str
@@ -153,7 +146,6 @@ Event = Annotated[
         RunEnded,
         EpochStarted,
         EpochCompleted,
-        EpochCarried,
         TaskDispatched,
         TaskDone,
         WorkGatePassed,
@@ -300,9 +292,6 @@ class EpochNode:
     tasks: list[TaskNode]
     started_ts: str | None = None
     ended_ts: str | None = None
-    #: Non-merged outcomes the epoch carried to the next boundary (blocked/escalated
-    #: tasks, an integration conflict, an infra abort), for the post-mortem render.
-    carried: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -369,8 +358,6 @@ def replay(events: list[Event]) -> RunTree:
             epoch = epochs_by_id[ev.epoch_id]
             epoch.status = "completed"
             epoch.ended_ts = ev.ts
-        elif isinstance(ev, EpochCarried):
-            epochs_by_id[ev.epoch_id].carried.append(ev.reason)
         elif isinstance(ev, TaskDispatched):
             task = _task(epochs_by_id[ev.epoch_id], ev.task_id)
             task.status = "dispatched"

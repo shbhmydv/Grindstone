@@ -46,6 +46,19 @@ def test_log_index_keys_epoch_dirs_only(tmp_path: Path) -> None:
     assert "journal.md" not in index
 
 
+def test_baton_path_and_read_baton(tmp_path: Path) -> None:
+    rd = _run_dir(tmp_path)
+    # Absent baton (and the epoch-0 sentinel for the first epoch) reads as "".
+    assert rd.read_baton(1) == ""
+    assert rd.read_baton(0) == ""
+    # baton_path is the E<n>/baton.md keyed-log path; once written, read_baton returns it.
+    p = rd.baton_path(2)
+    assert p == (rd.root / "E2/baton.md").resolve()
+    p.parent.mkdir(parents=True)
+    p.write_text("## Project summary\nso far so good\n", encoding="utf-8")
+    assert rd.read_baton(2) == "## Project summary\nso far so good\n"
+
+
 def test_resolve_rejects_bad_grammar(tmp_path: Path) -> None:
     rd = _run_dir(tmp_path)
     with pytest.raises(ValueError):

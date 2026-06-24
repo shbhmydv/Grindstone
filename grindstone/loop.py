@@ -1,16 +1,23 @@
 """The epoch driver: the BONES state machine, the two failure nodes, and resume.
 
 A synchronous, dumb Python loop; ALL sequencing judgment is delegated to the
-planner. Each boundary rebuilds the planner's context fresh FROM DISK (the
-integration tip + the durable keyed log + the job spec + the prior epoch's carried
-failures), asks the planner for ONE decision, and disposes of it:
+planner. Python characterizes NOTHING: it owns the state machine, the two
+deterministic invariants (the disjoint-ownership merge of the git diff, the one final
+acceptance), the durable log, crash-only resume, and bounded fresh-from-disk context
+assembly. Each boundary rebuilds the planner's context fresh FROM DISK (the
+integration tip + the durable keyed log + the job spec + the prior epoch's BATON),
+asks the planner for ONE decision, and disposes of it:
 
     EpochDecision -> run the planner-declared setup (the trusted host-mutation
         seam), fan the epoch's disjoint tasks out under ONE shared ``Backends``
         (the per-endpoint semaphores are the real concurrency bound), integrate the
-        PASSing implement tasks by the disjoint-ownership merge invariant, and
-        fast-forward the durable run branch ONLY on epoch completion (so its tip is
-        ALWAYS a clean checkpoint resume can re-enter from).
+        PASSing implement tasks onto a STAGING branch by the disjoint-ownership merge
+        invariant, ask the planner to CLOSE OUT the epoch (read the staging tree + the
+        per-task verdicts/handoffs, write the updated living baton), then atomically
+        finalize (fast-forward the durable run branch + persist the baton +
+        ``EpochCompleted``). Close-out runs BEFORE the fast-forward, so the one durable
+        commit point already includes the baton and there is no "integrated-but-not-
+        summarized" limbo.
     EndDecision  -> run the one final acceptance (invariant #2, an injected seam):
         pass -> ``completed``; otherwise persist the summary as the resume seed and
         end cleanly (``ended``, failure node #2).
@@ -18,18 +25,24 @@ failures), asks the planner for ONE decision, and disposes of it:
 Failure model (exactly two nodes):
 
   #1 RATE LIMIT (planner OR worker / critic): PARK, back off ~1/hr (injectable),
-     then re-enter. A planner rate-limit re-issues the boundary call; a mid-epoch
-     worker rate-limit RAZES the in-flight epoch's throwaway worktrees and RESTARTS
-     the epoch whole (partial state is never trusted).
-  #2 CANNOT CONTINUE (any other epoch failure): it becomes carried context the
-     planner sees next boundary and steers around, or the planner ends cleanly. The
-     ``max_epochs`` backstop is the INVOLUNTARY trigger of the same clean end.
+     then re-enter. A planner DECIDE rate-limit re-issues the boundary call; a
+     mid-epoch worker OR close-out rate-limit RAZES the in-flight epoch's throwaway
+     worktrees + staging and RESTARTS the epoch whole (partial state is never
+     trusted).
+  #2 CANNOT CONTINUE: the planner ends cleanly (the baton carries the why). An
+     UNEXPECTED exception in the epoch body (a GitError/OSError escaping the
+     worktree/integration machinery) RAZES + RESTARTS the SAME epoch (an aborted epoch
+     has no baton, so it is never completed); ``MAX_CONSECUTIVE_ABORTS`` consecutive
+     aborts on the same epoch clean-end the run. The ``max_epochs`` backstop is the
+     INVOLUNTARY trigger of the same clean end.
 
 RESUME is the universal crash-only recovery primitive: because the run branch only
-fast-forwards on completion, the git tip needs no rewind. ``resume_run`` razes the
-incomplete epoch's worktrees + wip branches + partial keyed log, PRESERVES the
-completed-epoch keyed log + the append-only journal (it APPENDS a razed-epoch
-marker, never truncates), and re-enters the loop from the planner call.
+fast-forwards on epoch finalize, the git tip needs no rewind. ``resume_run`` razes the
+incomplete epoch's worktrees + wip branches + partial keyed log (including a never-
+finalized ``E<n>/baton.md``), PRESERVES the completed-epoch keyed log + the
+append-only journal (it APPENDS a razed-epoch marker, never truncates), and re-enters
+the loop from the planner call; the next PLAN re-reads the prior epoch's baton from
+disk, so no in-memory failure context need survive the crash.
 
 This module exposes the testable CORE callables (``start_run`` / ``resume_run``)
 with the planner + backends injected; the CLI-facing ``run`` / ``resume`` (which
@@ -64,7 +77,6 @@ from grindstone.contracts.models import (
 )
 from grindstone.events import (
     Event,
-    EpochCarried,
     EpochCompleted,
     EpochStarted,
     WorkGatePassed,
@@ -89,6 +101,8 @@ from grindstone.script_planner import ScriptPlannerTransport
 from grindstone.script_worker import build_backends
 from grindstone.worker import (
     Backends,
+    CRITIC_VERDICT_FILENAME,
+    HANDOFF_FILENAME,
     RateLimited as WorkerRateLimited,
     TaskResult,
     run_task,
@@ -98,10 +112,11 @@ from grindstone.worker import (
 #: cap is the involuntary trigger of the clean partial-end, never unbounded).
 DEFAULT_MAX_EPOCHS = 40
 
-#: BONES failure node #2 backstop: K CONSECUTIVE epochs aborting on an UNEXPECTED
-#: error (a GitError/OSError escaping the worktree/integration machinery, not a
-#: planned task failure) clean-ends the run, so a persistent infra fault cannot
-#: infinite-loop an unattended run. A single transient fault is just carried.
+#: BONES failure node #2 backstop: K CONSECUTIVE aborts on the SAME epoch from an
+#: UNEXPECTED error (a GitError/OSError escaping the worktree/integration machinery,
+#: not a planned task failure) clean-end the run, so a persistent infra fault cannot
+#: infinite-loop an unattended run that keeps razing + restarting the same epoch. A
+#: single transient fault just razes + restarts the epoch once.
 MAX_CONSECUTIVE_ABORTS = 3
 
 #: Node-#1 backoff (~1/hr). Injected as ``sleep_fn``/``backoff_s`` so tests park
@@ -126,8 +141,10 @@ NowFn = Callable[[], str]
 @dataclass(frozen=True)
 class PlannerContext:
     """The bounded window the loop reconstructs FROM DISK each boundary and hands the
-    stateless planner. The mock ignores it; the real planner (a later part) renders
-    its prompt from it. Externalized context: re-derived, never accumulated."""
+    stateless PLAN call. The mock ignores it; the real planner renders its prompt from
+    it. Externalized context: re-derived, never accumulated. The planner GREPS its own
+    workdir for the tree (the file-name dump is gone); its memory across the run is the
+    ``baton`` it wrote at the prior close-out."""
 
     job: str
     repo: Path | None
@@ -136,24 +153,63 @@ class PlannerContext:
     #: The integration-tip commit (the durable run-branch tip, or repo HEAD before
     #: the first epoch completes). ``None`` when there is no repo.
     tip_ref: str | None
-    #: Names (not bodies) of every tracked file at the tip.
-    tip_files: tuple[str, ...]
     #: Durable keyed-log references a task may name as ``inputs``.
     log_index: tuple[str, ...]
-    #: The prior epoch's non-merged outcomes (blocked / escalated / conflict) the
-    #: planner steers around or ends on.
-    carried: tuple[str, ...]
+    #: The prior completed epoch's ``baton.md`` text (the planner's living plan), or
+    #: ``""`` for the first epoch.
+    baton: str
     #: The 1-based epoch number about to be planned, and the backstop.
     epoch_index: int
     max_epochs: int
 
 
+@dataclass(frozen=True)
+class TaskOutcome:
+    """A pure REFERENCE to one finished task's outcome (Python characterizes NOTHING).
+    The close-out planner reads the pointed-to handoff + verdict and writes the
+    partial-vs-none-vs-regression nuance itself; this struct only carries the
+    deterministic terminal, the keyed-log pointers, and the model's verbatim reason."""
+
+    task_id: str            # "E3/T2"
+    mode: str
+    outcome: str            # "passed" | "escalated" (the deterministic terminal)
+    handoff_key: str | None  # keyed-log path to the free-form handoff, if any
+    verdict_key: str | None  # keyed-log path to the critic verdict, if any
+    reason: str             # the escalation / critic reason verbatim (model text)
+
+
+@dataclass(frozen=True)
+class CloseoutContext:
+    """The bounded window the loop hands the CLOSE-OUT call at epoch END. Python
+    populates ``task_outcomes`` from the in-memory ``TaskResult``s as pure references;
+    the planner reads the staging tree + the pointed-to handoffs/verdicts and WRITES
+    the updated baton (the markdown returned by ``close_out``)."""
+
+    job: str
+    repo: Path | None
+    run_dir: RunDir
+    #: The tree close-out reads: the staging tip if work merged, else the epoch base.
+    staging_ref: str | None
+    #: The previous epoch's ``baton.md`` text, ``""`` if this is the first epoch.
+    prior_baton: str
+    epoch_index: int
+    epoch_id: str           # "E3"
+    title: str              # the epoch title the planner gave
+    task_outcomes: tuple[TaskOutcome, ...]
+    setup_error: str | None
+    integration_conflict: str | None
+
+
 class Planner(Protocol):
-    """The stateless one-shot planner the loop calls at each boundary. ``decide``
-    returns ONE typed ``Decision`` (epoch or end), or raises ``RateLimited`` (node
-    #1) / ``PlannerError`` (node #2)."""
+    """The stateless one-shot planner the loop calls at each boundary. ``decide`` (PLAN,
+    forward) returns ONE typed ``Decision`` (epoch or end); ``close_out`` (back) reads
+    the just-finished epoch's outcomes + staging tree and returns the updated baton
+    markdown. Either raises ``RateLimited`` (node #1) / ``PlannerError`` (node #2);
+    ``close_out`` NEVER hard-fails on content (it reads whatever prose the rig wrote,
+    like the free-form handoff)."""
 
     def decide(self, context: PlannerContext) -> Decision: ...
+    def close_out(self, context: CloseoutContext) -> str: ...
 
 
 #: Invariant #2: the one final acceptance, run ONCE when the planner says done.
@@ -291,22 +347,21 @@ def _build_context(
     run_dir: RunDir,
     run_branch: str | None,
     tip_ref: str | None,
-    carried: tuple[str, ...],
     epoch_index: int,
     max_epochs: int,
 ) -> PlannerContext:
-    tip_files: tuple[str, ...] = ()
-    if repo is not None and tip_ref is not None:
-        tip_files = tuple(wt.list_tree(repo, tip_ref))
+    """Reconstruct the PLAN window FROM DISK: the keyed-log index + the prior epoch's
+    baton (``read_baton(epoch_index - 1)``, ``""`` for epoch 1). No file-name dump (the
+    planner greps its own workdir for the tree)."""
+
     return PlannerContext(
         job=job,
         repo=repo,
         run_dir=run_dir,
         run_branch=run_branch,
         tip_ref=tip_ref,
-        tip_files=tip_files,
         log_index=tuple(run_dir.log_index()),
-        carried=carried,
+        baton=run_dir.read_baton(epoch_index - 1),
         epoch_index=epoch_index,
         max_epochs=max_epochs,
     )
@@ -462,14 +517,16 @@ def _grind_epoch(
 
 
 @dataclass(frozen=True)
-class _Integration:
-    """The epoch's integration disposition. ``conflict`` (set) is a hard error
-    surfaced to the planner next boundary (an ownership overlap or a merge conflict =
-    the planner mis-scoped); ``tip`` (set) is the new run-branch tip on a clean
-    fast-forward."""
+class _Staging:
+    """The epoch's PRE-finalize integration disposition. ``conflict`` (set) is a hard
+    error the close-out planner records in the baton (an ownership overlap or a merge
+    conflict = the planner mis-scoped); ``staging_branch`` / ``staging_tip`` (set) hold
+    the merged-but-not-yet-fast-forwarded work the close-out reads and ``_finalize_epoch``
+    consumes. All-``None`` means nothing merged (finalize is a no-op fast-forward)."""
 
     conflict: str | None
-    tip: str | None
+    staging_branch: str | None
+    staging_tip: str | None
 
 
 def _ownership_overlap(
@@ -499,7 +556,7 @@ def _ownership_overlap(
     return None
 
 
-def _integrate(
+def _integrate_to_staging(
     epoch_id: str,
     base: str | None,
     *,
@@ -508,12 +565,14 @@ def _integrate(
     run_branch: str | None,
     results: list[TaskResult],
     tasks_by_id: dict[str, Task],
-) -> _Integration:
-    """The disjoint-ownership merge (invariant #1): verify the PASSing implement
-    tasks own disjoint files, merge each wip branch (in task order) onto a fresh
-    staging branch off the epoch base, then FAST-FORWARD the durable run branch to
-    the staging tip. An overlap or a merge conflict aborts integration as a hard
-    error (carried to the planner), leaving the run branch UNTOUCHED."""
+) -> _Staging:
+    """The disjoint-ownership merge (invariant #1), STOPPED before the fast-forward:
+    verify the PASSing implement tasks own disjoint files, merge each wip branch (in
+    task order) onto a fresh staging branch off the epoch base, and return the staging
+    tip WITHOUT fast-forwarding the run branch and WITHOUT deleting the staging branch /
+    wip (the close-out reads the staging tree, ``_finalize_epoch`` consumes it). An
+    overlap or a merge conflict is a hard error the close-out records in the baton, the
+    run branch left UNTOUCHED. No passers -> all-``None`` (finalize is a no-op)."""
 
     passed = [
         (r.task_id, r.branch, tasks_by_id[r.task_id])
@@ -521,7 +580,7 @@ def _integrate(
         if r.outcome == "passed" and r.branch is not None
     ]
     if not passed:
-        return _Integration(conflict=None, tip=None)
+        return _Staging(conflict=None, staging_branch=None, staging_tip=None)
     assert repo is not None and base is not None and run_branch is not None
 
     overlap = _ownership_overlap(repo, base, passed)
@@ -530,7 +589,11 @@ def _integrate(
             if branch is not None:
                 wt.delete_branch(repo, branch)
         wt.prune_tree(repo, run_dir.worktrees_root)
-        return _Integration(conflict=f"ownership overlap: {overlap}", tip=None)
+        return _Staging(
+            conflict=f"ownership overlap: {overlap}",
+            staging_branch=None,
+            staging_tip=None,
+        )
 
     staging = f"grind-wip/{run_dir.root.name}/{epoch_id.replace('/', '-')}/_staging"
     wt.delete_branch(repo, staging)
@@ -547,47 +610,80 @@ def _integrate(
                 if b is not None:
                     wt.delete_branch(repo, b)
             wt.prune_tree(repo, run_dir.worktrees_root)
-            return _Integration(
-                conflict=f"merge conflict on {task_id}: {outcome.conflict}", tip=None
+            return _Staging(
+                conflict=f"merge conflict on {task_id}: {outcome.conflict}",
+                staging_branch=None,
+                staging_tip=None,
             )
     wt.remove_worktree(repo, int_wt)
     staging_tip = wt.resolve_commit(repo, staging)
     wt.prune_tree(repo, run_dir.worktrees_root)
-    wt.fast_forward_branch(repo, run_branch, staging_tip)
-    wt.delete_branch(repo, staging)
-    for _, branch, _ in passed:
-        if branch is not None:
-            wt.delete_branch(repo, branch)
-    return _Integration(conflict=None, tip=staging_tip)
+    # Deliberately NO fast-forward and NO branch deletion here: the staging tree is what
+    # close-out reads, and ``_finalize_epoch`` does the durable fast-forward + cleanup.
+    return _Staging(conflict=None, staging_branch=staging, staging_tip=staging_tip)
 
 
-def _carry(results: list[TaskResult], integration: _Integration) -> tuple[str, ...]:
-    """The prior epoch's non-merged outcomes, as context the next planner steers on."""
+def _task_outcomes(
+    results: list[TaskResult], tasks_by_id: dict[str, Task]
+) -> tuple[TaskOutcome, ...]:
+    """Project the in-memory ``TaskResult``s into pure close-out references: the
+    deterministic terminal, the keyed-log handoff/verdict pointers, and the model's
+    verbatim reason. Python labels NOTHING (partial / none / regression is the
+    close-out planner's read of the pointed-to files)."""
 
-    out: list[str] = []
-    for result in results:
-        if result.outcome == "escalated":
-            out.append(f"{result.task_id} escalated: {result.reason}")
-    if integration.conflict is not None:
-        out.append(integration.conflict)
+    out: list[TaskOutcome] = []
+    for r in results:
+        task = tasks_by_id.get(r.task_id)
+        out.append(
+            TaskOutcome(
+                task_id=r.task_id,
+                mode=task.mode if task is not None else "",
+                outcome=r.outcome,
+                handoff_key=(
+                    f"{r.task_id}/{HANDOFF_FILENAME}"
+                    if r.handoff_path is not None
+                    else None
+                ),
+                verdict_key=(
+                    f"{r.task_id}/{CRITIC_VERDICT_FILENAME}"
+                    if r.verdict is not None
+                    else None
+                ),
+                reason=r.reason or (r.verdict.reason if r.verdict is not None else ""),
+            )
+        )
     return tuple(out)
 
 
-def _journal_carried(
-    journal: JournalWriter, now_fn: NowFn, epoch_id: str, reasons: tuple[str, ...]
+def _finalize_epoch(
+    staging: _Staging,
+    baton_text: str,
+    epoch_index: int,
+    *,
+    repo: Path | None,
+    run_dir: RunDir,
+    run_branch: str | None,
+    journal: JournalWriter,
+    now_fn: NowFn,
 ) -> None:
-    """Journal each non-merged outcome (FIX 5): the in-memory carried tuple does not
-    survive a crash, so resume re-reads these to repopulate the planner's context."""
+    """The atomic durable commit point, run AFTER close-out wrote the baton: if work
+    merged, fast-forward the run branch to the staging tip and delete the staging +
+    every transient ``grind-wip/`` branch (this epoch's only); then persist the baton
+    to ``E<n>/baton.md`` and emit ``EpochCompleted`` (which now IMPLIES "baton
+    written"). With no merged work (no passers / setup failure / conflict) there is
+    nothing to fast-forward, but the epoch still completes WITH a baton."""
 
-    for reason in reasons:
-        # emit() invokes the factory synchronously (before the loop advances), so
-        # capturing ``reason`` directly is safe (no late-binding hazard) and keeps the
-        # factory a clean Callable[[int], Event].
-        journal.emit(
-            lambda s: EpochCarried(
-                seq=s, ts=now_fn(), epoch_id=epoch_id, reason=reason
-            )
-        )
+    epoch_id = f"E{epoch_index}"
+    if staging.staging_tip is not None:
+        assert repo is not None and run_branch is not None
+        wt.fast_forward_branch(repo, run_branch, staging.staging_tip)
+        for branch in wt.branches_with_prefix(repo, "grind-wip/"):
+            wt.delete_branch(repo, branch)
+        wt.prune_tree(repo, run_dir.worktrees_root)
+    baton_path = run_dir.baton_path(epoch_index)
+    baton_path.parent.mkdir(parents=True, exist_ok=True)
+    baton_path.write_text(baton_text, encoding="utf-8")
+    journal.emit(lambda s: EpochCompleted(seq=s, ts=now_fn(), epoch_id=epoch_id))
 
 
 # --- log reaping + raze (the resume / restart cleanup) -------------------------
@@ -703,25 +799,23 @@ def _drive(
     now_fn: NowFn,
     journal: JournalWriter,
     start_index: int,
-    start_carried: tuple[str, ...] = (),
 ) -> RunResult:
     """The shared epoch loop (entered fresh by ``start_run`` and re-entered by
-    ``resume_run``). Drives boundaries from ``start_index`` until the planner ends,
-    an unrecoverable planner failure forces a clean end, or ``max_epochs`` is hit.
-    ``start_carried`` seeds the first boundary's carried context (empty for a fresh
-    run; reconstructed from the journal on resume so the planner is not re-planned
-    blind to why the prior epoch failed)."""
+    ``resume_run``). Drives boundaries from ``start_index`` until the planner ends, an
+    unrecoverable planner failure forces a clean end, or ``max_epochs`` is hit. Each
+    boundary the PLAN call reads the prior epoch's baton (rebuilt from disk); each
+    epoch ends with the CLOSE-OUT call writing the new baton, which finalize persists.
+    No in-memory failure context is threaded between epochs: the baton on disk is the
+    only memory, so resume needs no reconstruction."""
 
     epoch_index = start_index
-    carried: tuple[str, ...] = start_carried
     consec_aborts = 0
     while epoch_index <= max_epochs:
         _reap_prior_logs(log_root, epoch_index)
         tip_ref = _resolve_tip(repo, run_branch)
         context = _build_context(
             job=job, repo=repo, run_dir=run_dir, run_branch=run_branch,
-            tip_ref=tip_ref, carried=carried, epoch_index=epoch_index,
-            max_epochs=max_epochs,
+            tip_ref=tip_ref, epoch_index=epoch_index, max_epochs=max_epochs,
         )
         try:
             decision = _plan_with_backoff(
@@ -743,61 +837,85 @@ def _drive(
         epoch = decision.epoch
         epoch_id = f"E{epoch_index}"
         base = tip_ref
-        started_emitted = False
         try:
             setup_err = _run_setup(
                 list(epoch.setup), repo=repo, run_dir=run_dir, base=base,
             )
-            if setup_err is not None:
-                msg = f"E{epoch_index} setup failed: {setup_err}"
-                _journal_carried(journal, now_fn, epoch_id, (msg,))
-                carried = carried + (msg,)
-                consec_aborts = 0
-                epoch_index += 1
-                continue
             journal.emit(
                 lambda s: EpochStarted(
                     seq=s, ts=now_fn(), epoch_id=epoch_id, title=epoch.title,
                     tasks=[TaskRef(id=t.id, mode=t.mode) for t in epoch.tasks],
                 )
             )
-            started_emitted = True
-            results = _grind_epoch(
-                epoch, epoch_id, base, repo=repo, run_dir=run_dir,
-                run_branch=run_branch, backends=backends, journal=journal,
-                log_root=log_root, sleep_fn=sleep_fn, backoff_s=backoff_s,
-                now_fn=now_fn,
+            if setup_err is None:
+                results = _grind_epoch(
+                    epoch, epoch_id, base, repo=repo, run_dir=run_dir,
+                    run_branch=run_branch, backends=backends, journal=journal,
+                    log_root=log_root, sleep_fn=sleep_fn, backoff_s=backoff_s,
+                    now_fn=now_fn,
+                )
+                tasks_by_id = {f"{epoch_id}/{t.id}": t for t in epoch.tasks}
+                staging = _integrate_to_staging(
+                    epoch_id, base, repo=repo, run_dir=run_dir, run_branch=run_branch,
+                    results=results, tasks_by_id=tasks_by_id,
+                )
+            else:
+                # A bad setup command will not pass on re-run; skip the grind, let the
+                # close-out baton record the setup error, and finalize so the planner
+                # sees it next boundary and changes its plan (NOT an abort).
+                results = []
+                tasks_by_id = {}
+                staging = _Staging(conflict=None, staging_branch=None, staging_tip=None)
+            closeout_ctx = CloseoutContext(
+                job=job,
+                repo=repo,
+                run_dir=run_dir,
+                staging_ref=staging.staging_tip or base,
+                prior_baton=context.baton,
+                epoch_index=epoch_index,
+                epoch_id=epoch_id,
+                title=epoch.title,
+                task_outcomes=_task_outcomes(results, tasks_by_id),
+                setup_error=setup_err,
+                integration_conflict=staging.conflict,
             )
-            tasks_by_id = {f"{epoch_id}/{t.id}": t for t in epoch.tasks}
-            integration = _integrate(
-                epoch_id, base, repo=repo, run_dir=run_dir, run_branch=run_branch,
-                results=results, tasks_by_id=tasks_by_id,
-            )
-            carried = _carry(results, integration)
-            _journal_carried(journal, now_fn, epoch_id, carried)
-            journal.emit(
-                lambda s: EpochCompleted(seq=s, ts=now_fn(), epoch_id=epoch_id)
+            # CLOSE-OUT (node #1 parks): a RateLimited escapes to the handler below,
+            # which razes + restarts the whole epoch (no advance). The baton is written
+            # by finalize, BEFORE the EpochCompleted that marks the epoch done.
+            baton_text = planner.close_out(closeout_ctx)
+            _finalize_epoch(
+                staging, baton_text, epoch_index, repo=repo, run_dir=run_dir,
+                run_branch=run_branch, journal=journal, now_fn=now_fn,
             )
             consec_aborts = 0
         except WorkerRateLimited:
             # Node #1 stays un-burned (defensive: _grind_epoch already parks on it).
             raise
+        except PlannerRateLimited as exc:
+            # Node #1, the CLOSE-OUT rate limit: RAZE the in-flight epoch (drop staging
+            # + wip), PARK, then RESTART the SAME epoch whole (re-grind). The run is
+            # never burned and no half-summarized epoch is left behind.
+            detail = str(exc)
+            journal.emit(
+                lambda s: RateLimitedEvent(
+                    seq=s, ts=now_fn(), role="planner", detail=detail
+                )
+            )
+            _raze_epoch(run_dir, repo, run_branch, epoch_id, log_root)
+            sleep_fn(backoff_s)
+            continue
         except Exception as exc:
-            # BONES node #2: ANY other epoch failure (a GitError/OSError escaping the
-            # worktree or integration machinery) becomes carried context the planner
-            # steers around next boundary, never an uncaught crash of an unattended
-            # run. The in-flight epoch's partial debris is razed.
+            # BONES node #2: an UNEXPECTED exception (a GitError/OSError escaping the
+            # worktree/integration machinery, or a close-out transport hard error)
+            # RAZES + RESTARTS the SAME epoch. An aborted epoch has NO baton, so it is
+            # never completed and never advances. K consecutive aborts clean-end the
+            # run so a persistent infra fault cannot infinite-loop an unattended run.
             consec_aborts += 1
             detail = (
                 f"E{epoch_index} aborted on an unexpected "
                 f"{type(exc).__name__}: {exc}"
             )
             _raze_epoch(run_dir, repo, run_branch, epoch_id, log_root)
-            if started_emitted:
-                _journal_carried(journal, now_fn, epoch_id, (detail,))
-                journal.emit(
-                    lambda s: EpochCompleted(seq=s, ts=now_fn(), epoch_id=epoch_id)
-                )
             if consec_aborts >= MAX_CONSECUTIVE_ABORTS:
                 summary = (
                     f"{consec_aborts} consecutive epochs aborted on unexpected "
@@ -805,14 +923,10 @@ def _drive(
                 )
                 _emit_ended(journal, now_fn, summary)
                 return RunResult("ended", summary, epoch_index - 1)
-            carried = carried + (detail,)
-            epoch_index += 1
             continue
         epoch_index += 1
 
     summary = f"max epochs ({max_epochs}) reached without a planned end"
-    if carried:
-        summary += "; carried: " + " | ".join(carried)
     _emit_ended(journal, now_fn, summary)
     return RunResult("ended", summary, epoch_index - 1)
 
@@ -897,7 +1011,9 @@ def resume_run(
     in_flight_id = f"E{start_index}"
     started_ids = {e.epoch_id for e in events if isinstance(e, EpochStarted)}
     razed = in_flight_id if in_flight_id in started_ids else None
-    carried = _reconstruct_carried(events)
+    # Raze the in-flight epoch's debris INCLUDING any never-finalized E<n>/baton.md
+    # (only a completed epoch persists a baton); the next PLAN re-reads the prior
+    # completed epoch's baton from disk, so no failure context need be reconstructed.
     _raze_epoch(run_dir, repo, run_branch, in_flight_id, log_root)
 
     with JournalWriter(run_dir.events_path) as journal:
@@ -909,28 +1025,8 @@ def resume_run(
             planner=planner, backends=backends, max_epochs=eff_max,
             log_root=log_root, acceptance=acceptance, sleep_fn=sleep_fn,
             backoff_s=backoff_s, now_fn=now_fn, journal=journal,
-            start_index=start_index, start_carried=carried,
+            start_index=start_index,
         )
-
-
-def _reconstruct_carried(events: Sequence[Event]) -> tuple[str, ...]:
-    """Repopulate the planner's carried context from the journal (FIX 5).
-
-    The in-memory carried tuple does not survive a crash, so re-read the
-    ``epoch_carried`` events of the LAST completed epoch (the prior boundary the
-    re-planned epoch follows). Empty when nothing was carried (a clean boundary)."""
-
-    last_completed: str | None = None
-    for ev in events:
-        if isinstance(ev, EpochCompleted):
-            last_completed = ev.epoch_id
-    if last_completed is None:
-        return ()
-    return tuple(
-        ev.reason
-        for ev in events
-        if isinstance(ev, EpochCarried) and ev.epoch_id == last_completed
-    )
 
 
 def _completed_count(events: Sequence[Event]) -> int:

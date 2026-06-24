@@ -2,15 +2,20 @@
 concurrency-safe loop worker (no real model). Covers the BONES state machine: a
 1-epoch run reaching ``completed``; a multi-epoch run; an EndDecision phase-handoff
 (``ended``); the planner-declared setup seam; the disjoint-ownership merge of two
-passing implement tasks; an ownership OVERLAP rejected (carried, no fast-forward);
-a worker RateLimited parking then the epoch restarting clean; a non-write task
-reading the integration tip a prior epoch built; and RESUME from a mid-epoch crash
-(raze the in-flight epoch, preserve the completed keyed log, re-plan).
+passing implement tasks; an ownership OVERLAP recorded in the close-out baton (no
+fast-forward); a worker RateLimited parking then the epoch restarting clean; a
+partial-fail epoch finalizing only the passers; a setup failure skipping the grind
+but still closing out and advancing; a close-out rate limit razing + restarting the
+epoch; a non-write task reading the integration tip a prior epoch built; and RESUME
+from a mid-epoch crash (raze the in-flight epoch, re-plan reading the prior baton).
 """
 
 from __future__ import annotations
 
+import json
 import subprocess
+import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -37,7 +42,13 @@ from grindstone.loop import (
 from tests.grindstone.mock_planner import MockDecisionPlanner
 from tests.grindstone.mock_worker import LoopWorker
 from grindstone.rundir import RunDir
-from grindstone.worker import Backends, WorkerTransport
+from grindstone.worker import (
+    Backends,
+    CRITIC_VERDICT_FILENAME,
+    HANDOFF_FILENAME,
+    WorkerRequest,
+    WorkerTransport,
+)
 
 
 # --- builders ------------------------------------------------------------------
@@ -185,7 +196,7 @@ def test_disjoint_merge_two_tasks(
     assert "a.py" in tip and "b.py" in tip  # both disjoint tasks merged cleanly
 
 
-# --- ownership OVERLAP rejected (carried, no fast-forward) ----------------------
+# --- ownership OVERLAP recorded in the baton (no fast-forward) ------------------
 
 
 def test_ownership_overlap_rejected(
@@ -201,9 +212,11 @@ def test_ownership_overlap_rejected(
     assert result.status == "completed"
     # No fast-forward: the colliding work never reached the run branch.
     assert not wt.branch_exists(git_repo, "grind/run-1")
-    # The overlap is surfaced to the NEXT planner boundary as carried context.
-    second_ctx = planner.contexts[1]
-    assert any("overlap" in c for c in second_ctx.carried)
+    # The overlap is recorded in E1's close-out baton, which the NEXT boundary reads.
+    assert "overlap" in run_dir.read_baton(1)
+    assert "overlap" in planner.contexts[1].baton
+    # The close-out saw the integration conflict deterministically.
+    assert planner.closeout_contexts[0].integration_conflict is not None
 
 
 # --- rate limit parks then the epoch restarts clean ----------------------------
@@ -228,6 +241,117 @@ def test_rate_limit_parks_then_restarts(
     assert any(
         e.event == "rate_limited" for e in read_events(run_dir.events_path)
     )
+
+
+# --- a partial-fail epoch finalizes only the passers ---------------------------
+
+
+@dataclass
+class _SelectiveWorker:
+    """A concurrency-safe worker that PASSES every task except those in ``fail_ids``
+    (matched on the bare task id), which produce no work and exhaust to an escalate.
+    Lets one epoch fan out a passer + a failer to prove partial finalize."""
+
+    fail_ids: set[str]
+    critic_outcome: str = "PASS"
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def run(self, request: WorkerRequest) -> None:
+        if request.critic is not None:
+            (request.scratch / CRITIC_VERDICT_FILENAME).write_text(
+                json.dumps({"outcome": self.critic_outcome, "reason": "sel"}),
+                encoding="utf-8",
+            )
+            return
+        if request.task.id in self.fail_ids:
+            return  # no work -> zero diff -> gate rejects -> retries exhaust -> escalate
+        for rel in request.task.file_ownership:
+            path = request.scratch / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"# {request.task_id}\n", encoding="utf-8")
+        (request.scratch / HANDOFF_FILENAME).write_text(
+            f"# handoff {request.task_id}\nDONE\n", encoding="utf-8"
+        )
+
+
+def test_partial_fail_finalizes_only_passers(
+    git_repo: Path, run_dir: RunDir, job_path: Path
+) -> None:
+    # T1 passes, T2 escalates: the epoch STILL completes, finalizing only T1's work
+    # onto the run branch, and the baton records T2's escalation for the next boundary.
+    planner = MockDecisionPlanner(
+        [_epoch(_impl("T1", ["a.py"]), _impl("T2", ["b.py"])), _end()]
+    )
+    result = start_run(
+        job_path=job_path, run_dir=run_dir, repo=git_repo, planner=planner,
+        backends=_backends(_SelectiveWorker(fail_ids={"T2"})),
+    )
+    assert result.status == "completed"
+    tree_files = wt.list_tree(git_repo, "grind/run-1")
+    assert "a.py" in tree_files and "b.py" not in tree_files  # only the passer merged
+    # The close-out saw one passer + one escalation; the baton carries the escalation.
+    outcomes = {o.task_id: o.outcome for o in planner.closeout_contexts[0].task_outcomes}
+    assert outcomes == {"E1/T1": "passed", "E1/T2": "escalated"}
+    assert "escalated" in run_dir.read_baton(1)
+
+
+# --- a setup failure skips the grind but still closes out and advances ----------
+
+
+def test_setup_failure_skips_grind_but_advances(
+    git_repo: Path, run_dir: RunDir, job_path: Path
+) -> None:
+    # A bad setup command will not pass on re-run, so it is NOT an abort: the grind is
+    # skipped, the close-out baton records the setup error, the epoch finalizes (no
+    # fast-forward, nothing was built) and ADVANCES so the planner re-plans next.
+    planner = MockDecisionPlanner(
+        [_epoch(_impl("T1", ["a.py"]), setup=["false"]), _end()]
+    )
+    result = start_run(
+        job_path=job_path, run_dir=run_dir, repo=git_repo, planner=planner,
+        backends=_backends(LoopWorker()),
+    )
+    assert result.status == "completed"
+    # The grind was skipped: T1 never dispatched and nothing reached the run branch.
+    events = read_events(run_dir.events_path)
+    assert not any(e.event == "task_dispatched" for e in events)
+    assert not wt.branch_exists(git_repo, "grind/run-1")
+    # The epoch still advanced (E1 completed) with a baton that records the setup error.
+    assert any(isinstance(e, EpochCompleted) and e.epoch_id == "E1" for e in events)
+    assert planner.closeout_contexts[0].setup_error is not None
+    assert "setup_error" in run_dir.read_baton(1)
+    # The next boundary's PLAN read that baton (it is the planner's only memory).
+    assert "setup_error" in planner.contexts[1].baton
+
+
+# --- a close-out rate limit razes + restarts the SAME epoch (node #1) -----------
+
+
+def test_closeout_rate_limit_razes_and_restarts(
+    git_repo: Path, run_dir: RunDir, job_path: Path
+) -> None:
+    calls, fake = _no_sleep()
+    # The epoch is planned TWICE: the first close-out hits a rate limit (raze + park +
+    # restart the whole epoch), the restart re-plans and closes out clean.
+    planner = MockDecisionPlanner(
+        [_epoch(_impl("T1", ["a.py"])), _epoch(_impl("T1", ["a.py"])), _end()],
+        closeout_rate_limit_once=True,
+    )
+    result = start_run(
+        job_path=job_path, run_dir=run_dir, repo=git_repo, planner=planner,
+        backends=_backends(LoopWorker()), sleep_fn=fake, backoff_s=11.0,
+    )
+    assert result.status == "completed"
+    assert calls == [11.0]  # parked exactly once at the close-out backoff
+    assert "a.py" in wt.list_tree(git_repo, "grind/run-1")
+    # E1 was started twice (razed + restarted) and completed exactly once.
+    events = read_events(run_dir.events_path)
+    starts = [e for e in events if isinstance(e, EpochStarted) and e.epoch_id == "E1"]
+    completes = [e for e in events if isinstance(e, EpochCompleted) and e.epoch_id == "E1"]
+    assert len(starts) == 2 and len(completes) == 1
+    # The close-out planner was called for both attempts; a rate-limit event was logged.
+    assert len(planner.closeout_contexts) == 2
+    assert any(e.event == "rate_limited" for e in events)
 
 
 # --- non-write task reads the integration tip ----------------------------------
@@ -332,15 +456,16 @@ def test_resume_razes_inflight_and_replans(
     assert "E1/T1/handoff.json" in planner.contexts[0].log_index
 
 
-# --- FIX 1: an unexpected GitError/OSError mid-epoch routes to node #2 ----------
+# --- an unexpected GitError/OSError mid-epoch razes + restarts the SAME epoch ----
 
 
-def test_unexpected_git_error_mid_epoch_is_carried_not_crash(
+def test_unexpected_git_error_mid_epoch_razes_and_restarts(
     git_repo: Path, run_dir: RunDir, job_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # An orchestrator-side fault (a GitError from the integration machinery, OUTSIDE
-    # the worker's attempt try) must NOT crash an unattended run: BONES routes ANY
-    # other epoch failure to node #2 as carried context the next boundary sees.
+    # An orchestrator-side fault during finalize (a GitError from the fast-forward,
+    # OUTSIDE the worker's attempt try) must NOT crash an unattended run: BONES razes
+    # the in-flight epoch and RESTARTS it (an aborted epoch has no baton, so it is
+    # never completed). The planner re-plans the SAME epoch on restart.
     real_ff = wt.fast_forward_branch
     calls = {"n": 0}
 
@@ -351,18 +476,27 @@ def test_unexpected_git_error_mid_epoch_is_carried_not_crash(
         real_ff(repo, branch, commit)
 
     monkeypatch.setattr("grindstone.loop.wt.fast_forward_branch", flaky_ff)
+    # Both script entries plan a.py: the first aborts at finalize, the restart re-plans
+    # and lands it (the work was razed, so the planner must re-propose it).
     planner = MockDecisionPlanner(
-        [_epoch(_impl("T1", ["a.py"])), _epoch(_impl("T2", ["b.py"])), _end()]
+        [_epoch(_impl("T1", ["a.py"])), _epoch(_impl("T1", ["a.py"])), _end()]
     )
     result = start_run(
         job_path=job_path, run_dir=run_dir, repo=git_repo, planner=planner,
         backends=_backends(LoopWorker()), max_epochs=5,
     )
-    assert result.status == "completed"  # the run survived the fault
-    # E1's integration aborted; the planner saw the abort as carried context at E2.
-    assert any("abort" in c.lower() for c in planner.contexts[1].carried)
-    # The run recovered: E2 integrated cleanly onto the run branch.
-    assert "b.py" in wt.list_tree(git_repo, "grind/run-1")
+    assert result.status == "completed"  # the run survived the fault by restarting
+    assert "a.py" in wt.list_tree(git_repo, "grind/run-1")
+    # E1 was STARTED twice (the abort razed it with no baton, then it restarted) and
+    # completed exactly once (the durable boundary only the successful finalize emits).
+    events = read_events(run_dir.events_path)
+    starts = [e for e in events if isinstance(e, EpochStarted) and e.epoch_id == "E1"]
+    completes = [
+        e for e in events if isinstance(e, EpochCompleted) and e.epoch_id == "E1"
+    ]
+    assert len(starts) == 2 and len(completes) == 1
+    # No baton was ever written for the aborted attempt; only the finalized epoch has one.
+    assert run_dir.read_baton(1) != ""
 
 
 def test_k_consecutive_aborts_end_cleanly(
@@ -385,18 +519,17 @@ def test_k_consecutive_aborts_end_cleanly(
     assert result.epochs <= 3
 
 
-# --- FIX 5: resume reconstructs the carried context from the journal -----------
+# --- resume re-plans reading the prior epoch's persisted baton -----------------
 
 
-def test_resume_reconstructs_carried_from_journal(
+def test_resume_reads_prior_baton_from_disk(
     git_repo: Path, run_dir: RunDir, job_path: Path
 ) -> None:
-    from grindstone.events import EpochCarried
     from tests.grindstone.mock_worker import CrashingWorker
 
-    # E1 completes with its one task ESCALATED (critic ESCALATE), so the loop carries
-    # "<task> escalated: ..." to the next boundary AND journals it. The host is then
-    # killed during E2 (a SimulatedKill escapes start_run).
+    # E1 completes with its one task ESCALATED (critic ESCALATE): the close-out baton
+    # records the escalation and is persisted at E1/baton.md. The host is then killed
+    # during E2 (a SimulatedKill escapes start_run) BEFORE E2 can finalize a baton.
     planner = MockDecisionPlanner(
         [_epoch(_impl("T1", ["a.py"])), _epoch(_impl("T1", ["b.py"]))]
     )
@@ -406,19 +539,20 @@ def test_resume_reconstructs_carried_from_journal(
             job_path=job_path, run_dir=run_dir, repo=git_repo, planner=planner,
             backends=_backends(worker), max_epochs=5,
         )
-    # The escalation was journaled as a carried event (the resume seed for FIX 5).
-    events = read_events(run_dir.events_path)
-    carried_events = [e for e in events if isinstance(e, EpochCarried)]
-    assert any("escalated" in e.reason for e in carried_events)
+    # E1's baton is on disk (every completed epoch has one) and records the escalation;
+    # the razed E2 left none.
+    assert "escalated" in run_dir.read_baton(1)
+    assert run_dir.read_baton(2) == ""
 
-    # Resume re-enters at the next boundary with carried REPOPULATED (not blind).
+    # Resume re-enters at the next boundary having READ the prior baton from disk (it is
+    # the planner's whole memory; nothing is reconstructed from the journal).
     resume_planner = MockDecisionPlanner([_end("resumed")])
     result = resume_run(
         run_dir=run_dir, repo=git_repo, planner=resume_planner,
         backends=_backends(LoopWorker()),
     )
     assert result.status == "completed"
-    assert any("escalated" in c for c in resume_planner.contexts[0].carried)
+    assert "escalated" in resume_planner.contexts[0].baton
 
 
 # --- the final-acceptance invariant runs done_when against the tip -------------
@@ -427,7 +561,7 @@ def test_resume_reconstructs_carried_from_journal(
 def _ctx(git_repo: Path, run_dir: RunDir, tip: str | None) -> PlannerContext:
     return PlannerContext(
         job="j", repo=git_repo, run_dir=run_dir, run_branch="grind/run-1",
-        tip_ref=tip, tip_files=(), log_index=(), carried=(), epoch_index=1,
+        tip_ref=tip, log_index=(), baton="", epoch_index=1,
         max_epochs=5,
     )
 
@@ -467,7 +601,13 @@ def test_planner_context_carries_tip_each_boundary(
         job_path=job_path, run_dir=run_dir, repo=git_repo, planner=planner,
         backends=_backends(LoopWorker()),
     )
-    # Boundary 1 saw the base (no a.py yet); boundary 2 saw E1's integrated tip.
-    assert "a.py" not in planner.contexts[0].tip_files
-    assert "a.py" in planner.contexts[1].tip_files
-    assert isinstance(planner.contexts[0], PlannerContext)
+    # The integration tip moved forward between boundaries (E1 fast-forwarded it);
+    # the planner greps the tip itself, so the loop need only carry the ref.
+    c0, c1 = planner.contexts[0], planner.contexts[1]
+    assert isinstance(c0, PlannerContext)
+    assert c0.tip_ref != c1.tip_ref
+    assert "a.py" not in wt.list_tree(git_repo, c0.tip_ref) if c0.tip_ref else True
+    assert c1.tip_ref is not None and "a.py" in wt.list_tree(git_repo, c1.tip_ref)
+    # Boundary 1 had no baton (first epoch); boundary 2 read E1's close-out baton.
+    assert c0.baton == ""
+    assert c1.baton == run_dir.read_baton(1) != ""

@@ -20,8 +20,8 @@ injected at a random boundary RESUMES and still converges.
 PART B (the safety net): a run where the worker's output FAILS the job-level
 done_when AND the critic RUBBER-STAMPS every task. The one deterministic
 final-acceptance invariant must catch it: the run ENDS, not completes. Plus: an
-honest critic's RETRY re-runs the worker and ESCALATE surfaces to the planner as
-carried context.
+honest critic's RETRY re-runs the worker and ESCALATE surfaces to the planner via
+the close-out baton.
 """
 
 from __future__ import annotations
@@ -377,7 +377,7 @@ def test_honest_critic_escalate_surfaces_to_planner(
     git_repo: Path, run_dir: RunDir, job_path: Path
 ) -> None:
     """An honest critic ESCALATE routes the task to the planner: it is NOT merged,
-    and the NEXT boundary sees it as carried context the planner steers on."""
+    and the NEXT boundary sees it via the close-out baton the planner steers on."""
 
     planner = MockDecisionPlanner([_epoch_impl("a.py"), _end("steered around it")])
     worker = _ScriptedCriticWorker(critic_outcomes=["ESCALATE"])
@@ -388,9 +388,9 @@ def test_honest_critic_escalate_surfaces_to_planner(
     assert result.status == "completed"  # the planner ended cleanly after the escalate
     # No fast-forward: the escalated work never reached the run branch.
     assert not wt.branch_exists(git_repo, f"grind/{run_dir.root.name}")
-    # The escalation surfaced to the planner's next boundary as carried context.
-    second = planner.contexts[1]
-    assert any("escalated" in c for c in second.carried)
+    # The escalation surfaced to the planner's next boundary via the persisted baton.
+    assert "escalated" in run_dir.read_baton(1)
+    assert "escalated" in planner.contexts[1].baton
 
 
 # --- small builders -------------------------------------------------------------

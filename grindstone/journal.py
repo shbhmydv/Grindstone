@@ -68,8 +68,6 @@ def render_journal(tree: RunTree) -> str:
                 f"    {glyph} {task.id} ({task.mode}) [{task.status}]"
                 f"{_dur(task.started_ts, task.ended_ts, ref)}{note}"
             )
-        for reason in epoch.carried:
-            lines.append(f"    [carried] {reason}")
         lines.append("")
 
     if tree.end_summary:

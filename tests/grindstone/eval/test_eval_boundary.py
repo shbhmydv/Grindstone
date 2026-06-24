@@ -75,15 +75,21 @@ def test_first_boundary_decision_conforms(rig: str, job: str) -> None:
 
 
 @pytest.mark.eval
-def test_boundary_with_carried_failure_conforms(rig: str) -> None:
-    """A boundary carrying a prior-epoch failure: the planner must STILL emit a
-    conforming decision (steer around the blocker or end on it), never a malformed or
-    overlapping plan. Same property band as a fresh boundary."""
+def test_boundary_with_prior_baton_conforms(rig: str) -> None:
+    """A mid-run boundary whose prior-epoch BATON records a failure: the planner must
+    STILL emit a conforming decision (steer around the blocker or end on it), never a
+    malformed or overlapping plan. Same property band as a fresh boundary."""
 
     decision = run_planner_boundary(
         job_spec=TODO_APP_JOB,
         rig=rig,
-        carried=("E1/T1 escalated: pytest is not installed in the environment",),
+        baton=(
+            "## Project summary\nBuilding the TODO app.\n"
+            "## Tasks done\n- (none yet)\n"
+            "## Tasks pending\n- the add/list/done commands + tests\n"
+            "## Current status\nE1/T1 escalated: pytest is not installed in the "
+            "environment; an implement task must install it inside its own worktree.\n"
+        ),
         epoch_index=2,
     )
     O.assert_decision_conforms(decision)
