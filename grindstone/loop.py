@@ -319,11 +319,37 @@ def _build_context(
 # --- setup (the trusted host-mutation seam) ------------------------------------
 
 
-def _run_setup(commands: list[str], cwd: Path) -> str | None:
+def _run_setup(
+    commands: list[str], *, repo: Path | None, run_dir: RunDir, base: str | None
+) -> str | None:
     """Run the planner-declared setup commands in order; return the first failure's
-    message or ``None`` on success. These are TRUSTED-tier (planner-authored)
-    host mutations, so the shell is intentional (the untrusted worker never reaches
-    this seam)."""
+    message or ``None`` on success.
+
+    BONES safety boundary: these are TRUSTED-tier (planner-authored) HOST-GLOBAL
+    mutations (system packages, global tooling, shared directories), so the shell is
+    intentional (the untrusted worker never reaches this seam). They run in a
+    THROWAWAY detached worktree of the epoch base, torn down after, so setup can
+    NEVER dirty the operator checkout. Project-LOCAL dependency installs (npm ci /
+    pip install) do NOT belong here: this throwaway checkout is not the task
+    worktrees, so an install run here would not reach them; an implement task
+    installs the project deps it needs inside its OWN worktree instead. With no repo
+    there is nothing to check out, so the commands run in the run dir (a degenerate
+    but honest fallback)."""
+
+    if not commands:
+        return None
+    if repo is None or base is None:
+        return _run_setup_in(commands, run_dir.root)
+    cwd = run_dir.worktrees_root / "_setup"
+    wt.add_worktree_detached(repo, cwd, ref=base)
+    try:
+        return _run_setup_in(commands, cwd)
+    finally:
+        wt.remove_worktree(repo, cwd)
+
+
+def _run_setup_in(commands: list[str], cwd: Path) -> str | None:
+    """Run the setup commands in ``cwd`` in order; first failure's message or None."""
 
     for cmd in commands:
         try:
@@ -705,7 +731,7 @@ def _drive(
         started_emitted = False
         try:
             setup_err = _run_setup(
-                list(epoch.setup), repo if repo is not None else run_dir.root
+                list(epoch.setup), repo=repo, run_dir=run_dir, base=base,
             )
             if setup_err is not None:
                 carried = carried + (f"E{epoch_index} setup failed: {setup_err}",)

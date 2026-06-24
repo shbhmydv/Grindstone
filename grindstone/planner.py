@@ -129,11 +129,14 @@ These rules hold for EVERY decision:
 - A FRESH run usually leans research-first (understand the job, lay groundwork),
   but that is NOT forced: a small job may be a single epoch, and once the job is
   met you simply emit END.
-- Declare host mutations as SETUP. If an epoch needs an install or any host-level
-  command (npm ci, pip install, creating a shared dir), list it in the epoch's
-  "setup": the TRUSTED state machine runs those, in order, BEFORE the tasks. The
-  untrusted worker NEVER mutates the host, so anything a task needs outside its own
-  worktree MUST be declared as setup.
+- Declare HOST-GLOBAL prep as SETUP. If an epoch needs a host-level mutation (a
+  system package, a globally-installed tool, a shared directory OUTSIDE the repo),
+  list it in the epoch's "setup": the TRUSTED state machine runs those, in order,
+  BEFORE the tasks (the untrusted worker never mutates the host). Setup runs in a
+  throwaway checkout, NOT the task worktrees, so do NOT put project-local dependency
+  installs (npm ci, pip install, yarn) in setup: they would not reach the isolated
+  task worktrees. Instead an implement task installs the project dependencies it
+  needs INSIDE its own worktree as part of its work.
 - Do NOT author verify or test commands as a gate. You write no done_when and no
   check commands: an independent agentic CRITIC re-derives each task's goal and
   judges the work against it. Carry acceptance in the task's prose goal, never as a

@@ -271,9 +271,12 @@ discarded, and corrupts the run.
 #: (the tier only selects which rig SCRIPT runs it).
 _MODE_GUIDANCE: dict[HandoffMode, str] = {
     "implement": (
-        "Make the change inside your file_ownership. Run whatever checks you write "
-        "to convince yourself it works, then self-review your diff and record a "
-        f"short note in `{REVIEW_FILENAME}` in your CWD before handing off."
+        "Make the change inside your file_ownership. If your checks need project "
+        "dependencies (npm ci, pip install, yarn), you MAY install them INSIDE THIS "
+        "WORKTREE as part of your work (setup does not reach here). Run whatever "
+        "checks you write to convince yourself it works, then self-review your diff "
+        f"and record a short note in `{REVIEW_FILENAME}` in your CWD before handing "
+        "off."
     ),
     "research": (
         "Investigate, then write your findings to the artifact log key below. "

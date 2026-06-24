@@ -94,6 +94,16 @@ def test_build_planner_input_renders_every_context_field(run_dir: RunDir) -> Non
     assert "epoch must declare at least one task" in prompt
 
 
+def test_planner_core_reframes_setup_as_host_global(run_dir: RunDir) -> None:
+    # FIX 3: setup is HOST-GLOBAL prep only; project-local dep installs must NOT be
+    # declared as setup (they would not reach the isolated task worktrees).
+    prompt = build_planner_input(_raw_context(run_dir), domain_skill_index={})
+    low = prompt.lower()
+    assert "host-global" in low
+    assert "npm ci" in low and "pip install" in low  # named as what NOT to put here
+    assert "would not reach" in low or "do not put" in low
+
+
 def test_build_planner_input_empty_run_is_clean(run_dir: RunDir) -> None:
     ctx = PlannerContext(
         job="x", repo=None, run_dir=run_dir, run_branch=None, tip_ref=None,

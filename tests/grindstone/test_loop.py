@@ -10,6 +10,7 @@ reading the integration tip a prior epoch built; and RESUME from a mid-epoch cra
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import Callable
 
@@ -140,19 +141,30 @@ def test_end_decision_phase_handoff(
 # --- planner-declared setup (the trusted host-mutation seam) -------------------
 
 
-def test_planner_setup_runs_before_tasks(
-    git_repo: Path, run_dir: RunDir, job_path: Path
+def test_planner_setup_runs_off_the_operator_checkout(
+    git_repo: Path, run_dir: RunDir, job_path: Path, tmp_path: Path
 ) -> None:
+    # FIX 3: setup is the TRUSTED host-global seam (system packages, shared dirs,
+    # global tooling), NOT project-local dep installs. It runs in a throwaway
+    # checkout, so a host-global side effect (an absolute-path touch) lands while the
+    # operator checkout stays clean.
+    marker = tmp_path / "host-global-ran"
     planner = MockDecisionPlanner(
-        [_epoch(_impl("T1", ["a.py"]), setup=["touch setup-ran"]), _end()]
+        [_epoch(_impl("T1", ["a.py"]), setup=[f"touch {marker}"]), _end()]
     )
     result = start_run(
         job_path=job_path, run_dir=run_dir, repo=git_repo, planner=planner,
         backends=_backends(LoopWorker()),
     )
     assert result.status == "completed"
-    # The orchestrator ran the planner-declared setup on the host (the repo root).
-    assert (git_repo / "setup-ran").is_file()
+    # The host-global setup ran (outside the repo)...
+    assert marker.is_file()
+    # ...and the operator checkout was NOT dirtied by it.
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=str(git_repo),
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert status == ""
 
 
 # --- disjoint-ownership merge of two passing implement tasks -------------------

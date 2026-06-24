@@ -202,6 +202,18 @@ def test_worktree_isolation_external_base(git_repo: Path, run_dir: RunDir) -> No
 # --- the critic prompt encodes the triage --------------------------------------
 
 
+def test_implement_prompt_allows_in_worktree_dep_install() -> None:
+    # FIX 3: an implement worker MAY install project deps inside its own worktree if
+    # its checks require them (setup no longer carries project-local installs).
+    from grindstone.worker import WorkerRequest, build_worker_prompt
+
+    request = WorkerRequest(
+        task=_implement(), task_id="P1/E1/T1", mode="implement", scratch=Path("/x"),
+    )
+    prompt = build_worker_prompt(request).lower()
+    assert "install" in prompt and "inside this worktree" in prompt
+
+
 def test_critic_prompt_encodes_triage() -> None:
     from grindstone.worker import CriticBrief, WorkerRequest
 
