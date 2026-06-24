@@ -1,9 +1,11 @@
-"""Invariant tests for the lenient wire contracts (decision / handoff / verdict).
+"""Invariant tests for the lenient wire contracts (decision / verdict).
 
 Stochastic-first (BONES): a handful of invariant tests, not hundreds. These pin
-the contract shape every later part imports, plus the failure-routing entry points
-(handoff BLOCKED, verdict ESCALATE) the failure model depends on, and guard the
-Pydantic models against drift from the JSON Schemas the planner self-validates on.
+the contract shape every later part imports, plus the failure-routing entry point
+(verdict ESCALATE) the failure model depends on, and guard the Pydantic models
+against drift from the JSON Schemas the planner self-validates on. The worker's
+``handoff.md`` is deliberately NOT a wire contract (free-form prose, never parsed),
+so there is nothing to test here.
 """
 
 from __future__ import annotations
@@ -18,10 +20,8 @@ from pydantic import ValidationError
 from grindstone.contracts.models import (
     EndDecision,
     EpochDecision,
-    Handoff,
     Verdict,
     parse_decision,
-    parse_handoff,
     parse_verdict,
 )
 
@@ -168,45 +168,6 @@ def test_decision_schema_matches_pydantic() -> None:
     assert list(validator.iter_errors(bad)) != []
     with pytest.raises(ValidationError):
         parse_decision(bad)
-
-
-# --- handoff: the bone + BLOCKED ----------------------------------------------
-
-
-def _handoff_payload(status: str = "DONE") -> dict[str, object]:
-    return {
-        "schema_version": "1",
-        "task_id": "P1/E1/T1",
-        "status": status,
-        "resulting_state": "did the work",
-        "checks": [{"check": "pytest", "exit_code": 0}],
-        "occupancy": {"compacted": False, "subagent_splits": 0},
-    }
-
-
-def test_handoff_done_parses() -> None:
-    handoff = parse_handoff(_handoff_payload())
-    assert isinstance(handoff, Handoff)
-    assert handoff.status == "DONE"
-
-
-def test_handoff_blocked_is_accepted() -> None:
-    """A worker self-reporting BLOCKED routes straight to the planner (BONES)."""
-
-    handoff = parse_handoff(_handoff_payload("BLOCKED"))
-    assert handoff.status == "BLOCKED"
-
-
-def test_handoff_bad_status_rejected() -> None:
-    with pytest.raises(ValidationError):
-        parse_handoff(_handoff_payload("WIP"))
-
-
-def test_handoff_task_id_grammar_enforced() -> None:
-    payload = _handoff_payload()
-    payload["task_id"] = "T1"  # not fully qualified
-    with pytest.raises(ValidationError):
-        parse_handoff(payload)
 
 
 # --- verdict: lenient triage ---------------------------------------------------

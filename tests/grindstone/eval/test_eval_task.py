@@ -2,10 +2,11 @@
 
 Each test drives the REAL ``run_task`` once through ``run_worker_task`` on the ``rig``
 fixture (the local floor and the cloud ceiling) and asserts PROPERTIES of the result
-via the ``_oracle`` bands: a trivial task must PASS, which means its handoff VALIDATED
-(the disk-gate + Pydantic parse ran) and the independent CRITIC returned a verdict.
-The thesis mirrors the boundary corpus: if the local floor handles a trivial implement
-+ research task cleanly, the cloud ceiling will too.
+via the ``_oracle`` bands: a trivial task must PASS, which means it cleared the
+DETERMINISTIC gate (a non-empty in-scope commit, or a present artifact) and the
+independent CRITIC returned a PASS verdict. The thesis mirrors the boundary corpus:
+if the local floor handles a trivial implement + research task cleanly, the cloud
+ceiling will too.
 
 These need a live endpoint, so they are excluded from the default suite (the ``eval``
 marker) and skipped unless ``GRINDSTONE_EVAL_RIG`` names the rig. Run them live with:
@@ -26,8 +27,9 @@ from tests.grindstone.eval._task import run_worker_task
 @pytest.mark.eval
 def test_implement_task_creates_file(rig: str) -> None:
     """A tiny implement task: create one file with exact content. BAND: the task
-    PASSES with a gate-clean DONE handoff and a critic verdict. file_ownership is a
-    single concrete file, so the worker has no decomposition latitude to get wrong."""
+    PASSES the deterministic gate (a non-empty in-scope commit) and the critic
+    verdict. file_ownership is a single concrete file, so the worker has no
+    decomposition latitude to get wrong."""
 
     task = Task(
         id="T1",
@@ -46,8 +48,8 @@ def test_implement_task_creates_file(rig: str) -> None:
 @pytest.mark.eval
 def test_research_task_writes_findings(rig: str) -> None:
     """A tiny research task: write a short grounded findings note. BAND: the task
-    PASSES with a gate-clean DONE handoff (the gate enforces the research citation
-    floor) and a critic verdict."""
+    PASSES the deterministic gate (the artifact exists) and the critic verdict (the
+    critic enforces the research grounding floor)."""
 
     task = Task(
         id="T1",

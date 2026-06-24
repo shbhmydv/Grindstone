@@ -9,10 +9,11 @@ from pathlib import Path
 
 import pytest
 
-from grindstone.contracts.models import Task, parse_decision, parse_handoff
+from grindstone.contracts.models import Task, parse_decision
 from grindstone.mock_planner import MockPlanner
 from grindstone.mock_worker import MockWorker
 from grindstone.planner import RateLimited as PlannerRateLimited
+from grindstone.worker import HANDOFF_FILENAME
 from grindstone.worker import RateLimited as WorkerRateLimited
 from grindstone.worker import WorkerRequest
 
@@ -36,18 +37,18 @@ def test_mock_planner_failures_route_two_node() -> None:
         parse_decision(json.loads(bad))
 
 
-def test_mock_worker_writes_valid_handoff(tmp_path: Path) -> None:
+def test_mock_worker_writes_work_and_freeform_handoff(tmp_path: Path) -> None:
     task = Task(id="T1", mode="implement", goal="x", file_ownership=["a.py"])
     request = WorkerRequest(
         task=task, task_id="P1/E1/T1", mode="implement", scratch=tmp_path
     )
     worker = MockWorker(script=["ok"], artifacts={"a.py": "print(1)\n"})
     worker.run(request)
-    handoff = parse_handoff(__import__("json").loads(
-        (tmp_path / "handoff.json").read_text()
-    ))
-    assert handoff.status == "DONE"
-    assert (tmp_path / "review.md").is_file()  # implement review gate satisfied
+    # The claimed file is written (the deterministic gate's subject) and a free-form
+    # handoff.md report sits alongside it (prose, never a schema).
+    assert (tmp_path / "a.py").read_text() == "print(1)\n"
+    report = (tmp_path / HANDOFF_FILENAME).read_text()
+    assert "P1/E1/T1" in report and "DONE" in report
 
 
 def test_mock_worker_rate_limit_raises(tmp_path: Path) -> None:

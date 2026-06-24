@@ -3,10 +3,11 @@
 ``run_worker_task`` is the worker analogue of ``run_planner_boundary``: given a typed
 ``Task`` + a rig, it builds the real per-backend ``Backends`` map (one ``ScriptWorker``
 per endpoint, the same the CLI ladder builds) and runs the production ``run_task``
-end to end, the isolated worktree / scratch, the rig dispatch, the disk-gate handoff
-collection, and the independent tier-matched CRITIC. It returns the ``TaskResult`` so
-the corpus can assert PROPERTIES (the handoff validated, the critic returned a
-verdict). REUSES ``run_task`` + ``build_backends`` verbatim, so there is zero drift.
+end to end, the isolated worktree / scratch, the rig dispatch, the DETERMINISTIC gate
+(committed diff / produced artifact), and the independent tier-matched CRITIC. It
+returns the ``TaskResult`` so the corpus can assert PROPERTIES (the gate cleared, the
+critic returned a verdict). REUSES ``run_task`` + ``build_backends`` verbatim, so
+there is zero drift.
 """
 
 from __future__ import annotations

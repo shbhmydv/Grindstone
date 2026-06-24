@@ -1,11 +1,13 @@
 """The per-task EXECUTION UNIT (``run_task``) + the lenient CRITIC.
 
 Driven entirely through ``MockWorker`` (no real model): a flat script alternates
-worker behaviors and critic outcomes (``run_task`` always dispatches worker then,
-on a DONE handoff, the tier-matched critic). Covers the BONES control flow: DONE ->
-critic PASS -> merge-ready; RETRY-then-PASS; ESCALATE surfaced; retries exhausted
-surfaced; BLOCKED skips the critic and routes to the planner; an invalid handoff is
-rejected; and worktree isolation (writes never touch the operator checkout).
+worker behaviors and critic outcomes (``run_task`` always dispatches the worker then,
+on a gate-clean attempt, the tier-matched critic). Covers the BONES control flow: a
+gate-clean attempt -> critic PASS -> merge-ready; RETRY-then-PASS; ESCALATE surfaced;
+retries exhausted surfaced; a worker that REPORTS an environmental blocker -> the
+critic ESCALATES (no separate Python BLOCKED gate); an attempt that fails the
+deterministic gate (no committed work) is rejected; and worktree isolation (writes
+never touch the operator checkout).
 """
 
 from __future__ import annotations
@@ -122,30 +124,31 @@ def test_retries_exhausted_surfaced(git_repo: Path, run_dir: RunDir) -> None:
     assert result.attempts == 2
 
 
-# --- BLOCKED skips the critic, routes to the planner ---------------------------
+# --- a worker-reported environmental blocker -> the critic ESCALATES -----------
 
 
-def test_blocked_skips_critic(git_repo: Path, run_dir: RunDir) -> None:
+def test_blocked_report_escalates(git_repo: Path, run_dir: RunDir) -> None:
+    # The worker does some work AND writes a handoff.md reporting a hard blocker; the
+    # independent critic reads that report and ESCALATES (no Python BLOCKED gate).
     base = wt.head_commit(git_repo)
-    # Script has NO critic entry: a BLOCKED handoff must route straight to the
-    # planner without dispatching the critic (else the mock would over-run).
-    worker = MockWorker(script=["blocked"], artifacts={"a.py": "print(1)\n"})
+    worker = MockWorker(script=["blocked", "ESCALATE"], artifacts={"a.py": "print(1)\n"})
     result = run_task(
         _implement(), "P1/E1/T1", run_dir=run_dir, repo=git_repo, base=base,
         backends=_backends(worker),
     )
-    assert result.outcome == "blocked"
-    assert result.handoff is not None and result.handoff.status == "BLOCKED"
-    assert result.verdict is None  # the critic never ran
+    assert result.outcome == "escalated"
+    assert result.verdict is not None and result.verdict.outcome == "ESCALATE"
+    # The free-form report was relocated for the planner's context.
+    assert result.handoff_path is not None and result.handoff_path.is_file()
 
 
-# --- invalid handoff rejected --------------------------------------------------
+# --- a failed deterministic gate (no committed work) is rejected ---------------
 
 
-def test_invalid_handoff_retried_then_pass(git_repo: Path, run_dir: RunDir) -> None:
+def test_empty_attempt_retried_then_pass(git_repo: Path, run_dir: RunDir) -> None:
     base = wt.head_commit(git_repo)
     worker = MockWorker(
-        script=["bad_json", "ok", "PASS"], artifacts={"a.py": "print(1)\n"}
+        script=["empty", "ok", "PASS"], artifacts={"a.py": "print(1)\n"}
     )
     result = run_task(
         _implement(), "P1/E1/T1", run_dir=run_dir, repo=git_repo, base=base,
@@ -155,17 +158,17 @@ def test_invalid_handoff_retried_then_pass(git_repo: Path, run_dir: RunDir) -> N
     assert result.attempts == 2
 
 
-def test_invalid_handoff_exhausts_to_escalate(
+def test_empty_attempts_exhaust_to_escalate(
     git_repo: Path, run_dir: RunDir
 ) -> None:
     base = wt.head_commit(git_repo)
-    worker = MockWorker(script=["bad_json", "empty"], artifacts={"a.py": "x\n"})
+    worker = MockWorker(script=["empty", "empty"], artifacts={"a.py": "x\n"})
     result = run_task(
         _implement(), "P1/E1/T1", run_dir=run_dir, repo=git_repo, base=base,
         backends=_backends(worker),
     )
     assert result.outcome == "escalated"
-    assert result.verdict is None  # no DONE handoff ever reached the critic
+    assert result.verdict is None  # no gate-clean attempt ever reached the critic
 
 
 # --- rate limit propagates (not a burned attempt) ------------------------------

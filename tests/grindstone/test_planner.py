@@ -58,8 +58,8 @@ def _raw_context(run_dir: RunDir) -> PlannerContext:
         run_branch=None,
         tip_ref="deadbeef",
         tip_files=("README.md", "src/app.py"),
-        log_index=("P1/E1/T1/handoff.json", "P1/E1/T2/report.md"),
-        carried=("T2 BLOCKED: missing dep foo",),
+        log_index=("P1/E1/T1/handoff.md", "P1/E1/T2/report.md"),
+        carried=("T2 escalated: missing dep foo",),
         epoch_index=3,
         max_epochs=40,
     )
@@ -80,12 +80,12 @@ def test_build_planner_input_renders_every_context_field(run_dir: RunDir) -> Non
     # the running state + epoch counter
     assert "epoch 3 of at most 40" in prompt
     # the keyed-log index a task may name as inputs
-    assert "P1/E1/T1/handoff.json" in prompt
+    assert "P1/E1/T1/handoff.md" in prompt
     assert "P1/E1/T2/report.md" in prompt
     # the integration-tip file list
     assert "README.md" in prompt and "src/app.py" in prompt
     # the prior epoch's carried failures to steer around
-    assert "T2 BLOCKED: missing dep foo" in prompt
+    assert "T2 escalated: missing dep foo" in prompt
     # the domain-skill catalogue INDEX to select from
     assert "rn-taste" in prompt and "tasteful RN component conventions" in prompt
     # the grep + read read-tools note (the planner pulls; nothing is pushed)

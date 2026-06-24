@@ -13,14 +13,9 @@ from pathlib import Path
 
 import pytest
 
-from grindstone.contracts.models import Task, parse_handoff
+from grindstone.contracts.models import Task
 from grindstone.script_worker import ScriptWorker, build_backends
 from grindstone.worker import RateLimited, TransportError, WorkerRequest
-
-_HANDOFF_JSON = """{{"schema_version":"1","task_id":"{tid}","status":"DONE",
-"resulting_state":"fake worker done","what_changed":[],"downstream_needs":[],
-"not_done":[],"citations":[],"checks":[{{"check":"x","exit_code":0}}],
-"occupancy":{{"compacted":false,"subagent_splits":0}}}}"""
 
 
 def _script(path: Path, body: str) -> Path:
@@ -54,19 +49,16 @@ def _worker(script: Path, tmp_path: Path, timeout_s: float = 30.0) -> ScriptWork
 
 
 def test_script_worker_writes_handoff(tmp_path: Path) -> None:
+    # The script honors the file contract: it writes its free-form handoff.md into
+    # the --worktree. ScriptWorker just runs it (run_task gates the work, not this).
     body = _arg("worktree") + (
-        "cat > \"$wt/handoff.json\" <<'EOF'\n"
-        + _HANDOFF_JSON.format(tid="P1/E1/T1")
-        + "\nEOF\n"
+        'printf "# handoff P1/E1/T1\\nDONE\\n" > "$wt/handoff.md"\n'
     )
     script = _script(tmp_path / "worker_request.sh", body)
     scratch = tmp_path / "wt"
     scratch.mkdir()
     _worker(script, tmp_path).run(_request(scratch))
-    handoff = parse_handoff(
-        __import__("json").loads((scratch / "handoff.json").read_text())
-    )
-    assert handoff.status == "DONE"
+    assert "DONE" in (scratch / "handoff.md").read_text()
 
 
 def test_script_worker_maps_rate_limit(tmp_path: Path) -> None:

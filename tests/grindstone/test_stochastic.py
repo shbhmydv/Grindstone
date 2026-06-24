@@ -39,7 +39,6 @@ from grindstone.contracts.models import (
     Epoch,
     EpochDecision,
     Task,
-    parse_handoff,
 )
 from grindstone.loop import (
     AcceptanceCheck,
@@ -174,10 +173,10 @@ def _assert_log_and_events_consistent(run_dir: RunDir, result: RunResult) -> Non
         tid = getattr(event, "task_id", None)
         if tid is not None:
             assert _SHORT_TASK_ID.match(tid), f"malformed task id in journal: {tid!r}"
-    # Every relocated handoff parses (no torn / half-written record), and every
-    # published artifact is a non-empty file (no half-relocated deliverable).
-    for handoff in run_dir.root.rglob("P*/E*/T*/handoff.json"):
-        parse_handoff(json.loads(handoff.read_text(encoding="utf-8")))
+    # Every relocated handoff is a non-empty file (free-form prose, never parsed),
+    # and every published artifact is a non-empty file (no half-relocated deliverable).
+    for handoff in run_dir.root.rglob("P*/E*/T*/handoff.md"):
+        assert handoff.stat().st_size > 0, f"empty relocated handoff {handoff}"
     for key in run_dir.log_index():
         if key.endswith((".md",)):
             assert run_dir.resolve(key).stat().st_size > 0, f"empty artifact {key}"
@@ -350,9 +349,9 @@ class _ScriptedCriticWorker:
             (request.scratch / rel).write_text(
                 f"# {request.task_id}\nvalue = 1\n", encoding="utf-8"
             )
-        (request.scratch / "review.md").write_text("ok\n", encoding="utf-8")
-        (request.scratch / "handoff.json").write_text(
-            json.dumps(_handoff_for(request)), encoding="utf-8"
+        (request.scratch / "handoff.md").write_text(
+            f"# handoff {request.task_id}\nDONE; built the claimed files.\n",
+            encoding="utf-8",
         )
 
 
@@ -414,18 +413,3 @@ def _epoch_impl(owned: str) -> EpochDecision:
 
 def _end(summary: str) -> EndDecision:
     return EndDecision(kind="end", summary=summary)
-
-
-def _handoff_for(request: WorkerRequest) -> dict[str, object]:
-    return {
-        "schema_version": "1",
-        "task_id": request.task_id,
-        "status": "DONE",
-        "what_changed": [
-            {"kind": "file", "ref": f} for f in request.task.file_ownership
-        ],
-        "resulting_state": "work complete",
-        "citations": [{"file": f} for f in request.task.file_ownership],
-        "checks": [{"check": "self-check", "exit_code": 0}],
-        "occupancy": {"compacted": False, "subagent_splits": 0},
-    }

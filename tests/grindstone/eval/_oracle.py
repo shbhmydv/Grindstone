@@ -84,18 +84,14 @@ def assert_task_passed_with_verdict(result: TaskResult) -> None:
     """A tiny real worker task produced a gate-clean, critic-judged PASS.
 
     The capability band: a trivial task (write one file, write one findings note) on
-    the local floor must PASS, which means its handoff VALIDATED (the disk-gate +
-    Pydantic parse ran inside ``run_task``, so a non-None DONE handoff is a gate pass)
-    and the independent CRITIC returned a verdict (the agentic judge actually ran and
-    routed to PASS). A blocked / escalated tiny task is a real capability failure the
-    corpus surfaces, with the handoff reason for the post-mortem."""
+    the local floor must PASS, which means it cleared the DETERMINISTIC gate (a
+    non-empty in-scope commit, or a present artifact, checked inside ``run_task``) and
+    the independent CRITIC returned a PASS verdict (the agentic judge actually ran and
+    routed). An escalated tiny task is a real capability failure the corpus surfaces,
+    with the verdict reason for the post-mortem."""
 
-    reason = result.reason or (result.handoff.resulting_state if result.handoff else "")
     assert result.outcome == "passed", (
-        f"a trivial task did not pass: {result.outcome!r} ({reason})"
-    )
-    assert result.handoff is not None and result.handoff.status == "DONE", (
-        "no gate-clean DONE handoff was collected"
+        f"a trivial task did not pass: {result.outcome!r} ({result.reason})"
     )
     assert result.verdict is not None, "the critic returned no verdict"
     assert result.verdict.outcome == "PASS", (
