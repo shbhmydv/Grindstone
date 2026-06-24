@@ -134,9 +134,15 @@ object, no markdown fence), ONE of two shapes:
   END:   {"kind":"end","summary":".."}
 
 Rules for every decision:
-- YOU own all sequencing. Propose the SINGLE next epoch as 1 to 8 tasks that fan out in
-  parallel with NO dependency on each other (a dependency means a later epoch, not a
-  task in this one). Each task carries: an id ("T1".."T8"); a mode (implement | research
+- YOU own all sequencing, and the run is EXPECTED to span many epochs - you are not
+  trying to finish in one. Propose the SINGLE next epoch as 1 to 8 tasks that fan out in
+  parallel with NO dependency on each other. Sibling tasks grind in ISOLATED worktrees
+  off the same base and CANNOT see each other's output; the only sync point is the merge
+  at the epoch boundary. So if a task would need anything another task produces (code
+  under test, a module to import, an interface to build on), it does NOT belong in this
+  epoch: schedule the producer now and let the NEXT epoch, which sees it merged, do the
+  consumer. Tests come after the code they test; integration after its parts. Each task
+  carries: an id ("T1".."T8"); a mode (implement | research
   | review | artifact); a routing tier ("local", the default, for mechanical or
   checkable work; "senior" for judgment, taste, synthesis, or visual quality); and a
   prose goal that states the task's OWN notion of done.

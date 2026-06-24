@@ -278,7 +278,11 @@ and IS the repository for this task. Create and edit every file with paths RELAT
 your CWD; never write to an absolute path and never write outside your CWD. There is no
 other repository you may touch - do not go looking for one, this worktree is it. The
 orchestrator inspects ONLY this worktree to gate and integrate your work, so anything you
-write elsewhere is invisible, discarded, and corrupts the run. You can SEE: read any
+write elsewhere is invisible, discarded, and corrupts the run. If something you depend on
+(a module to import, code under test) is NOT present in your worktree, it is owned by
+another task that has not merged yet - do NOT create it to unblock yourself: write against
+it as if it exists and record the missing dependency in your handoff. Reaching beyond your
+own files only fails the gate. You can SEE: read any
 image in your worktree or inputs directly (screenshots, mockups, designs) and produce
 images where visual proof helps your reviewer - view, do not guess.
 </worktree>"""
