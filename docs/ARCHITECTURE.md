@@ -3,8 +3,10 @@
 Grindstone is an **epoch-based deep-work orchestrator**. You hand it a job spec;
 a stateless planner proposes one small epoch at a time; workers fan out and grind
 through the epoch's tasks in isolated git worktrees; an independent critic triages
-each task; and the loop repeats until the planner declares the job done. It is
-Python with Pydantic at every boundary and `mypy --strict` clean.
+each task; the planner then closes out the epoch by writing a free-form **baton**
+(its living plan, the memory it hands its next self); and the loop repeats until
+the planner declares the job done. It is Python with Pydantic at every boundary and
+`mypy --strict` clean.
 
 It is a subagent that does not lose context, does not have to be babysat, and uses
 cheap local compute when the work is checkable. Nothing more.
@@ -15,9 +17,11 @@ The differentiator is the loop itself. It is **not** a stateful "leader" model t
 owns the run and drifts over a long horizon. The only model that steers the run,
 the planner, is a **stateless one-shot call**: each boundary Grindstone
 reconstructs its full input fresh from durable disk state, so context is
-re-derived, never accumulated, and no window rots or goes quadratic. The model
-*proposes* one decision as constrained JSON; the state machine *validates and
-disposes* of it.
+re-derived, never accumulated, and no window rots or goes quadratic. The planner
+works in two roles, **PLAN** (forward: propose the next epoch as constrained JSON)
+and **CLOSE-OUT** (back: write the free-form baton); its only memory across the run
+is that baton, persisted on disk and re-read fresh at the next boundary. The model
+*proposes* one decision; the state machine *validates and disposes* of it.
 
 Python here is a pure function of disk state plus a handful of enum/boolean
 signals, mapping to the next node. It makes **no quality judgment**. It owns
@@ -42,10 +46,12 @@ done or blocked or retryable) is delegated to a model.
 ## The five properties that define it
 
 1. **Externalized context.** No model holds the whole history. The memory is the
-   git tip plus the durable keyed log plus the event log. Each epoch reconstructs
-   a bounded, fresh window from disk: the job, the integration-tip file list, the
-   keyed-log index, and the prior epoch's carried failures. The planner is
-   stateless per call.
+   git tip plus the durable keyed log plus the event log plus the planner's baton.
+   Each epoch reconstructs a bounded, fresh window from disk: the job, the keyed-log
+   index, and the prior epoch's baton (the living plan the planner wrote at
+   close-out); the planner greps its own workdir checkout for the tree rather than
+   being handed a file list. The planner is stateless per call, and its only memory
+   across the run is that durable on-disk baton.
 2. **Local when it can.** Per-task tier: `local` (Qwen) for mechanical or
    checkable work, `senior` (Claude) for judgment and taste. The planner picks the
    tier; Python just maps it to a rig.
@@ -68,13 +74,16 @@ entirely in `models/`.
 
 | role | what it does | shipped default adapter (`models/claude/`) |
 |---|---|---|
-| **planner** | proposes one epoch at a time as constrained JSON | `planner_request.sh` -> Claude (Opus) via `claude -p`, read-only |
+| **planner** | PLAN: proposes one epoch as constrained JSON; CLOSE-OUT: writes the free-form baton | `planner_request.sh` -> Claude (Opus) via `claude -p`, read-only |
 | **worker** | the on-rig grinders that fan out across an epoch's tasks | `worker_request.sh` -> Claude (Opus) via `claude -p` in the worktree |
 | **senior** | optional judgment / taste / synthesis tier | `senior_request.sh` -> Claude (Opus) via `claude -p`, web search on |
 
 There is **one executor role**: a `senior`-tier task reuses the same worker
 prompts (the tier only selects which rig script runs it). The critic is dispatched
-on the task's own tier.
+on the task's own tier. The planner reaches its rig through one script as well:
+PLAN and CLOSE-OUT are two purposes of the same `planner_request.sh`, switched by a
+`--purpose` flag (the close-out call swaps the self-validate instruction for a
+minimal "write the baton" one).
 
 `models/` is layered as a rig stack: `claude/` is the tracked Claude rig (the
 shipped floor) a fresh clone runs with zero setup; `local/` is a bundled all-Qwen
@@ -104,8 +113,8 @@ job is met.
 
 ```
 loop (until the planner ends or the max-epochs backstop fires):
-  context  = job + integration tip (file list) + keyed-log index + carried failures
-  decision = planner.decide(context)          # ONE typed Decision, self-validated on disk
+  context  = job + keyed-log index + the prior epoch's baton (the planner's living plan)
+  decision = planner.decide(context)          # PLAN: ONE typed Decision, self-validated on disk
   if decision is END:
     run the one final acceptance (job done_when) ONCE
     pass -> completed ; otherwise -> a clean partial-end (resumable)
@@ -115,11 +124,18 @@ loop (until the planner ends or the max-epochs backstop fires):
       worker grinds -> writes a free-form handoff.md report in its CWD
       deterministic gate (in-scope commit, or the artifact exists)
       tier-matched critic reads the report + the diff/artifact -> a lenient verdict
-        PASS -> merge-ready ; RETRY -> bounded same-tier retry ; ESCALATE -> the planner
-    integrate the PASSing implement tasks by the disjoint-ownership merge invariant
-    fast-forward the durable run branch (only on epoch completion)
-    carry any non-merged outcome forward as context for the next boundary
+        PASS -> merge-ready ; RETRY -> bounded same-tier retry ; ESCALATE -> close-out
+    integrate the PASSing implement tasks onto a STAGING branch (disjoint-ownership merge)
+    planner.close_out(staging tree + the per-task outcomes)  # CLOSE-OUT: writes the baton
+    atomically finalize: fast-forward the run branch + persist the baton + EpochCompleted
 ```
+
+Close-out runs BEFORE the run-branch fast-forward, reading the staging tree, so the
+single durable commit point (the fast-forward + the baton write + `EpochCompleted`)
+already includes the baton: there is no "integrated-but-not-summarized" limbo, and a
+close-out crash or rate-limit is just a raze-and-restart of the same epoch. The
+planner greps its own workdir checkout for the tree, so the context carries no file
+list.
 
 ### Epochs and tasks
 
@@ -162,15 +178,16 @@ handles next boundary.
 Python disposes on exactly two deterministic checks. Everything else is grounded
 and judged agentically.
 
-1. **Disjoint-ownership merge** (`_integrate`, `_ownership_overlap`). Parallel
-   implement tasks declare the files they own; the core enforces that each wrote
-   only within its declared globs and that the realized ownership is pairwise
+1. **Disjoint-ownership merge** (`_integrate_to_staging`, `_ownership_overlap`).
+   Parallel implement tasks declare the files they own; the core enforces that each
+   wrote only within its declared globs and that the realized ownership is pairwise
    disjoint, then fast-forward-merges the passing wip branches (in task order) onto
-   a staging branch and fast-forwards the durable run branch to it. An ownership
-   overlap or a merge conflict aborts integration as a hard error (carried to the
-   planner, the run branch left untouched). This is the one check that prevents
-   silent corruption. The artifact analogue is enforced at parse time: two tasks
-   may not declare the same `artifact_out`.
+   a staging branch. The durable run-branch fast-forward to that staging tip happens
+   later, in `_finalize_epoch`, after close-out has read the staging tree. An
+   ownership overlap or a merge conflict aborts integration as a hard error (the
+   close-out planner records it in the baton, the run branch left untouched). This is
+   the one check that prevents silent corruption. The artifact analogue is enforced
+   at parse time: two tasks may not declare the same `artifact_out`.
 2. **One final acceptance** (`make_acceptance`). When the planner emits END,
    Grindstone checks out the integration tip in a throwaway worktree and runs the
    job's own `done_when` **once**: exit 0 means the run is `completed`; any other
@@ -181,8 +198,9 @@ and judged agentically.
 
 There is **no per-epoch build gate**. Intermediate red is by design: epoch 1 may
 write a module epoch 2 will build against. Only judgment can tell "incrementally
-incomplete" from "broken", so between-epoch build-health is carried as context the
-critic notes and the next epoch resolves, never a deterministic gate.
+incomplete" from "broken", so between-epoch build-health is something the critic
+notes and the close-out planner records in the baton for the next epoch to resolve,
+never a deterministic gate.
 
 ### The critic: triage, not grade
 
@@ -196,8 +214,9 @@ emitting a lenient `Verdict` (an `outcome` enum plus a free-text reason):
 - **RETRY**: a defect the **same** worker can plausibly fix (a typo, a wrong value,
   a missing piece). The bounded same-tier retry.
 - **ESCALATE**: anything the worker cannot fix on its own (a missing dependency, an
-  ambiguous or wrong spec, a decision needed, an environmental blocker). Routes to
-  the planner.
+  ambiguous or wrong spec, a decision needed, an environmental blocker). The task's
+  work is discarded and the outcome surfaces to the close-out planner, which reads
+  the verdict and records what really happened in the baton.
 
 The retry-vs-escalate split is one question: "can the same worker plausibly fix
 this itself?". A research / review critic additionally verifies that the artifact's
@@ -216,7 +235,7 @@ fail-safe escalate, never a silent pass.
 Every worker writes a **free-form** `handoff.md` report in its own CWD: plain prose
 (what I did, what is done, what is blocked or unfinished, which files I touched,
 grounding as prose). Grindstone relocates it verbatim to the task's log key for the
-critic and the planner's optional context. It is **never parsed or schema-validated
+critic and the close-out planner to read. It is **never parsed or schema-validated
 by Python**; stdout is never parsed either. The deterministic gate is the committed
 diff or the produced artifact, not this file. A missing or pathologically large
 report is fine: the critic judges the actual work.
@@ -229,6 +248,40 @@ owns all git staging and committing; the worker must not commit and must not tou
 orchestration files. The critic's verdict is a `verdict.json` written in the
 critic's CWD, relocated and re-validated with Pydantic (a re-read disk contract,
 stdout ignored).
+
+### The baton: the planner's memory (close-out)
+
+The planner is not memoryless. At the **end** of every epoch the loop hands it a
+`CloseoutContext` (the just-finished epoch's per-task outcomes as pure references,
+plus the staging tree) and asks the **CLOSE-OUT** role for one thing: the updated
+**baton**, a **free-form** markdown living plan. The baton has four sections the
+close-out prompt enforces (Project summary / Tasks done / Tasks pending / Current
+status), but Python persists it **verbatim and NEVER parses it** (the same status as
+the handoff). It is stored per epoch in the keyed log at `E<n>/baton.md`; the latest
+completed epoch's baton is "current", and history is free (each epoch keeps its own).
+At the **start** of the next epoch the PLAN call re-reads that prior baton as its
+memory, reconciling it against the actual tree.
+
+This is where all the judgment Python refuses to make lives. The close-out planner
+**reads** the escalated tasks' verdicts and handoffs (already in the keyed log) and
+the staging tree, then writes the partial-progress / no-progress / regression nuance
+itself; the loop never characterizes a failure. Close-out marks the epoch DONE: a
+completed epoch always has a baton, so the all-pass and the partial-fail cases are
+one path (only the passing tasks merge; the epoch still completes with a baton),
+while an unhandled crash or rate-limit razes and restarts the epoch with no baton
+written.
+
+### Vision is first-class
+
+Worker, critic, planner, and close-out all **see**. Images (screenshots, mockups,
+rendered UI, diagrams) ride the **same file contract** as everything else: an agent
+views an image file with its Read tool, with no separate machinery, no extra event,
+and no schema. An image artifact a task produces is a first-class log key (the keyed
+log already allows image paths), and an image input is named by its log key like any
+other input. The prompts tell every agent it can see and should view rather than
+describe. Generating the visual proof (rendering a screen, capturing a screenshot)
+is the **target repo's** job, declared in a task's goal; Grindstone's job is only to
+make the pipeline able to see it.
 
 ## The safety boundary
 
@@ -257,17 +310,18 @@ state machine with one field in the decision.
 Every interruption routes to exactly one of two handlers.
 
 1. **Rate limit / quota** (on the planner, the worker, or the critic): **park**,
-   back off (about once an hour, injectable), then re-enter. A planner rate-limit
-   re-issues the boundary call; a mid-epoch worker rate-limit razes the in-flight
-   epoch's throwaway worktrees and **restarts the epoch whole** (partial state is
-   never trusted).
-2. **Cannot continue** (any other epoch failure): the failure becomes carried
-   context the planner sees next boundary and steers around, or the planner ends
-   cleanly by writing a summary (the resume seed). The `max_epochs` backstop is the
-   **involuntary** trigger of the same clean end, so a planner that spins without
-   progress is always bounded. An unexpected error escaping the worktree or
-   integration machinery is razed and carried; a run of consecutive such aborts
-   clean-ends the run rather than looping forever.
+   back off (about once an hour, injectable), then re-enter. A planner PLAN
+   rate-limit re-issues the boundary call; a mid-epoch worker rate-limit OR a
+   close-out rate-limit razes the in-flight epoch's throwaway worktrees and staging
+   and **restarts the epoch whole** (partial state is never trusted).
+2. **Cannot continue** (any other epoch failure): the close-out planner records the
+   outcome in the baton, which the PLAN call reads next boundary to steer around, or
+   the planner ends cleanly by writing a summary (the resume seed). The `max_epochs`
+   backstop is the **involuntary** trigger of the same clean end, so a planner that
+   spins without progress is always bounded. An unexpected error escaping the
+   worktree or integration machinery razes and **restarts the same epoch** (an
+   aborted epoch has no baton, so it is never completed); a run of consecutive such
+   aborts on the same epoch clean-ends the run rather than looping forever.
 
 There is no infra-repair node, no session-limited node, no worker-timeout node, and
 no tier-escalation state machine. A hung worker is just a task failure that routes
@@ -283,10 +337,11 @@ guarded so nothing resolves outside it:
 .grindstone/runs/<run-id>/
   events.ndjson        append-only journal, the durable source of truth
   journal.md           human-facing markdown post-mortem (derived; latest run only)
-  P1/E1/T1/handoff.md  the keyed log: relocated free-form handoffs, verdicts, artifacts
+  E1/T1/handoff.md     the keyed log: relocated free-form handoffs, verdicts, artifacts
+  E1/baton.md          the planner's close-out baton for that epoch (free-form, never parsed)
   artifacts/           scratch CWDs for non-write tasks
   logs/                per-worker / per-critic raw stdout (ephemeral, reaped each epoch)
-  _planner_tip/        the orchestrator-managed planner read/write tip checkout
+  _planner_tip/        the orchestrator-managed planner read/write + close-out checkout
 ```
 
 The model-written executor worktrees (task attempts, staging) and the
@@ -308,21 +363,25 @@ are kept forever.
 ## The journal and resume
 
 The **journal** (`grindstone/events.py`, `grindstone/journal.py`) is the backbone:
-a frozen vocabulary of Pydantic events (`run_started`, `epoch_started`,
-`task_dispatched`, `handoff_accepted`, `handoff_rejected`, `verdict`,
-`epoch_carried`, `epoch_completed`, `run_completed`, `run_ended`, `rate_limited`,
-`run_resumed`) written one per line, fsynced, with strictly monotonic `seq`. The
-event stream alone is sufficient to render the whole run -> epoch -> task tree;
-`journal.md` is a derived view that carries no trust and is never read back into the
-loop.
+a frozen vocabulary of Pydantic events (`run_started`, `run_resumed`,
+`run_completed`, `run_ended`, `epoch_started`, `epoch_completed`, `task_dispatched`,
+`task_done`, `work_gate_passed`, `work_gate_rejected`, `verdict`, `rate_limited`)
+written one per line, fsynced, with strictly monotonic `seq`. There is no
+failure-carry event: an `epoch_completed` now implies "baton written" (close-out
+runs immediately before it), and a failure's nuance lives in that epoch's baton, not
+the event stream. The event stream alone is sufficient to render the whole run ->
+epoch -> task tree; `journal.md` is a derived view that carries no trust and is never
+read back into the loop.
 
 **Resume is the universal crash-only recovery primitive.** Because the run branch
-only fast-forwards on completion, the git tip needs no rewind. On resume from a
+only fast-forwards on epoch finalize, the git tip needs no rewind. On resume from a
 non-ended epoch, programmatically (with no planner in the cleanup): remove the
 run's worktrees and transient `grind-wip/` branches, reap the incomplete epoch's
-partial keyed log and raw logs, **preserve** the completed-epoch keyed log and the
-append-only journal (appending a "razed incomplete epoch" marker, never
-truncating), reconstruct the carried context from the journal, and re-enter the
-loop at the planner prompt from the last clean boundary. Every interruption (kill,
+partial keyed log and raw logs (including any never-finalized `E<n>/baton.md`, since
+only a completed epoch persists a baton), **preserve** the completed-epoch keyed log
+(its baton included) and the append-only journal (appending a "razed incomplete
+epoch" marker, never truncating), and re-enter the loop at the planner prompt from
+the last clean boundary. No failure context need be reconstructed: the next PLAN
+re-reads the prior completed epoch's baton from disk. Every interruption (kill,
 rate-limit, crash, any unhandled case) recovers the same way: resume = cleanup +
 re-plan, never a rewind.

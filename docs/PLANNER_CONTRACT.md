@@ -12,28 +12,36 @@ Where prose here and the model disagree, the model wins.
 
 ## 1. Call model
 
-The planner is a **stateless one-shot call** (`grindstone/planner.py`,
-`ScriptPlanner.decide`). There is no warm planner instance and no planner-held
-state: Grindstone reconstructs the full input fresh from durable disk state on
-every call, so model drift has nowhere to accumulate. The shipped default adapter
-(`models/claude/planner_request.sh`) drives Claude (Opus) via `claude -p`
-read-only; the role is swappable behind the script by a bundled `rig:` name (e.g.
-the all-Qwen `models/local/`) or the operator's gitignored `models/personal/`.
+The planner is a **stateless one-shot call** with two roles (`grindstone/planner.py`):
+**PLAN** (`ScriptPlanner.decide`, forward) proposes the next epoch, and **CLOSE-OUT**
+(`ScriptPlanner.close_out`, back) writes the epoch's baton. There is no warm planner
+instance and no planner-held state: Grindstone reconstructs the full input fresh from
+durable disk state on every call, so model drift has nowhere to accumulate. Its only
+memory across the run is the **baton** it writes at close-out and re-reads at the next
+PLAN. The shipped default adapter (`models/claude/planner_request.sh`) drives Claude
+(Opus) via `claude -p` read-only and serves both roles (switched by a `--purpose`
+flag); the role is swappable behind the script by a bundled `rig:` name (e.g. the
+all-Qwen `models/local/`) or the operator's gitignored `models/personal/`.
 
-Grindstone invokes the planner once at **every epoch boundary**, starting from the
-first. There are no phases and no skeleton step: the very first call already
-proposes a real epoch (or, for a trivial job, ends). The planner emits **exactly
-one decision per call**.
+Grindstone invokes PLAN once at **every epoch boundary**, starting from the first.
+There are no phases and no skeleton step: the very first call already proposes a real
+epoch (or, for a trivial job, ends). PLAN emits **exactly one decision per call**.
+After the epoch's tasks are gated and integrated onto a staging branch, CLOSE-OUT is
+invoked once to write the baton (Section 10).
 
-Each call rebuilds a bounded `PlannerContext` from disk and the planner returns one
-typed `Decision`. The two-node failure taxonomy governs what can go wrong:
+Each call rebuilds a bounded context from disk (`PlannerContext` for PLAN,
+`CloseoutContext` for close-out); PLAN returns one typed `Decision`, close-out returns
+the free-form baton markdown. The two-node failure taxonomy governs what can go wrong:
 
 - **`RateLimited`** (failure node 1): a rate-limit / quota refusal. The loop parks,
-  backs off (about once an hour), and re-issues the same boundary call. Nothing is
-  burned.
-- **`PlannerError`** (failure node 2): any other unrecoverable planner failure
-  (auth, transport, or a decision the planner could not make valid within its
-  budget). The loop ends the run cleanly (a resumable partial-end).
+  backs off (about once an hour), and re-enters. A PLAN rate-limit re-issues the same
+  boundary call; a close-out rate-limit razes the in-flight epoch (staging and wip)
+  and restarts the epoch whole. Nothing is burned.
+- **`PlannerError`** (failure node 2): any other unrecoverable PLAN failure (auth,
+  transport, or a decision the planner could not make valid within its budget). The
+  loop ends the run cleanly (a resumable partial-end). Close-out never hard-fails on
+  content (it reads whatever prose the rig produced, like the handoff); a transport
+  hard error there takes the epoch abort path (raze and restart).
 
 A decision that fails validation is treated as a retryable bad output and
 **re-asked up to twice** (`MAX_REASKS`; the failing reasons are appended to the
@@ -42,22 +50,21 @@ self-validate loop, below); an exhausted re-ask budget raises `PlannerError`.
 
 ## 2. Input construction
 
-Grindstone owns the input; it does **not** mirror the output format. Every call is
+Grindstone owns the input; it does **not** mirror the output format. The PLAN call is
 built as a byte-stable head plus a volatile tail so a backend prefix cache can reuse
-the head across a run (`build_planner_input` in `grindstone/planner.py`):
+the head across a run (`build_planner_input` in `grindstone/planner.py`); the
+close-out input (Section 10) mirrors the same head-plus-tail shape:
 
 ```
-[BYTE-STABLE CORE: byte-identical every call of every run]
-  PLANNER_CORE             role identity + output discipline + the cross-cutting
+[BYTE-STABLE HEAD: byte-identical every call of every run]
+  PLAN_PREAMBLE            role identity + output discipline + the cross-cutting
                            rules true for every decision (fixed per Grindstone version)
 [VOLATILE TAIL]
   job spec                 the full job text
   state                    the epoch index + its max-epochs backstop, and the
                            keyed-log index (the log keys a task may name as inputs)
-  integration tip          a bounded listing of the tracked files at the current tip
-                           (capped at TIP_FILES_CAP; the planner greps for the rest)
-  carried failures         the prior epoch's UNRESOLVED outcomes (a critic escalate,
-                           an ownership conflict, a setup failure) to steer around or end on
+  baton                    the prior completed epoch's baton.md text (the planner's
+                           living plan: its memory; empty on the first epoch)
   domain skills            the target repo's <repo>/.grindstone/skills catalogue index
                            (name -> one-line description; empty when the repo ships none)
   tools note               the workdir is a checkout of the tip; grep + read it to ground
@@ -65,18 +72,22 @@ the head across a run (`build_planner_input` in `grindstone/planner.py`):
   decision request
 ```
 
-**References, not payloads.** The tail carries *names* and *log keys*, never inlined
-file bodies. The planner names an artifact by its log key in a task's `inputs`;
-Grindstone resolves keys to file bodies only when building the *worker's* input. The
-listed `inputs` must already exist in the keyed-log index; an invented key is
-rejected.
+There is **no file-name dump**: the planner greps its own workdir checkout of the
+tip for the tree. Its only carried state is the baton, which it reconciles against
+that actual tree (the tree is ground truth, the baton is intent).
+
+**References, not payloads.** The tail carries *names* and *log keys* (and the baton
+text the planner itself wrote), never inlined file bodies. The planner names an
+artifact by its log key in a task's `inputs`; Grindstone resolves keys to file bodies
+only when building the *worker's* input. The listed `inputs` must already exist in the
+keyed-log index; an invented key is rejected.
 
 ## 3. The decision wire contract
 
 A decision is a single JSON object discriminated on `kind`, one of two shapes:
 
 ```
-EPOCH: {"kind":"epoch","epoch":{"title":..,"rationale":..,"tasks":[ ... ],"setup":[ ... ]}}
+EPOCH: {"kind":"epoch","epoch":{"title":..,"tasks":[ ... ],"setup":[ ... ]}}
 END:   {"kind":"end","summary":".."}
 ```
 
@@ -86,12 +97,13 @@ the job is met, then emits **END**. A fresh run often leans research-first to
 understand the job, but that is not forced; a small job may be a single epoch.
 
 - **EPOCH** proposes the single next epoch as **1 to 8 independent tasks** that fan
-  out in parallel (`title`, an optional `rationale`, the `tasks`, and an optional
-  `setup` list).
+  out in parallel (`title`, the `tasks`, and an optional `setup` list). There is no
+  `rationale` field: the planner's reasoning lives in the baton it carries across
+  epochs, not in the decision.
 - **END** stops the run. `summary` is the pending-summary / resume seed: either what
   was accomplished (a satisfied done) or, when the planner cannot make progress, a
   handoff that lets the work continue as the next appendable run. END is also how
-  the planner disposes of an unresolvable carried failure.
+  the planner stops on a failure it judges unresolvable (the baton records why).
 
 The planner **does not author verify or test commands as a gate**: it writes no
 `done_when` and no check commands. An independent agentic critic re-derives each
@@ -115,8 +127,8 @@ infra-repair subsystem.
 Each task in an epoch is independent and fans out concurrently; tasks **must not
 consume each other's outputs** (anything sequential belongs in a later epoch).
 1 to 8 tasks per epoch, ids `T1`..`T8`; the fully-qualified log-key prefix is
-`<phase>/<epoch>/<task>` (the keyed log keeps a single fixed phase prefix, since the
-system is epochs-only).
+`<epoch>/<task>` (e.g. `E3/T2`), with no phase prefix, since the system is
+epochs-only.
 
 Every task carries:
 
@@ -182,15 +194,17 @@ planner call, bounded by `max_epochs`.
 1. Every implement task gets a worktree branched from the **epoch base** (the run
    branch tip at epoch dispatch).
 2. `file_ownership` sets are **pairwise disjoint within the epoch**. An overlap in
-   the realized git diff is detected at integration and surfaced to the planner as a
-   carried failure (the planner mis-scoped); the run branch is left untouched.
+   the realized git diff is detected at integration and recorded by close-out in the
+   baton (the planner mis-scoped); the run branch is left untouched.
 3. On task return, a deterministic scope check: every committed path must fall
    inside the task's `file_ownership`. An out-of-scope write or a zero-diff commit is
    a failed attempt; workers never negotiate scope.
-4. Integration is fast-forward merges in task-id order onto a staging branch, then a
-   fast-forward of the durable run branch `grind/<run-id>`. Given (2) and (3) the
-   merges commute; a conflict is treated as a structural error that aborts
-   integration (carried to the planner), never papered over.
+4. Integration is fast-forward merges in task-id order onto a **staging branch**
+   (`_integrate_to_staging`); the durable run branch `grind/<run-id>` is
+   fast-forwarded to that staging tip later, in `_finalize_epoch`, after close-out has
+   read the staging tree. Given (2) and (3) the merges commute; a conflict is treated
+   as a structural error that aborts integration (close-out records it in the baton),
+   never papered over.
 5. Grindstone (never the model) commits each successful task.
 
 ## 7. The critic and the worker handoff
@@ -198,19 +212,23 @@ planner call, bounded by `max_epochs`.
 There is no Python-parsed handoff contract. The worker writes a **free-form**
 `handoff.md` report in its CWD (plain prose: what it did, what is done, what is
 blocked, which files it touched, grounding as prose). Grindstone relocates it
-verbatim to the keyed log for the critic and the planner's optional context; it is
+verbatim to the keyed log for the critic and the close-out planner to read; it is
 **never parsed or schema-validated**, and stdout is never parsed. The deterministic
 gate is the committed diff or the produced artifact, not this file.
 
 A gate-clean attempt always runs the tier-matched **critic** (an independent agentic
 pass). It emits a lenient `Verdict` (`schemas/verdict.json`): an `outcome` of
 **PASS** (merge; notes carry forward), **RETRY** (a defect the same worker can fix;
-the bounded same-tier retry), or **ESCALATE** (anything the worker cannot fix, which
-routes to the planner as a carried failure). An environmental blocker the worker
-reports in `handoff.md` becomes a critic ESCALATE; there is no separate Python
-BLOCKED gate. A research / review critic also verifies the artifact's citations
-resolve to real files. A missing or invalid verdict is a fail-safe escalate, never a
-silent pass.
+the bounded same-tier retry), or **ESCALATE** (anything the worker cannot fix; the
+task's work is discarded and the outcome surfaces to the close-out planner, which
+reads the verdict and records what really happened in the baton). An environmental
+blocker the worker reports in `handoff.md` becomes a critic ESCALATE; there is no
+separate Python BLOCKED gate. A research / review critic also verifies the artifact's
+citations resolve to real files. A missing or invalid verdict is a fail-safe escalate,
+never a silent pass.
+
+The gate events in the journal are `work_gate_passed` / `work_gate_rejected` (the
+deterministic gate), followed by the `verdict` (the critic's triage).
 
 ## 8. Failure flow
 
@@ -218,24 +236,25 @@ silent pass.
 failed deterministic gate (zero-diff / out-of-scope / missing artifact)
                               -> a failed attempt: bounded same-tier retry (MAX_ATTEMPTS), then escalate
 critic RETRY                  -> bounded same-tier retry, inheriting the prior attempt's wip
-critic ESCALATE               -> the task escalates; its reason is CARRIED to the planner next boundary
-retries exhausted             -> the task escalates (carried)
-ownership overlap / merge conflict -> integration aborts; carried to the planner (run branch untouched)
-setup command failed          -> carried to the planner; the epoch is skipped
-planner RATE-LIMITED          -> failure node 1: park, back off ~1/hr, re-issue the boundary
-worker RATE-LIMITED           -> failure node 1: raze the in-flight epoch, restart it whole after the backoff
+critic ESCALATE               -> the task's work is discarded; close-out reads the outcome and records it in the baton
+retries exhausted             -> the task escalates (same path as ESCALATE)
+ownership overlap / merge conflict -> integration aborts (run branch untouched); close-out records it in the baton
+setup command failed          -> grind skipped; the epoch still completes with a baton noting the error, then advances
+PLAN RATE-LIMITED             -> failure node 1: park, back off ~1/hr, re-issue the boundary
+worker / close-out RATE-LIMITED -> failure node 1: raze the in-flight epoch (staging + wip), restart it whole after the backoff
+unexpected epoch-body error   -> raze + restart the SAME epoch (an aborted epoch has no baton); K consecutive aborts clean-end the run
 max_epochs reached            -> failure node 2: an involuntary clean partial-end (resumable)
 ```
 
 There is **no tier escalation**, no infra-repair node, and no separate
-failed-epoch state machine. Every non-rate-limit failure is **carried** as context
-the planner reads at the next boundary and either steers around (re-plan) or ends on
-(a clean partial-end). The `max_epochs` backstop guarantees a planner that spins
-without progress is bounded.
+failed-epoch state machine. Every non-rate-limit failure is read by the close-out
+planner and written into the baton, which the next PLAN call reads and either steers
+around (re-plan) or ends on (a clean partial-end). The `max_epochs` backstop
+guarantees a planner that spins without progress is bounded.
 
-## 9. The self-validate-on-disk loop and read priority
+## 9. The self-validate-on-disk loop and read priority (PLAN)
 
-The planner grounds itself the same way a worker does. It runs inside a throwaway
+The PLAN call grounds itself the same way a worker does. It runs inside a throwaway
 checkout of the current integration tip (its `_planner_tip` workdir, refreshed only
 when the tip moves). It may grep and read that workdir to ground its plan, then it
 writes its decision to `./decision.json`, runs `python3 check_decision.py
@@ -251,3 +270,48 @@ channel falls through to the next. Whatever is read is extracted to JSON and par
 through the same `parse_decision` the validator uses; an unparseable or invalid
 result is re-asked (Section 1), and an exhausted budget is a `PlannerError`. The
 planner never returns an unvalidated decision.
+
+## 10. Close-out and the baton
+
+At the **end** of every epoch, after the passing tasks are merged onto a staging
+branch but **before** the durable run-branch fast-forward, the loop invokes the
+planner's **CLOSE-OUT** role (`ScriptPlanner.close_out`, `build_closeout_input`). It
+hands a `CloseoutContext` and asks for one thing: the updated **baton**.
+
+The close-out input mirrors the PLAN head-plus-tail shape: a byte-stable
+`CLOSEOUT_PREAMBLE` (which carries the four-section baton skeleton) then the volatile
+tail of the job, the **prior baton**, the **epoch report**, the domain-skill index,
+and the request to write `./baton.md`. The epoch report lists, per task: its id, mode,
+the deterministic outcome (`passed` / `escalated`), and the keyed-log paths of the
+worker handoff and the critic verdict to **read**, plus the verbatim reason; then any
+`setup_error` and `integration_conflict`. These are pure **references**: Python
+characterizes nothing. The close-out planner's CWD is a throwaway checkout of the
+epoch's **staging tree** (the work that merged); it greps that tree, opens the named
+handoffs and verdicts, and judges what really happened, writing the
+partial-progress / no-progress / regression nuance itself.
+
+The **baton** is a **free-form** markdown living plan with four sections the prompt
+enforces (Project summary / Tasks done / Tasks pending / Current status). Python
+persists it **verbatim and never parses it** (the same status as the handoff), at
+`E<n>/baton.md` in the keyed log. There is **no self-validate loop and no JSON
+parse**: close-out reads its result back by priority `baton.md` > `--out` > stdout
+and returns whatever prose the rig produced (it never `PlannerError`s on content; a
+`RateLimited` razes and restarts the epoch, and a transport hard error takes the
+epoch abort path). Writing the baton marks the epoch DONE; the next epoch's PLAN call
+re-reads it as the planner's memory.
+
+Because close-out reads the staging tree and runs before the fast-forward, the single
+durable commit point (the fast-forward + the baton write + `epoch_completed`) already
+includes the baton: there is no "integrated-but-not-summarized" limbo, and a
+completed epoch always has a baton.
+
+### Vision is first-class
+
+The PLAN call, the close-out call, the worker, and the critic all **see**. Images
+(screenshots, mockups, rendered UI, diagrams) ride the **same file contract** as text:
+an agent views an image file with its Read tool, with no separate machinery and no
+schema. An image artifact a task produces is a first-class log key, and an image input
+is named by its log key like any other input. The prompts tell every agent it can see
+and should view rather than describe. Generating the visual proof (rendering a screen,
+capturing a screenshot) is the **target repo's** job, declared in a task's goal;
+Grindstone's job is only to make the pipeline able to see it.
