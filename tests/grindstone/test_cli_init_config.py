@@ -277,9 +277,23 @@ def test_resolve_ladder_no_config_fails_loudly(tmp_path: Path) -> None:
 
 
 def test_resolve_concurrency_is_local_slots(tmp_path: Path) -> None:
+    # Worker-only ladder: no senior tier to add, so the pool = worker.slots.
     _write_cfg(tmp_path, _LOCAL_ONLY)
     cfg = load_config(tmp_path)
-    assert _resolve_concurrency(_flags(), cfg) == 3  # = roles.worker.slots
+    assert _resolve_concurrency(_flags(), cfg) == 3  # = roles.worker.slots (no senior)
+
+
+def test_resolve_concurrency_sums_worker_and_senior_slots(tmp_path: Path) -> None:
+    # The fan-out pool must be wide enough that the per-tier ScriptWorker
+    # semaphores are the real bound, not the pool: total = worker.slots +
+    # senior.slots, so a serial-local worker tier (slots=1) and the Claude senior
+    # tier still overlap instead of the pool serializing them.
+    main(["init", "--repo", str(tmp_path)])
+    cfg = load_config(tmp_path)
+    assert cfg is not None and cfg.roles.senior is not None
+    expected = cfg.roles.worker.slots + cfg.roles.senior.slots
+    assert _resolve_concurrency(_flags(), cfg) == expected
+    assert expected > cfg.roles.worker.slots  # genuinely wider than worker alone
 
 
 def test_resolve_concurrency_no_config_fails_loudly() -> None:

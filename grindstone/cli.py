@@ -265,15 +265,24 @@ def _resolve_ladder(
 def _resolve_concurrency(
     args: argparse.Namespace, cfg: GrindstoneConfig | None
 ) -> int | None:
-    """Fan-out cap = the ``worker`` role's slot count (one in-flight task / slot).
+    """Epoch fan-out pool = the SUM of the execution tiers' slots.
 
-    No config fails loudly toward ``grindstone init`` (run/resume already exit
-    in ``_resolve_ladder`` first, but the bound is meaningless without config).
+    The pool (``ThreadPoolExecutor`` max_workers) must never be the binding limit
+    on cross-tier overlap: each tier's ``ScriptWorker`` already self-limits to its
+    own ``slots`` via a semaphore, so sizing the pool to ``worker.slots`` alone
+    would serialize a worker + a senior whenever ``worker.slots`` is small (e.g. 1
+    for a single-slot local server). Summing worker + senior slots makes the
+    per-tier semaphores the real bound: the local tier stays serial at
+    ``worker.slots=1`` while a local worker and a Claude senior still run
+    concurrently. No config fails loudly toward ``grindstone init``.
     """
 
     if cfg is None:
         raise _no_config_exit()
-    return cfg.roles.worker.slots
+    total = cfg.roles.worker.slots
+    if cfg.roles.senior is not None:
+        total += cfg.roles.senior.slots
+    return total
 
 
 def _resolve_max_planner_calls(cfg: GrindstoneConfig | None) -> int:
