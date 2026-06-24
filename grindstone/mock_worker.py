@@ -15,6 +15,7 @@ import random
 from dataclasses import dataclass, field
 
 from grindstone.worker import (
+    CRITIC_VERDICT_FILENAME,
     REVIEW_FILENAME,
     RateLimited,
     TransportError,
@@ -27,18 +28,27 @@ from grindstone.worker import (
 #: never emits it (a real park would make the termination-fuzz test sleep).
 BEHAVIORS: tuple[str, ...] = ("ok", "rate_limit", "bad_json", "empty", "timeout")
 
+#: The critic-dispatch vocabulary (consumed when a run carries a ``CriticBrief``):
+#: the lenient triage outcome the mock writes to ``verdict.json``, plus ``no_verdict``
+#: (writes nothing, modelling a critic that produced no parseable verdict).
+CRITIC_OUTCOMES: tuple[str, ...] = ("PASS", "RETRY", "ESCALATE", "no_verdict")
 
-def _valid_handoff(request: WorkerRequest, cited: list[str]) -> dict[str, object]:
-    """A schema- and semantic-valid DONE handoff for the dispatched task."""
+
+def _valid_handoff(
+    request: WorkerRequest, cited: list[str], *, status: str = "DONE"
+) -> dict[str, object]:
+    """A schema- and semantic-valid handoff for the dispatched task."""
 
     return {
         "schema_version": "1",
         "task_id": request.task_id,
-        "status": "DONE",
+        "status": status,
         "what_changed": [{"kind": "file", "ref": f} for f in cited],
-        "resulting_state": "toy work complete",
+        "resulting_state": "toy work complete"
+        if status == "DONE"
+        else "toy worker reported a blocker",
         "downstream_needs": [],
-        "not_done": [],
+        "not_done": [] if status == "DONE" else ["a host dependency the worker may not install"],
         "citations": [{"file": f} for f in cited],
         "checks": [{"check": "self-check", "exit_code": 0}],
         "occupancy": {"compacted": False, "subagent_splits": 0},
@@ -64,6 +74,10 @@ class MockWorker:
             raise AssertionError("mock worker script exhausted")
         behavior = self.script[self._calls]
         self._calls += 1
+        if request.critic is not None:
+            self._critic(request, behavior)
+            return
+
         handoff = request.scratch / "handoff.json"
 
         if behavior in ("rate_limit", "session_limit"):
@@ -78,24 +92,42 @@ class MockWorker:
             # worker. No real sleep, the kill is modelled as a raise.
             handoff.write_text('{"schema_version": "1"', encoding="utf-8")
             raise TransportError("mock hang killed")
-        if behavior == "ok":
-            cited: list[str] = []
-            for rel, content in self.artifacts.items():
-                path = request.scratch / rel
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(content, encoding="utf-8")
-                cited.append(rel)
-            if request.mode == "implement":
-                # A compliant implement worker satisfies the review gate the loop
-                # appends (a non-empty review.md in the attempt CWD).
+        if behavior in ("ok", "blocked"):
+            cited = self._write_artifacts(request)
+            if request.mode == "implement" and behavior == "ok":
+                # A compliant implement worker self-reviews before handing off.
                 (request.scratch / REVIEW_FILENAME).write_text(
                     "mock review: no findings\n", encoding="utf-8"
                 )
+            status = "DONE" if behavior == "ok" else "BLOCKED"
             handoff.write_text(
-                json.dumps(_valid_handoff(request, cited)), encoding="utf-8"
+                json.dumps(_valid_handoff(request, cited, status=status)),
+                encoding="utf-8",
             )
             return
         raise ValueError(f"unknown mock behavior: {behavior!r}")
+
+    def _write_artifacts(self, request: WorkerRequest) -> list[str]:
+        cited: list[str] = []
+        for rel, content in self.artifacts.items():
+            path = request.scratch / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+            cited.append(rel)
+        return cited
+
+    def _critic(self, request: WorkerRequest, outcome: str) -> None:
+        """Write the scripted critic ``verdict.json`` (or, for ``no_verdict``,
+        nothing, modelling a critic that produced no parseable verdict)."""
+
+        if outcome == "no_verdict":
+            return
+        if outcome not in CRITIC_OUTCOMES:
+            raise ValueError(f"unknown mock critic outcome: {outcome!r}")
+        (request.scratch / CRITIC_VERDICT_FILENAME).write_text(
+            json.dumps({"outcome": outcome, "reason": f"mock critic {outcome}"}),
+            encoding="utf-8",
+        )
 
 
 def fuzz_script(seed: int, length: int) -> list[str]:
