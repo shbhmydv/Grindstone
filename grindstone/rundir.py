@@ -7,12 +7,18 @@ run dir, and the atomic JSON write used for ``state.json``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+#: Default external base for throwaway git worktrees. ``/tmp`` here is disk-backed
+#: ext4 (not tmpfs), so a multi-GB checkout is safe. Operators relocate via the
+#: ``GRINDSTONE_WORKTREE_BASE`` env override; tests redirect it into their tmp dir.
+_DEFAULT_WORKTREE_BASE = "/tmp/cache/grindstone"
 
 #: Log-key grammar, mirrored from schemas/epoch_decision.json $defs/log_key.
 _LOG_KEY_RE = re.compile(r"^[A-Za-z0-9][a-zA-Z0-9._/-]{0,127}$")
@@ -59,6 +65,32 @@ class RunDir:
         return self.root / "events.ndjson"
 
     @property
+    def worktrees_root(self) -> Path:
+        """External base for this run's throwaway git worktrees, OUTSIDE the repo.
+
+        A worktree nested under the target repo lets a worker that strips its CWD
+        back to the repo root write into the MAIN checkout instead of its isolated
+        worktree (run 124321Z RCA: a local model wrote ``src/`` into the live repo,
+        so its worktree-relative ``done_when`` could never pass). Hosting the
+        worktrees on an external base removes the nesting, so the path can no longer
+        be stripped to the repo. The model-WRITTEN executor worktrees (task attempts,
+        infra-repair, polish) plus the orchestrator scratch + staging trees move out;
+        durable run STATE (events, state, handoffs, artifacts, keyed log) stays under
+        ``root``, as does the one planner-READ tip (``_planner_tip``), which a
+        sandboxed planner rig must reach inside the repo.
+
+        Layout ``<base>/<repo-id>/<run-id>/worktrees`` keeps two repos that share a
+        run-id from colliding (``repo-id`` folds the resolved repo path into a short
+        hash). The base defaults to ``/tmp/cache/grindstone`` and honors the
+        ``GRINDSTONE_WORKTREE_BASE`` override (operator relocation; test isolation).
+        """
+
+        repo = self.root.parent.parent.parent
+        base = Path(os.environ.get("GRINDSTONE_WORKTREE_BASE", _DEFAULT_WORKTREE_BASE))
+        repo_id = f"{repo.name}-{hashlib.sha1(str(repo.resolve()).encode()).hexdigest()[:8]}"
+        return base / repo_id / self.root.name / "worktrees"
+
+    @property
     def journal_path(self) -> Path:
         """Human-facing markdown post-mortem, rendered from ``events.ndjson`` at
         terminal. Kept only for the LATEST run (reaped when the next run starts);
@@ -71,8 +103,10 @@ class RunDir:
 
         The log keys a planner may reference as task ``inputs``: every regular
         file under a phase dir (``P<n>/...``, handoffs, outcomes, relocated
-        artifacts). Excludes ``state.json`` / ``events.ndjson`` / worktrees /
-        artifact scratch, none of which are durable references.
+        artifacts). Excludes ``state.json`` / ``events.ndjson`` / artifact
+        scratch, none of which are durable references (the throwaway git
+        worktrees live on an external base outside the run dir entirely; see
+        ``worktrees_root``).
         """
 
         out: list[str] = []

@@ -417,7 +417,7 @@ def _integrate(
     merged: list[str] = list(store.state.integration.merged)
 
     if done_in_order:
-        int_wt = run_dir.root / "worktrees" / "_staging"
+        int_wt = run_dir.worktrees_root / "_staging"
         wt.add_worktree_on(repo, int_wt, branch=branch)
         for outcome in done_in_order:
             tid = outcome.identity.task_id
@@ -464,7 +464,7 @@ def _integrate(
     # Prune the epoch's worktrees, THEN move/delete branches: git refuses to delete or
     # reuse a branch still checked out in a worktree (ruling 7). The run branch is a
     # leaf ref never checked out in an epoch worktree, so the fast-forward is safe.
-    wt.prune_tree(repo, run_dir.root / "worktrees")
+    wt.prune_tree(repo, run_dir.worktrees_root)
     wt.fast_forward_branch(repo, run_branch, staging_tip)
     # "Once things pass, they clean up and fall down": delete the now-absorbed
     # transient branches (the staging branch + every merged task attempt branch). The

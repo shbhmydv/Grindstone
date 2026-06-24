@@ -499,6 +499,21 @@ class FailingWorker:
 # --- fixtures ------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _isolate_worktree_base(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Redirect the external git-worktree base into the test's own tmp dir.
+
+    Production hosts throwaway worktrees under ``/tmp/cache/grindstone`` (outside any
+    target repo, so a worker cannot strip its CWD to the repo root). Tests must not
+    collide on that shared dir nor leave debris there, so each test points
+    ``GRINDSTONE_WORKTREE_BASE`` at its own ``tmp_path`` (pytest reaps it). The base
+    is a SIBLING of the ``tmp_path/repo`` checkout the fixtures build, never nested,
+    preserving the very out-of-repo property the relocation guarantees.
+    """
+
+    monkeypatch.setenv("GRINDSTONE_WORKTREE_BASE", str(tmp_path / "wt-base"))
+
+
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     return init_git_repo(tmp_path / "repo")

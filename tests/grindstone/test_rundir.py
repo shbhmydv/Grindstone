@@ -22,6 +22,39 @@ def test_create_run_dir_paths_and_collision(tmp_path: Path) -> None:
         create_run_dir(tmp_path, "run-1")
 
 
+def test_worktrees_root_is_external_and_collision_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The throwaway git worktrees must live OUTSIDE the target repo: a nested
+    # worktree lets a worker strip its CWD back to the repo root and write there
+    # (the run 124321Z RCA). So the base is external, keyed by repo-id + run-id.
+    base = tmp_path / "wt-base"
+    monkeypatch.setenv("GRINDSTONE_WORKTREE_BASE", str(base))
+    run = create_run_dir(tmp_path / "repo", "run-1")
+    wt_root = run.worktrees_root
+    # Not under the run dir, and not under the repo at all.
+    assert run.root.resolve() not in wt_root.resolve().parents
+    repo_root = (tmp_path / "repo").resolve()
+    assert repo_root not in wt_root.resolve().parents
+    # Sits under the configured base, ends in the run-id + worktrees leaf.
+    assert base.resolve() in wt_root.resolve().parents
+    assert wt_root.name == "worktrees"
+    assert wt_root.parent.name == "run-1"
+
+    # A second repo with the SAME run-id never collides (repo-id segment differs).
+    other = create_run_dir(tmp_path / "repo2", "run-1")
+    assert other.worktrees_root != wt_root
+
+
+def test_worktrees_root_default_base_when_env_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("GRINDSTONE_WORKTREE_BASE", raising=False)
+    run = create_run_dir(tmp_path / "repo", "run-1")
+    assert str(run.worktrees_root).startswith("/tmp/cache/grindstone/")
+    assert run.worktrees_root.name == "worktrees"
+
+
 def test_resolve_accepts_valid_log_key(tmp_path: Path) -> None:
     run = create_run_dir(tmp_path, "run-1")
     resolved = run.resolve("p2/e3/t1/handoff.json")

@@ -698,10 +698,10 @@ def _scratch_for(
     fallback, behavior)."""
 
     if implement:
-        return run_dir.root / "worktrees" / identity.task_id / f"attempt-{attempt}"
+        return run_dir.worktrees_root / identity.task_id / f"attempt-{attempt}"
     if read_tip:
         return (
-            run_dir.root / "worktrees" / _REVIEW_TIP_WORKTREE / identity.fq / f"attempt-{attempt}"
+            run_dir.worktrees_root / _REVIEW_TIP_WORKTREE / identity.fq / f"attempt-{attempt}"
         )
     return run_dir.artifacts_dir(f"{identity.fq}/attempt-{attempt}")
 

@@ -430,7 +430,7 @@ def _evaluate_checks_detailed(
     worktree: Path | None = None
     worktree_error: str | None = None
     if needs_worktree and repo is not None:
-        worktree = run_dir.root / "worktrees" / scratch_name
+        worktree = run_dir.worktrees_root / scratch_name
         try:
             wt.add_worktree_detached(repo, worktree, ref=ref or "HEAD")
         except wt.GitError:
@@ -895,6 +895,11 @@ def _build_workspace(store: _RunStateStore, run_dir: RunDir, repo: Path | None) 
     # fresh repo with no commit) raises GitError and leaves the planner on its
     # read-only fallback; the keyed-log manifest still surfaces either way.
     ref = store.state.last_integration_branch or "HEAD"
+    # The planner-read tip stays INSIDE the run dir (not the external worktrees_root):
+    # the planner rigs are sandboxed to the repo (codex `-C repo` read-only, claude
+    # cwd=repo), so a tip checkout on the external /tmp base would be unreadable to
+    # them. Only the model-WRITTEN executor worktrees move out (the leak fix); this
+    # orchestrator-managed read tree is never model-written, so nesting is safe here.
     candidate = run_dir.root / "worktrees" / _PLANNER_TIP_WORKTREE
     try:
         wt.add_worktree_detached(repo, candidate, ref=ref)
@@ -1677,7 +1682,7 @@ def _run_one_infra_repair(
 
     tip = store.state.last_integration_branch or "HEAD"
     base_commit = wt.resolve_commit(repo, tip)
-    worktree = run_dir.root / "worktrees" / f"_infra_repair_{attempt}"
+    worktree = run_dir.worktrees_root / f"_infra_repair_{attempt}"
     # TRANSIENT repair branch under ``grind-wip/``, never ``grind/{run_id}/...``: the
     # persistent run branch ``grind/{run_id}`` is a leaf ref, and a child under it
     # would dir/file-conflict in git's ref store. On a sticking repair the run branch
@@ -1955,7 +1960,7 @@ def _run_final_polish(
     """
 
     base_commit = wt.resolve_commit(repo, branch)  # pre-polish tip (for the diff)
-    worktree = run_dir.root / "worktrees" / "_polish"
+    worktree = run_dir.worktrees_root / "_polish"
     wt.add_worktree_detached(repo, worktree, ref=branch)
     # Restore declared deps so codex can run build commands while polishing (and so
     # they are present for the evidence re-check below). A prepare failure here is
