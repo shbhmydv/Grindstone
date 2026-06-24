@@ -24,9 +24,12 @@ uses cheap local compute when the work is checkable. Nothing more.
    work, senior (Claude) for judgment and taste. The planner picks the tier.
 3. RIGHT SKILLS. Repo-owned domain-skill catalogue, selected per task. Retrieve,
    do not concatenate.
-4. VERIFIABLE CHECKPOINTS. Every step produces a checked artifact (the handoff
-   disk contract) gated by two deterministic invariants + an agentic review, so
-   the run can be trusted and left alone.
+4. VERIFIABLE CHECKPOINTS. Every step is gated by EXACTLY two deterministic
+   invariants (disjoint-ownership merge of the git diff, and one final
+   acceptance) plus an agentic review. The worker writes a FREE-FORM handoff
+   report that the critic reads; the state machine never parses or schema-gates
+   it. Deterministic facts (git, file existence) and one lenient verdict are the
+   only things Python disposes on, so the run can be trusted and left alone.
 5. PARALLEL FAN-OUT. Multiple workers per epoch on disjoint file ownership. The
    throughput win and the local-GPU leverage.
 
@@ -37,8 +40,9 @@ uses cheap local compute when the work is checkable. Nothing more.
             epoch (1..N tasks, each with disjoint file ownership) OR emits done
         if done: run final acceptance once; exit
         for each task (fan out, tier-routed, in its own worktree):
-            worker grinds -> writes handoff.json in its CWD
-            review (agentic critic, re-derives) -> pass | fail-with-gaps
+            worker grinds -> writes a free-form handoff.md report in its CWD
+            review (agentic critic reads the report + the diff/artifact,
+                re-derives, owns grounding + blocked judgment) -> lenient verdict
             on fail: retry same tier -> escalate tier -> abort after K
         integrate passing tasks: disjoint-merge check, then merge to run branch
         next epoch
@@ -47,9 +51,11 @@ No phases. No floors. No epoch budget. The planner self-steers to done.
 
 ## Bones to COPY (already minimal and correct; port near-verbatim)
 
-- Handoff disk contract: worker writes `handoff.json` in its CWD, orchestrator
-  relocates + re-validates the copy in the run dir, stdout is NEVER parsed.
-  (today: `grindstone/check_handoff.py`, the handoff half of contracts/models.py)
+- Handoff disk convention (NOT a schema gate): worker writes a free-form
+  `handoff.md` report in its CWD, the orchestrator relocates it to the keyed log
+  for the critic + the planner's optional context, stdout is NEVER parsed. The
+  report is read by the agentic critic, never parsed or validated by Python.
+  (the old `check_handoff.py` + the `Handoff` Pydantic model are DROPPED, see below)
 - `grindstone/worktree.py`: git worktree create + run branch + merge + the
   disjoint-ownership check. Keep the external-base location (rundir.worktrees_root
   lesson: worktrees outside the repo so a worker cannot strip CWD to the repo).
@@ -57,8 +63,10 @@ No phases. No floors. No epoch budget. The planner self-steers to done.
   contract, selected by per-role `rig:` config.
 - Skills: the domain-skill catalogue (`<repo>/.grindstone/skills/` + index.md)
   and the per-task selection function. NOT the operating-skill scenario split.
-- Pydantic models for the wire contracts (the decision the planner emits, the
-  handoff the worker writes). Lenient verdict (see DROP, below).
+- Pydantic models for the TWO wire contracts the state machine actually disposes
+  on: the decision the planner emits, and the lenient verdict the critic emits
+  (see DROP, below). The worker handoff is NOT a wire contract; it is a free-form
+  report for the critic.
 - The event log: append-only `events.ndjson` as the single source of truth;
   resume can be deferred but the log cannot.
 - The planner / worker request SHAPE (input on disk, self-validate, decision.json
@@ -81,6 +89,12 @@ No phases. No floors. No epoch budget. The planner self-steers to done.
   schema-invalid verdict.json (`extra_forbidden`) and the task was rejected for a
   MACHINERY fault, not a work fault. Senior/Claude passed the same schema; the
   brittleness is forcing a weak model into a strict structure.
+- The Python-parsed handoff CONTRACT (`check_handoff.py`, the `Handoff` Pydantic
+  model + its citation/task_id/size gate). SAME brittleness class as the verdict
+  schema above, and it contradicted "two deterministic invariants, everything
+  else agentic" by being a THIRD deterministic gate. The worker writes a
+  free-form `handoff.md` report; the critic reads it and owns grounding +
+  blocked judgment; Python disposes only on git facts + the lenient verdict.
 - Infra-repair subsystem (auto-dispatch repair epoch, `prepare:` materialization,
   host allowlist). REPLACE with: the PLANNER declares setup/install commands.
   Rationale below.
@@ -280,11 +294,13 @@ Prompt principles (keep it from becoming a crutch):
 3. Make "is this worker-fixable?" an explicit step so an unfixable blocker cannot
    masquerade as a retry.
 
-Worker self-report: a worker that hits a hard blocker writes BLOCKED (e.g. missing
-dep) in its handoff -> routes straight to the planner, SKIPPING the critic (no point
-critiquing env-blocked work). The critic is the backstop for a dishonest or mistaken
-DONE. Two honest entry points to the planner: worker-reported-blocked and
-critic-escalate.
+Worker self-report: a worker that hits a hard blocker says so (e.g. missing dep)
+in its free-form handoff report. The critic reads that report, and an
+unrecoverable environmental blocker becomes a critic ESCALATE -> the planner. No
+separate Python BLOCKED gate or critic-skip: collapsing blocked into the critic's
+ESCALATE keeps ONE judge of "is this done / blocked / retryable" and avoids
+trusting a self-declared status. The critic is also the backstop for a dishonest
+or mistaken DONE. One honest path to the planner: critic-escalate.
 
 Verdict FORMAT stays lenient: an outcome enum + a short reason. NOT the rigid
 multi-field schema the local model fumbled in run 051645Z.
