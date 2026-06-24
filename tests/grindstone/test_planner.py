@@ -88,8 +88,8 @@ def test_build_planner_input_renders_every_context_field(run_dir: RunDir) -> Non
     assert "T2 BLOCKED: missing dep foo" in prompt
     # the domain-skill catalogue INDEX to select from
     assert "rn-taste" in prompt and "tasteful RN component conventions" in prompt
-    # the repo-map + grep read-tools note
-    assert "repomap.py" in prompt
+    # the grep + read read-tools note (the planner pulls; nothing is pushed)
+    assert "GREP and READ it to ground your plan" in prompt
     # the re-ask feedback
     assert "epoch must declare at least one task" in prompt
 

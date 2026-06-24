@@ -72,8 +72,8 @@ reuse the head across a run (`build_planner_input` in `grindstone/planner.py`):
                             resulting_state + downstream_needs, each FAILED
                             task's last reason)
   workspace handles        (absolute read paths: the integration-tip checkout, the
-                            keyed-log root + manifest, the repo_map, the last
-                            verdict.json) for read-capable planning
+                            keyed-log root + manifest, the last verdict.json) for
+                            read-capable planning
   re-ask errors            (only when a prior decision was rejected)
   decision request
 ```

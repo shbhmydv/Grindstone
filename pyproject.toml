@@ -28,19 +28,6 @@ dependencies = [
     "pydantic>=2",
     "pyyaml>=6",
     "rich>=13",
-    # Repo-map (grindstone/repomap.py): tree-sitter parsing + token-budgeted
-    # rendering of a structural map of the TARGET repo. Required, but the map is
-    # built only above a file-count threshold and degrades to "no map" on any
-    # failure, so a future `[lean]` extras split can move these out untouched.
-    # (PageRank is hand-rolled, so no numpy/scipy/networkx stack is pulled in.)
-    # tree-sitter floor is 0.25.2: repomap.py uses the 0.25 Query/QueryCursor API,
-    # and tree-sitter-language-pack's bundled grammars are built for that ABI, so a
-    # lower floor risks an ABI mismatch where grammars fail to load and the map
-    # degrades to None. The language-pack pins tree-sitter>=0.25.2 itself.
-    "tree-sitter>=0.25.2",
-    "tree-sitter-language-pack>=1.0",
-    "tiktoken>=0.7",
-    "diskcache>=5",
 ]
 
 # The `grindstone` command. An editable install (`pip install -e .`) puts this on
@@ -58,13 +45,3 @@ build-backend = "setuptools.build_meta"
 # relative to the repo root (siblings of the grindstone package), so use
 # `pip install -e .` from a checkout rather than a copy install.
 packages = ["grindstone", "grindstone.contracts"]
-
-[tool.setuptools.package-data]
-# Vendored tree-sitter tag queries (data, not code) the repo-map loads at runtime.
-grindstone = ["_repomap_queries/*.scm", "_repomap_queries/*.md"]
-
-# diskcache ships no type stubs (tree-sitter, tree-sitter-language-pack and
-# tiktoken do); silence only the missing-import error, OUR code stays strict.
-[[tool.mypy.overrides]]
-module = ["diskcache.*"]
-ignore_missing_imports = true

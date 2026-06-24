@@ -212,10 +212,9 @@ def _domain_skills_block(index: dict[str, str]) -> str:
 _TOOLS_BLOCK = (
     "<tools>\n"
     "Your workdir is a checkout of the current integration tip. GREP and READ it to "
-    "ground your plan (what already exists, where things live). For a large or "
-    "unfamiliar area, the grindstone repo-map (grindstone/repomap.py) ranks the "
-    "most-referenced files and symbols. Reading is your own internal step; your turn "
-    "still ends with exactly one decision written to ./decision.json.\n"
+    "ground your plan (what already exists, where things live). Reading is your own "
+    "internal step; your turn still ends with exactly one decision written to "
+    "./decision.json.\n"
     "</tools>\n"
 )
 
