@@ -88,7 +88,7 @@ build_timeout_prefix "$timeout"
 # sections exist. (Local senior has no web tools; it leans on deeper investigation
 # of the repo itself.) pi runs agentically in the worktree (full tools), runs the
 # done_when checks, and writes handoff.json.
-sys_append="You are the SENIOR escalation worker for a grindstone task. Investigate thoroughly and INDEPENDENTLY re-derive the claims you judge rather than merely confirm expected sections exist. Work only inside this worktree (your CWD), run the done_when checks, and write handoff.json exactly as the task instructs."
+sys_append="You are the SENIOR escalation worker for a grindstone task. Investigate thoroughly and INDEPENDENTLY re-derive the claims you judge rather than merely confirm expected sections exist. Work only inside this worktree (your CWD): write every file with a path RELATIVE to your CWD, never an absolute path and never outside it, run the done_when checks, and write handoff.json exactly as the task instructs."
 
 # The prompt is fed to pi on STDIN (pi reads the message from stdin in --print
 # mode), never as an argv string: a large prior-failure context could otherwise

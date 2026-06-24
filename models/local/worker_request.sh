@@ -92,6 +92,14 @@ log_err="$log_dir/agent.stderr.log"
 # Honor --timeout as a backstop (grindstone also supervises wall-clock).
 build_timeout_prefix "$timeout"
 
+# The `worker` role is the on-rig grinder: build the task and verify it. A local
+# model needs the worktree-isolation contract stated at the SYSTEM level too (RCA:
+# an unframed local worker wrote files with ABSOLUTE paths into the real repo, so
+# nothing landed in the worktree the orchestrator gates and every build escalated
+# to the senior tier). The composed prompt carries the full motivated contract;
+# this is the system-level reinforcement its claude/senior siblings already had.
+sys_append="You are the LOCAL grinder for a grindstone task. Work only inside this worktree (your CWD): write every file with a path RELATIVE to your CWD, never an absolute path and never outside it. Make the change, run the done_when checks, and write handoff.json exactly as the task instructs."
+
 # The prompt is fed to pi on STDIN (pi reads the message from stdin in --print
 # mode), never as an argv string: a large prior-failure context could otherwise
 # exceed the kernel's MAX_ARG_STRLEN (~128KB) and the CLI dies before launching
@@ -104,6 +112,7 @@ set +e
   --mode json \
   --print \
   --no-session \
+  --append-system-prompt "$sys_append" \
   < "$prompt" > "$log_out" 2> "$log_err"
 rc=$?
 set -e
