@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from grindstone.events import (
+    EpochCarried,
     EpochCompleted,
     EpochStarted,
     Event,
@@ -116,6 +117,24 @@ def test_replay_resume_marker(tmp_path: Path) -> None:
     tree = replay(events)
     assert tree.status == "running"
     assert tree.epochs[0].status == "completed"
+
+
+def test_epoch_carried_roundtrips_and_replays(tmp_path: Path) -> None:
+    # FIX 5: a non-merged outcome is journaled so resume can repopulate the planner's
+    # carried context (and replay surfaces it on the epoch for the post-mortem).
+    path = tmp_path / "events.ndjson"
+    with JournalWriter(path) as jw:
+        jw.emit(lambda s: RunStarted(seq=s, ts="t0", run_id="r4", job_path="j"))
+        jw.emit(lambda s: EpochStarted(seq=s, ts="t1", epoch_id="P1/E1", title="x",
+                                       tasks=[TaskRef(id="T1", mode="implement")]))
+        jw.emit(lambda s: EpochCarried(seq=s, ts="t2", epoch_id="P1/E1",
+                                       reason="P1/E1/T1 escalated: missing dep"))
+        jw.emit(lambda s: EpochCompleted(seq=s, ts="t3", epoch_id="P1/E1"))
+    events = read_events(path)
+    carried = [e for e in events if isinstance(e, EpochCarried)]
+    assert len(carried) == 1 and "escalated" in carried[0].reason
+    tree = replay(events)
+    assert tree.epochs[0].carried == ["P1/E1/T1 escalated: missing dep"]
 
 
 def test_replay_rejects_event_before_run_started(tmp_path: Path) -> None:

@@ -64,6 +64,7 @@ from grindstone.contracts.models import (
 )
 from grindstone.events import (
     Event,
+    EpochCarried,
     EpochCompleted,
     EpochStarted,
     HandoffAccepted,
@@ -579,6 +580,23 @@ def _carry(results: list[TaskResult], integration: _Integration) -> tuple[str, .
     return tuple(out)
 
 
+def _journal_carried(
+    journal: JournalWriter, now_fn: NowFn, epoch_id: str, reasons: tuple[str, ...]
+) -> None:
+    """Journal each non-merged outcome (FIX 5): the in-memory carried tuple does not
+    survive a crash, so resume re-reads these to repopulate the planner's context."""
+
+    for reason in reasons:
+        # emit() invokes the factory synchronously (before the loop advances), so
+        # capturing ``reason`` directly is safe (no late-binding hazard) and keeps the
+        # factory a clean Callable[[int], Event].
+        journal.emit(
+            lambda s: EpochCarried(
+                seq=s, ts=now_fn(), epoch_id=epoch_id, reason=reason
+            )
+        )
+
+
 # --- log reaping + raze (the resume / restart cleanup) -------------------------
 
 
@@ -692,13 +710,17 @@ def _drive(
     now_fn: NowFn,
     journal: JournalWriter,
     start_index: int,
+    start_carried: tuple[str, ...] = (),
 ) -> RunResult:
     """The shared epoch loop (entered fresh by ``start_run`` and re-entered by
     ``resume_run``). Drives boundaries from ``start_index`` until the planner ends,
-    an unrecoverable planner failure forces a clean end, or ``max_epochs`` is hit."""
+    an unrecoverable planner failure forces a clean end, or ``max_epochs`` is hit.
+    ``start_carried`` seeds the first boundary's carried context (empty for a fresh
+    run; reconstructed from the journal on resume so the planner is not re-planned
+    blind to why the prior epoch failed)."""
 
     epoch_index = start_index
-    carried: tuple[str, ...] = ()
+    carried: tuple[str, ...] = start_carried
     consec_aborts = 0
     while epoch_index <= max_epochs:
         _reap_prior_logs(log_root, epoch_index)
@@ -734,7 +756,9 @@ def _drive(
                 list(epoch.setup), repo=repo, run_dir=run_dir, base=base,
             )
             if setup_err is not None:
-                carried = carried + (f"E{epoch_index} setup failed: {setup_err}",)
+                msg = f"E{epoch_index} setup failed: {setup_err}"
+                _journal_carried(journal, now_fn, epoch_id, (msg,))
+                carried = carried + (msg,)
                 consec_aborts = 0
                 epoch_index += 1
                 continue
@@ -757,6 +781,7 @@ def _drive(
                 results=results, tasks_by_id=tasks_by_id,
             )
             carried = _carry(results, integration)
+            _journal_carried(journal, now_fn, epoch_id, carried)
             journal.emit(
                 lambda s: EpochCompleted(seq=s, ts=now_fn(), epoch_id=epoch_id)
             )
@@ -776,6 +801,7 @@ def _drive(
             )
             _raze_epoch(run_dir, repo, run_branch, epoch_id, log_root)
             if started_emitted:
+                _journal_carried(journal, now_fn, epoch_id, (detail,))
                 journal.emit(
                     lambda s: EpochCompleted(seq=s, ts=now_fn(), epoch_id=epoch_id)
                 )
@@ -878,6 +904,7 @@ def resume_run(
     in_flight_id = f"{_PHASE}/E{start_index}"
     started_ids = {e.epoch_id for e in events if isinstance(e, EpochStarted)}
     razed = in_flight_id if in_flight_id in started_ids else None
+    carried = _reconstruct_carried(events)
     _raze_epoch(run_dir, repo, run_branch, in_flight_id, log_root)
 
     with JournalWriter(run_dir.events_path) as journal:
@@ -889,8 +916,28 @@ def resume_run(
             planner=planner, backends=backends, max_epochs=eff_max,
             log_root=log_root, acceptance=acceptance, sleep_fn=sleep_fn,
             backoff_s=backoff_s, now_fn=now_fn, journal=journal,
-            start_index=start_index,
+            start_index=start_index, start_carried=carried,
         )
+
+
+def _reconstruct_carried(events: Sequence[Event]) -> tuple[str, ...]:
+    """Repopulate the planner's carried context from the journal (FIX 5).
+
+    The in-memory carried tuple does not survive a crash, so re-read the
+    ``epoch_carried`` events of the LAST completed epoch (the prior boundary the
+    re-planned epoch follows). Empty when nothing was carried (a clean boundary)."""
+
+    last_completed: str | None = None
+    for ev in events:
+        if isinstance(ev, EpochCompleted):
+            last_completed = ev.epoch_id
+    if last_completed is None:
+        return ()
+    return tuple(
+        ev.reason
+        for ev in events
+        if isinstance(ev, EpochCarried) and ev.epoch_id == last_completed
+    )
 
 
 def _completed_count(events: Sequence[Event]) -> int:

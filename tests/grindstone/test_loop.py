@@ -385,6 +385,42 @@ def test_k_consecutive_aborts_end_cleanly(
     assert result.epochs <= 3
 
 
+# --- FIX 5: resume reconstructs the carried context from the journal -----------
+
+
+def test_resume_reconstructs_carried_from_journal(
+    git_repo: Path, run_dir: RunDir, job_path: Path
+) -> None:
+    from grindstone.events import EpochCarried
+    from grindstone.mock_worker import CrashingWorker
+
+    # E1 completes with its one task ESCALATED (critic ESCALATE), so the loop carries
+    # "<task> escalated: ..." to the next boundary AND journals it. The host is then
+    # killed during E2 (a SimulatedKill escapes start_run).
+    planner = MockDecisionPlanner(
+        [_epoch(_impl("T1", ["a.py"])), _epoch(_impl("T1", ["b.py"]))]
+    )
+    worker = CrashingWorker(inner=LoopWorker(critic_outcome="ESCALATE"), crash_on=2)
+    with pytest.raises(BaseException):
+        start_run(
+            job_path=job_path, run_dir=run_dir, repo=git_repo, planner=planner,
+            backends=_backends(worker), max_epochs=5,
+        )
+    # The escalation was journaled as a carried event (the resume seed for FIX 5).
+    events = read_events(run_dir.events_path)
+    carried_events = [e for e in events if isinstance(e, EpochCarried)]
+    assert any("escalated" in e.reason for e in carried_events)
+
+    # Resume re-enters at the next boundary with carried REPOPULATED (not blind).
+    resume_planner = MockDecisionPlanner([_end("resumed")])
+    result = resume_run(
+        run_dir=run_dir, repo=git_repo, planner=resume_planner,
+        backends=_backends(LoopWorker()),
+    )
+    assert result.status == "completed"
+    assert any("escalated" in c for c in resume_planner.contexts[0].carried)
+
+
 # --- the final-acceptance invariant runs done_when against the tip -------------
 
 
