@@ -10,8 +10,8 @@ from pathlib import Path
 import pytest
 
 from grindstone.contracts.models import Task, parse_decision
-from grindstone.mock_planner import MockPlanner
-from grindstone.mock_worker import MockWorker
+from tests.grindstone.mock_planner import MockPlanner
+from tests.grindstone.mock_worker import MockWorker
 from grindstone.planner import RateLimited as PlannerRateLimited
 from grindstone.worker import HANDOFF_FILENAME
 from grindstone.worker import RateLimited as WorkerRateLimited

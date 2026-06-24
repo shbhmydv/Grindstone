@@ -48,8 +48,8 @@ from grindstone.loop import (
     resume_run,
     start_run,
 )
-from grindstone.mock_planner import GoalPlanner, MockDecisionPlanner
-from grindstone.mock_worker import (
+from tests.grindstone.mock_planner import GoalPlanner, MockDecisionPlanner
+from tests.grindstone.mock_worker import (
     CrashingWorker,
     LoopWorker,
     SimulatedKill,

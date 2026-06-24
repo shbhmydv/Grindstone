@@ -18,7 +18,7 @@ import pytest
 
 from grindstone import worktree as wt
 from grindstone.contracts.models import Task
-from grindstone.mock_worker import MockWorker
+from tests.grindstone.mock_worker import MockWorker
 from grindstone.rundir import RunDir
 from grindstone.worker import (
     Backends,

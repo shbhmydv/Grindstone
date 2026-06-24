@@ -16,7 +16,7 @@ import pytest
 from grindstone import worktree as wt
 from grindstone.contracts.models import EndDecision, EpochDecision
 from grindstone.loop import PlannerContext
-from grindstone.mock_planner import MockPlannerTransport, MockRig
+from tests.grindstone.mock_planner import MockPlannerTransport, MockRig
 from grindstone.planner import (
     PlannerError,
     RateLimited,

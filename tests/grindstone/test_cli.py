@@ -12,8 +12,8 @@ import pytest
 from grindstone import cli, loop
 from grindstone.contracts.models import EndDecision, Epoch, EpochDecision, Task
 from grindstone.events import EpochStarted, JournalWriter, RunStarted, TaskRef
-from grindstone.mock_planner import MockDecisionPlanner
-from grindstone.mock_worker import LoopWorker
+from tests.grindstone.mock_planner import MockDecisionPlanner
+from tests.grindstone.mock_worker import LoopWorker
 from grindstone.rundir import create_run_dir
 from grindstone.worker import Backends
 

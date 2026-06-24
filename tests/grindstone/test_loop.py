@@ -34,8 +34,8 @@ from grindstone.loop import (
     resume_run,
     start_run,
 )
-from grindstone.mock_planner import MockDecisionPlanner
-from grindstone.mock_worker import LoopWorker
+from tests.grindstone.mock_planner import MockDecisionPlanner
+from tests.grindstone.mock_worker import LoopWorker
 from grindstone.rundir import RunDir
 from grindstone.worker import Backends, WorkerTransport
 
@@ -392,7 +392,7 @@ def test_resume_reconstructs_carried_from_journal(
     git_repo: Path, run_dir: RunDir, job_path: Path
 ) -> None:
     from grindstone.events import EpochCarried
-    from grindstone.mock_worker import CrashingWorker
+    from tests.grindstone.mock_worker import CrashingWorker
 
     # E1 completes with its one task ESCALATED (critic ESCALATE), so the loop carries
     # "<task> escalated: ..." to the next boundary AND journals it. The host is then
