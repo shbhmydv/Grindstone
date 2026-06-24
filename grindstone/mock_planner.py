@@ -1,18 +1,23 @@
 """Deterministic mock planner: scripted decisions + scripted failures.
 
-A test double for the loop's planner seam. The script is a list consumed one entry
-per ``plan()`` call, so a test pins the exact decision / failure sequence with zero
-randomness. An entry is either:
+Three test doubles for the planner seams the rewrite exposes:
 
-  - a ``dict`` (a decision payload) returned as JSON text, optionally fence- or
-    prose-wrapped so the core's extractor is exercised end-to-end; or
-  - a failure token from ``FAILURES``, raising the matching transport exception or
-    returning malformed text.
+* ``MockPlanner`` -- the RAW-TEXT transport double (``plan(prompt) -> str``): scripts
+  decision dicts (optionally fence-/prose-wrapped so the core's extractor is
+  exercised) or failure tokens. Used where only the text channel matters.
+* ``MockPlannerTransport`` -- the ``PlannerTransport`` seam (``dispatch(request) ->
+  str``, symmetric to ``mock_worker``): each scripted ``MockRig`` writes a decision
+  to any of the three result channels (``decision.json`` in the workdir, the
+  ``--out`` file, stdout), so ``ScriptPlanner.decide``'s read-priority + re-ask loop
+  is driven with zero randomness. A failure token raises instead.
+* ``MockDecisionPlanner`` -- the loop's ``Planner`` seam (``decide(context) ->
+  Decision``): scripts typed decisions, recording each context so a loop test can
+  assert the boundary was rebuilt from disk.
 
 Failure taxonomy (the bones two-node model): ``rate_limit`` / ``session_limit`` ->
-``RateLimited`` (back off and re-issue); ``transient`` / ``timeout`` / ``hard`` ->
-``PlannerError`` (the cannot-continue catch-all); ``bad_json`` / ``empty`` /
-``invalid`` -> un-gateable output the core re-asks on.
+``RateLimited`` (back off and re-issue); ``transient`` / ``timeout`` / ``hard`` /
+``error`` -> ``PlannerError`` (the cannot-continue catch-all); ``bad_json`` /
+``empty`` / ``invalid`` -> un-gateable output the core re-asks on.
 """
 
 from __future__ import annotations
@@ -22,8 +27,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Union
 
+from grindstone.check_decision import DECISION_FILE
 from grindstone.contracts.models import Decision
-from grindstone.planner import PlannerError, RateLimited
+from grindstone.planner import PlannerDispatch, PlannerError, RateLimited
 
 if TYPE_CHECKING:
     from grindstone.loop import PlannerContext
@@ -95,6 +101,77 @@ class MockPlanner:
                 f"{body}\n\nThat is my single decision."
             )
         return body
+
+
+def _decision_text(decision: dict[str, object]) -> str:
+    return json.dumps(decision)
+
+
+@dataclass(frozen=True)
+class MockRig:
+    """One simulated rig run for ``MockPlannerTransport``: the content it writes to
+    each result channel. ``decision_json`` lands at ``workdir/decision.json`` (the
+    self-validated disk contract), ``out`` at the ``--out`` file, ``stdout`` is
+    returned. ``None`` leaves a channel un-written, so a test pins exactly which
+    channel the read-priority must pick (and can put DIFFERENT content on each)."""
+
+    decision_json: str | None = None
+    out: str | None = None
+    stdout: str = ""
+
+    @classmethod
+    def from_decision(
+        cls, decision: dict[str, object], *, channel: str = "decision_json"
+    ) -> MockRig:
+        """A rig that writes ``decision`` to one channel (default the disk contract)."""
+
+        body = _decision_text(decision)
+        if channel == "decision_json":
+            return cls(decision_json=body)
+        if channel == "out":
+            return cls(out=body)
+        if channel == "stdout":
+            return cls(stdout=body)
+        raise ValueError(f"unknown channel: {channel!r}")
+
+
+#: A transport-level script entry: a ``MockRig`` (writes channels) or a failure token.
+RigEntry = Union[MockRig, str]
+
+
+@dataclass
+class MockPlannerTransport:
+    """The ``PlannerTransport`` seam as a test double: every ``dispatch`` follows the
+    next scripted ``MockRig`` (writing the channels a real rig would), or raises a
+    scripted failure. Drives ``ScriptPlanner.decide`` end to end without a real rig:
+    a ``[invalid_rig, valid_rig]`` script proves the re-ask loop; differing
+    per-channel content proves the ``decision.json`` > ``--out`` > stdout priority."""
+
+    script: list[RigEntry]
+    _calls: int = field(default=0)
+
+    def dispatch(self, request: PlannerDispatch) -> str:
+        if self._calls >= len(self.script):
+            raise AssertionError("mock planner transport script exhausted")
+        entry = self.script[self._calls]
+        self._calls += 1
+        if isinstance(entry, str):
+            return self._failure(entry)
+        if entry.decision_json is not None:
+            (request.workdir / DECISION_FILE).write_text(
+                entry.decision_json, encoding="utf-8"
+            )
+        if entry.out is not None:
+            request.out_file.write_text(entry.out, encoding="utf-8")
+        return entry.stdout
+
+    @staticmethod
+    def _failure(token: str) -> str:
+        if token in ("rate_limit", "session_limit"):
+            raise RateLimited(f"mock planner {token}")
+        if token in ("error", "transient", "hard", "timeout"):
+            raise PlannerError(f"mock planner {token}")
+        raise ValueError(f"unknown mock rig failure token: {token!r}")
 
 
 #: A decision-level script entry: a typed ``Decision`` returned verbatim, or a
