@@ -58,8 +58,22 @@ Requirements:
 """
 
 
+#: A modify-existing-code spec (the dominant north-star shape): the planner should
+#: enumerate concrete existing files to edit, still bounded and disjoint.
+MODIFY_JOB = """\
+Improve an existing Python package `notes/`.
+
+Requirements:
+- `notes/store.py` currently keeps notes in a list; make it persist to a JSON file.
+- `notes/cli.py` should gain a `search <term>` command over the stored notes.
+- Keep the public function signatures stable; do not rename modules.
+"""
+
+
 @pytest.mark.eval
-@pytest.mark.parametrize("job", [TODO_APP_JOB, RESEARCH_REPORT_JOB, UI_BUILD_JOB])
+@pytest.mark.parametrize(
+    "job", [TODO_APP_JOB, RESEARCH_REPORT_JOB, UI_BUILD_JOB, MODIFY_JOB]
+)
 def test_first_boundary_decision_conforms(rig: str, job: str) -> None:
     """A FRESH boundary: the planner emits exactly one bones decision (epoch or end)
     that obeys the core rules.
@@ -72,6 +86,27 @@ def test_first_boundary_decision_conforms(rig: str, job: str) -> None:
 
     decision = run_planner_boundary(job_spec=job, rig=rig)
     O.assert_decision_conforms(decision)
+
+
+@pytest.mark.eval
+@pytest.mark.parametrize("job", [TODO_APP_JOB, UI_BUILD_JOB])
+def test_fresh_boundary_does_not_split_tests_from_code(rig: str, job: str) -> None:
+    """The planner-sequencing FLOOR (the 3780dd2 nudge): on a fresh boundary the
+    planner must not schedule a pure-test task in the same epoch as the source it
+    covers (a producer/consumer dependency across isolated worktrees). It may bundle
+    tests with their code in one task, or defer tests to a later epoch; it may not
+    fan them out as dependent siblings. Conformance is asserted too, so this is a
+    strict superset check on the same live decision.
+
+    This is a PER-SAMPLE probe, not a guarantee: the weaker local model meets the
+    sequencing bar only INCONSISTENTLY (observed splitting tests out in a full smoke
+    run), so a RED here is a sample-level capability finding, not a regression. The
+    worker dependency-discipline contract + the close-out baton's reconciliation are
+    what keep a split non-fatal when it does happen."""
+
+    decision = run_planner_boundary(job_spec=job, rig=rig)
+    O.assert_decision_conforms(decision)
+    O.assert_no_fresh_test_code_split(decision)
 
 
 @pytest.mark.eval

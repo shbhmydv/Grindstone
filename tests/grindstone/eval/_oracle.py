@@ -77,6 +77,42 @@ def assert_decision_conforms(decision: Decision) -> None:
     assert_epoch_obeys_core_rules(decision)
 
 
+def _is_test_path(path: str) -> bool:
+    """A heuristic for "this file is a test, not the code under test": a ``tests``
+    path segment, or a filename in the ``test_*`` / ``*_test`` convention."""
+
+    segments = path.split("/")
+    name = segments[-1]
+    stem = name.rsplit(".", 1)[0]
+    return "tests" in segments or name.startswith("test_") or stem.endswith("_test")
+
+
+def assert_no_fresh_test_code_split(decision: Decision) -> None:
+    """On a FRESH boundary, the planner must not fan a pure-test task out alongside a
+    task that owns the source it covers.
+
+    Sibling tasks grind in isolated worktrees off the same base and cannot see each
+    other's output, so testing code that another same-epoch task is still writing is
+    the producer/consumer dependency the core forbids (a dependency means a LATER
+    epoch). Scoped to the fresh boundary, where nothing is merged yet, so any
+    test-task + source-task cofanout is necessarily a violation. Bundling tests AND
+    their source into ONE task is allowed (that task is not pure-test), as is a
+    source-only first epoch; both pass. An END trivially passes."""
+
+    if isinstance(decision, EndDecision):
+        return
+    impl = [t for t in decision.epoch.tasks if t.mode == "implement"]
+    pure_test = [t for t in impl if t.file_ownership and all(map(_is_test_path, t.file_ownership))]
+    owns_source = [t for t in impl if any(not _is_test_path(f) for f in t.file_ownership)]
+    collisions = [
+        (tt.id, ss.id) for tt in pure_test for ss in owns_source if tt.id != ss.id
+    ]
+    assert not collisions, (
+        f"fresh epoch fans a test task out alongside the code it covers {collisions}; "
+        "tests depend on the source and belong in a LATER epoch, not a sibling task"
+    )
+
+
 # --- worker task bands ----------------------------------------------------------
 
 
