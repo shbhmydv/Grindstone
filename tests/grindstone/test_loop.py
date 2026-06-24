@@ -37,7 +37,7 @@ from grindstone.loop import (
 from grindstone.mock_planner import MockDecisionPlanner
 from grindstone.mock_worker import LoopWorker
 from grindstone.rundir import RunDir
-from grindstone.worker import Backends
+from grindstone.worker import Backends, WorkerTransport
 
 
 # --- builders ------------------------------------------------------------------
@@ -69,7 +69,7 @@ def job_path(tmp_path: Path) -> Path:
     return p
 
 
-def _backends(worker: LoopWorker, *, slots: int = 2) -> Backends:
+def _backends(worker: WorkerTransport, *, slots: int = 2) -> Backends:
     return Backends.single(worker, slots=slots)
 
 

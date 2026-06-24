@@ -23,6 +23,7 @@ Failure taxonomy (the bones two-node model): ``rate_limit`` / ``session_limit`` 
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Union
@@ -194,7 +195,7 @@ class MockDecisionPlanner:
     handed so a test can assert the loop rebuilt the context from disk (e.g. the
     prior epoch's carried failures landed on the next boundary)."""
 
-    script: list[DecisionEntry]
+    script: Sequence[DecisionEntry]
     contexts: list["PlannerContext"] = field(default_factory=list)
     _calls: int = field(default=0)
 
