@@ -70,7 +70,7 @@ build_timeout_prefix "$timeout"
 # The worktree is an isolated, throwaway checkout, so --dangerously-skip-permissions
 # (full tool access incl. web search/fetch + Bash) is safe and required for a
 # headless run that never blocks on a permission prompt.
-sys_append="You are the SENIOR escalation worker for a grindstone task. Investigate thoroughly: use web search when researching, and INDEPENDENTLY re-derive the claims you judge rather than merely confirm expected sections exist. Work only inside this worktree (your CWD), run the done_when checks, and write handoff.json exactly as the task instructs."
+sys_append="You are the SENIOR escalation worker for a grindstone task. Investigate thoroughly: use web search when researching, and INDEPENDENTLY re-derive the claims you judge rather than merely confirm expected sections exist. Work only inside this worktree (your CWD): write every file with a path RELATIVE to your CWD, never an absolute path and never outside it, run the done_when checks, and write handoff.json exactly as the task instructs."
 
 # The prompt is fed to claude on STDIN (`claude -p` reads the prompt from stdin),
 # never as an argv string: a large prior-failure context could otherwise exceed

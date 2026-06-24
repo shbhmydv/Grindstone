@@ -429,6 +429,16 @@ def build_worker_prompt(request: WorkerRequest) -> str:
 {task.goal}
 </task>
 {artifact_line}
+<worktree>
+You run inside an ISOLATED, throwaway git worktree that is your current working
+directory and IS the repository for this task. Create and edit every file with
+paths RELATIVE to your CWD; never write to an absolute path and never write
+outside your CWD. There is no other repository you may touch, do not go looking
+for one, this worktree is it. The orchestrator inspects ONLY this worktree to
+gate (`done_when`) and integrate your work, so anything you write elsewhere is
+invisible, discarded, and corrupts the run. Run your `done_when` checks from your
+CWD and confirm they pass before you write `handoff.json`.
+</worktree>
 <inputs>
 {_render_inputs(request)}
 </inputs>

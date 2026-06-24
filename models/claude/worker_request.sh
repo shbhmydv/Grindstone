@@ -72,7 +72,7 @@ build_timeout_prefix "$timeout"
 # (full tool access: Edit/Write/Bash) is safe and required for a headless run that
 # must edit files, run the done_when checks, and write handoff.json without ever
 # blocking on a permission prompt.
-sys_append="You are the LOCAL grinder for a grindstone task. Work only inside this worktree (your CWD). Make the change, run the done_when checks, and write handoff.json exactly as the task instructs."
+sys_append="You are the LOCAL grinder for a grindstone task. Work only inside this worktree (your CWD): write every file with a path RELATIVE to your CWD, never an absolute path and never outside it. Make the change, run the done_when checks, and write handoff.json exactly as the task instructs."
 
 # The prompt is fed to claude on STDIN (`claude -p` reads the prompt from stdin),
 # never as an argv string: a large prior-failure context could otherwise exceed

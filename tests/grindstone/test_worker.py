@@ -129,6 +129,27 @@ def test_build_worker_prompt_composes_core_plus_one_scenario(mode: str) -> None:
             assert sentinel not in prompt
 
 
+@pytest.mark.parametrize("mode", ["implement", "research", "review", "artifact"])
+def test_worker_prompt_carries_worktree_isolation_contract(mode: str) -> None:
+    """RCA fix: a local worker wrote files with ABSOLUTE paths into the real repo
+    instead of its isolated worktree CWD, so nothing landed where the orchestrator
+    gates it and every build escalated to the senior tier. Every executor prompt
+    (worker AND senior, every mode, every transport) must carry the motivated
+    worktree-isolation contract, since the shared builder is the only surface the
+    transport-less local worker reads."""
+
+    if mode == "implement":
+        request = _implement_request()
+    else:
+        request = _artifact_request(mode)  # type: ignore[arg-type]
+    prompt = build_worker_prompt(request)
+    assert "<worktree>" in prompt
+    # The exact failure mode (relative-not-absolute) and the why-it-matters.
+    assert "RELATIVE to your CWD" in prompt
+    assert "never write to an absolute path" in prompt
+    assert "invisible, discarded, and corrupts the run" in prompt
+
+
 def test_implement_prompt_keeps_dynamic_file_ownership() -> None:
     prompt = build_worker_prompt(_implement_request())
     # The dynamic ownership globs stay in the code-built block (not the .md).
