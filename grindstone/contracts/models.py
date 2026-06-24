@@ -138,6 +138,27 @@ class Epoch(_Frozen):
         Field(max_length=8),
     ] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def _distinct_artifact_out(self) -> Epoch:
+        # The artifact analogue of the disjoint-merge invariant: each non-write task
+        # publishes to its artifact_out via a copy into the run dir, so two tasks
+        # declaring the SAME key race on publish and the loser is silently clobbered
+        # (both still return passed). Reject the collision here so the planner (which
+        # self-validates decision.json through parse_decision) re-emits with distinct
+        # keys, exactly as it must for colliding implement file_ownership.
+        seen: set[str] = set()
+        for task in self.tasks:
+            out = task.artifact_out
+            if out is None:
+                continue
+            if out in seen:
+                raise ValueError(
+                    f"two tasks declare the same artifact_out {out!r}; "
+                    "artifact_out must be distinct across an epoch's tasks"
+                )
+            seen.add(out)
+        return self
+
 
 # --- decision: the two shapes (discriminated on ``kind``) ----------------------
 

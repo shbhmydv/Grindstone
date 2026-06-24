@@ -120,6 +120,41 @@ def test_bad_discriminator_is_rejected() -> None:
         parse_decision({"kind": "nope", "summary": "x"})
 
 
+def test_epoch_rejects_colliding_artifact_out() -> None:
+    """The artifact analogue of disjoint-merge: two non-write tasks may not declare
+    the SAME artifact_out, else concurrent publish races silently clobber the loser
+    and both return passed. The epoch validator rejects the collision so the planner
+    re-emits (it self-validates decision.json through parse_decision)."""
+
+    payload: dict[str, object] = {
+        "kind": "epoch",
+        "epoch": {
+            "title": "two reports",
+            "tasks": [
+                {"id": "T1", "mode": "research", "goal": "a", "artifact_out": "P1/E1/out.md"},
+                {"id": "T2", "mode": "review", "goal": "b", "artifact_out": "P1/E1/out.md"},
+            ],
+        },
+    }
+    with pytest.raises(ValidationError):
+        parse_decision(payload)
+
+
+def test_epoch_allows_distinct_artifact_out() -> None:
+    payload: dict[str, object] = {
+        "kind": "epoch",
+        "epoch": {
+            "title": "two reports",
+            "tasks": [
+                {"id": "T1", "mode": "research", "goal": "a", "artifact_out": "P1/E1/a.md"},
+                {"id": "T2", "mode": "review", "goal": "b", "artifact_out": "P1/E1/b.md"},
+            ],
+        },
+    }
+    decision = parse_decision(payload)
+    assert isinstance(decision, EpochDecision)
+
+
 def test_decision_schema_matches_pydantic() -> None:
     """A payload the Pydantic model accepts must also pass the wire schema, and the
     empty-epoch invalid payload must fail BOTH layers (no model/schema drift)."""
