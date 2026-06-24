@@ -54,18 +54,26 @@ reuse the head across a run (`build_planner_input` in `grindstone/planner.py`):
 
 ```
 [STABLE HEAD: byte-identical across the run]
-  system preamble          (fixed per Grindstone version)
+  planner core (PLANNER_CORE)  role identity + output discipline + the cross-cutting
+                            rules true for every call (fixed per Grindstone version)
   job spec                 (frozen at run start)
-  skills digest            (reserved; empty in v1)
   repo memory digest       (frozen at run start; empty when the repo has none)
   phase skeleton           (changes ONLY on propose_skeleton / revise_phases)
+[SCENARIO SKILL: composed between head and tail]
+  one of plan_skeleton / plan_epoch / repair_epoch, selected deterministically from
+  run state (skeleton-exists, failed-epoch-active) by select_planner_scenario
 [VOLATILE TAIL]
   running state            (phase id, epoch counter, keyed-log index)
-  phase status             (per-check pass/fail of the exit criterion, budget,
+  phase status             (per-check pass/fail of the exit-criterion FLOOR, budget,
                             integration-tip file listing, escalation demand)
+  domain skills index      (the target repo's <repo>/.grindstone/skills catalogue,
+                            name -> one-line description; empty when absent)
   last epoch report        (per-task status/attempts/tier, each DONE task's
                             resulting_state + downstream_needs, each FAILED
                             task's last reason)
+  workspace handles        (absolute read paths: the integration-tip checkout, the
+                            keyed-log root + manifest, the repo_map, the last
+                            verdict.json) for read-capable planning
   re-ask errors            (only when a prior decision was rejected)
   decision request
 ```
@@ -86,16 +94,22 @@ on the tool name**: modes are function names, not a field a model can fudge.
 | `implement` | epoch boundary | plans an epoch whose deliverable is committed repo files (worktree + commit) |
 | `research` / `artifact` | epoch boundary | plans an epoch that ships an analysis/report through the keyed log (no worktree) |
 | `review` | epoch boundary | judges existing work and ships a verdict through the keyed log |
+| `phase_complete` | epoch boundary, once the build-health floor is green and the deliverables exist | judges the CURRENT phase's GOAL met; cites concrete deliverable paths the core re-checks EXIST at the tip before ending the phase |
 | `revise_phases` | epoch boundary | the **phase STRUCTURE** is wrong; replaces the current phase onward (never a completed phase); separately journaled |
 | `handle_failed_epoch` | only when an epoch has **failed** and is awaiting disposition | a focused disposition of that epoch: `retry` (with a `hint`, optionally `escalate_tier`), `escalate_senior` (with a `diagnosis`), or `halt` (with a `reason`) |
 | `escalate_run` | epoch boundary | the planner cannot proceed → hand to a human |
 | `complete_run` | epoch boundary | the whole job is done; carries deterministic `evidence` checks |
 
-There is **no `advance_phase` tool**: phase exit is decided by Grindstone running
-the phase's deterministic exit criterion against the integration tip, never by a
-planner claim. The planner *defines* the criteria (in `propose_skeleton` /
-`revise_phases`); the state machine *evaluates* them. *Model proposes, state
-machine disposes.* The planner never executes anything inline.
+The phase's `exit_criterion` is a **build-health floor**, not a phase-exit gate:
+the state machine re-runs it against the integration tip every call as a regression
+signal, but a green floor never ends a phase on its own. The planner **owns phase
+completion** and ends a phase by emitting `phase_complete`; the state machine then
+GROUNDS that judgement by re-checking each cited deliverable EXISTS at the tip
+(existence only, never quality) and bounces the decision back if any is missing.
+So the planner *defines* the floor checks (in `propose_skeleton` /
+`revise_phases`) and *judges* the goal met; the state machine *evaluates* the floor
+and *grounds* the completion, never taking a bare planner claim. *Model proposes,
+state machine disposes.* The planner never executes anything inline.
 
 ### Choosing the mode: by destination, not flavor
 
@@ -120,7 +134,7 @@ giant epoch with a single giant task cannot be diagnosed when it fails.
 
 1. **PHASING** (`propose_skeleton` / `revise_phases`): split the *job* into
    phases. **One phase = one MODE** (research / implement / test / review); a
-   phase that mixes modes is two phases. 2–10 phases (§4).
+   phase that mixes modes is two phases. 2-10 phases (§4).
 2. **EPOCH** (one work decision per call): split a *phase* into epochs. **One
    epoch = one coherent FEATURE or milestone.** For an **implement** phase the
    **FIRST epoch is an explicit baseline-dependencies epoch**: it stands up the
@@ -184,12 +198,15 @@ so: use a `research` epoch first.
 ## 4. Phases
 
 A phase = `{id, title, exit_criterion, epoch_budget}` (`id` is `P1`…`P99`; a
-skeleton has 2–10 phases).
+skeleton has 2-10 phases).
 
 - `exit_criterion` is a list of deterministic **checks** (the same shape as a
-  task's `done_when`, §5). A planner that cannot express phase-done as commands
-  + expected exits and/or required artifacts is mis-scoping the phase; the
-  validator rejects prose-only criteria structurally.
+  task's `done_when`, §5) that form the phase's **build-health floor**: a
+  regression signal the core re-runs against the integration tip each call, NOT the
+  phase-done predicate (the planner judges that with `phase_complete`, §3, once the
+  floor is green). A planner that cannot express the floor as commands + expected
+  exits and/or required artifacts is mis-scoping the phase; the validator rejects
+  prose-only criteria structurally.
 - `epoch_budget` caps how many epochs the phase may consume. Exhaustion does not
   loop silently: it fires a **phase escalation**; the next call may legally emit
   only `revise_phases` or `escalate_run` until the demand clears.
@@ -200,7 +217,7 @@ skeleton has 2–10 phases).
 
 All tasks in an epoch are independent and fan out concurrently; they **must not
 consume each other's outputs** (anything sequential belongs in a later epoch).
-1–8 tasks per epoch, ids `T1`…`T8`; the fully-qualified log-key prefix is
+1-8 tasks per epoch, ids `T1`…`T8`; the fully-qualified log-key prefix is
 `<phase>/<epoch>/<task>`.
 
 Common shape:
@@ -211,7 +228,7 @@ Common shape:
 - `inputs`: **log keys only.** The validator rejects a key that does not exist
   in the keyed log at validation time, the structural guard against the planner
   hallucinating an upstream artifact.
-- `done_when`: 1–6 deterministic **structural** checks (see *Checks* below). The
+- `done_when`: 1-6 deterministic **structural** checks (see *Checks* below). The
   worker runs them, then Grindstone re-runs them on return; a task whose checks
   cannot run is FAILED, never vibes-DONE. `done_when` is scoped by mode: a
   research / review / artifact task runs in a scratch dir that is **not** a repo
@@ -229,11 +246,15 @@ Common shape:
   equivalent"). These are judged by an agentic verification pass, never by a shell
   command. Express the bar here whenever it is content or semantic rather than
   structural, the content-grep you would otherwise reach for is exactly this.
-- `skills`: optional catalog names (reserved seam).
+- `skills`: optional domain-skill names this task pulls in (max 6). Each must be an
+  entry the target repo's `<repo>/.grindstone/skills/index.md` catalogue advertises;
+  the validator rejects any name the catalogue does not list, and absent a catalogue
+  `skills` must be empty. The worker composes only the selected skills into its
+  prompt (retrieve, do not concatenate the whole catalogue).
 
 Mode-specific:
 
-- **implement** additionally requires `file_ownership`: 1–32 paths that must be
+- **implement** additionally requires `file_ownership`: 1-32 paths that must be
   **pairwise disjoint across the epoch**; this is the merge-correctness mechanism
   (§6), not metadata. A **deterministic size gate** further bounds a *fresh*
   implement task: every `file_ownership` entry must be a **concrete file path**, a

@@ -76,19 +76,24 @@ loop:
 
 ### Skeleton and phases
 
-The first decision is always `propose_skeleton`, which lays down a 2–10 phase
-skeleton. Each phase carries a deterministic `exit_criterion` and an
-`epoch_budget`. On every loop pass, once a skeleton exists, the core freshly
-evaluates the current phase's exit criterion **against the integration tip** in a
-throwaway worktree; all checks passing advances the phase (the last phase passing
-does *not* auto-complete; the planner still owns `complete_run`). A phase whose
-budget is exhausted with its criterion still failing fires a one-shot **phase
-escalation**, after which only `revise_phases` / `escalate_run` are legal until
-it clears.
+The first decision is always `propose_skeleton`, which lays down a 2-10 phase
+skeleton. Each phase carries an `exit_criterion` and an `epoch_budget`. The
+`exit_criterion` is a **build-health floor**, not an auto-pass gate: on every loop
+pass, once a skeleton exists, the core freshly evaluates it **against the
+integration tip** in a throwaway worktree, but a green floor never ends a phase on
+its own; it is a regression signal surfaced to the planner each call. A phase ends
+only when the **planner** emits `phase_complete`, judging the phase GOAL met
+against the cumulative repo state and citing the concrete deliverables that satisfy
+it; the core then re-checks each cited deliverable EXISTS at the tip (existence
+only, never a quality judgement) and bounces the decision back to planning if any
+is missing. The last phase completing does *not* auto-complete the run; the planner
+still owns `complete_run`. A phase whose budget is exhausted with its floor still
+red fires a one-shot **phase escalation**, after which only `revise_phases` /
+`escalate_run` are legal until it clears.
 
 ### Epochs and tasks
 
-Each work decision opens one **epoch** (`grindstone/epoch_loop.py`): 1–8
+Each work decision opens one **epoch** (`grindstone/epoch_loop.py`): 1-8
 independent tasks fan out on a bounded thread pool, each running the single-task
 state machine in `grindstone/task_loop.py`:
 
@@ -98,6 +103,10 @@ state machine in `grindstone/task_loop.py`:
   task's `file_ownership` globs. Because ownership is pairwise-disjoint and
   scope-checked, integration is fast-forward merges in task order that *cannot
   conflict*; any conflict is treated as a structural bug and aborts the epoch.
+  A passed epoch fast-forwards one durable run branch, `grind/{run_id}` (the only
+  ref that survives a boundary); the per-attempt and per-epoch staging branches
+  all live under a transient `grind-wip/*` namespace and are pruned once their
+  work is absorbed into the run branch.
 - **research / review / artifact** tasks run in a plain run-dir scratch directory
   with no worktree and no git: a non-write task is never handed the live repo as
   its CWD. They publish their `artifact_out` to the keyed log.
@@ -122,7 +131,11 @@ relocated record (zero dead artifacts) and re-queues the attempt. **Stdout is
 never parsed**; the disk file is the only result channel.
 
 The worker owns a narrow lane: it edits ONLY files within its `file_ownership`
-(or, for a non-write task, only its CWD). Grindstone (the core) owns all git
+(or, for a non-write task, only its CWD), writing every path RELATIVE to that CWD,
+never to an absolute path and never outside the worktree (the executor prompt
+carries this worktree-isolation contract explicitly, since a worker that strips its
+CWD back to the repo root must not be able to reach the real checkout). Grindstone
+(the core) owns all git
 staging and committing and may keep its own bookkeeping files in the tree, so the
 worker must NOT git-commit, must NOT touch orchestration files, and "working tree
 clean" is grindstone's concern, never the worker's. Because a *missing*
@@ -263,11 +276,22 @@ so nothing resolves outside it:
   state.json           in-flight epoch cursor (EpochState): per-task status
   journal.md           human-facing markdown post-mortem (derived; latest run only)
   P1/E1/T1/handoff.json …   the keyed log: relocated handoffs, outcomes, artifacts
-  worktrees/           throwaway per-attempt + integration worktrees
+  worktrees/_planner_tip    the orchestrator-managed planner-READ tip checkout only
   artifacts/           scratch CWDs for non-write tasks
   worker_logs/         per-worker stdout/stderr
-  vision/, polish/     scratch for the taste gates
+  vision/, polish/     verdict scratch for the taste gates
 ```
+
+The model-WRITTEN executor worktrees (task attempts, infra-repair, polish) and the
+orchestrator's scratch + staging trees no longer nest under the run dir: they live
+on an **external base**, `/tmp/cache/grindstone/<repo-id>/<run-id>/worktrees`
+(`GRINDSTONE_WORKTREE_BASE` to relocate; `rundir.worktrees_root`). A worktree nested
+inside the target repo lets a worker that strips its CWD back to the repo root write
+into the MAIN checkout instead of its isolated worktree, so hosting them externally
+removes the nesting the strip relies on. Only the orchestrator-managed `_planner_tip`
+read checkout stays under `worktrees/` here, since the sandboxed planner rigs (codex
+`-C repo` read-only, claude cwd=repo) must reach it inside the repo and it is never
+model-written.
 
 The **journal** (`grindstone/events.py`, `grindstone/journal.py`) is the
 backbone: a frozen vocabulary of Pydantic events (`run_started`, `phase_passed`,

@@ -106,16 +106,19 @@ A job moves through a fixed lifecycle. The state machine decides every transitio
 
 ```
 job.md
-  └─ propose_skeleton ──▶ phases (each: exit_criterion + epoch_budget)
+  └─ propose_skeleton ──▶ phases (each: exit_criterion floor + epoch_budget)
         └─ implement / research / review / artifact ──▶ epochs
               └─ tasks fan out ──▶ workers ──▶ handoff.json (disk contract)
-                    └─ deterministic done_when / exit_criterion gates
-                          └─ complete_run (re-verifies evidence) ──▶ terminal
+                    └─ deterministic done_when / build-health-floor gates
+                          └─ phase_complete (planner judges the phase goal met)
+                                └─ complete_run (re-verifies evidence) ──▶ terminal
 ```
 
 Each worker writes `handoff.json` in its own throwaway git worktree, and the
 relocated, re-validated copy in the run dir is what counts. A phase advances only
-once its `exit_criterion` checks pass, and `complete_run` re-runs the evidence
+once the planner judges its goal met with `phase_complete`; its `exit_criterion` is
+a build-health floor that must be green first (and whose cited deliverables the core
+re-checks exist), not an auto-advance gate. `complete_run` re-runs the evidence
 before the run is allowed to finish. The full design lives in
 **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)**: the thesis, the script-backed
 roles, the run-dir layout, the taste and vision features, and how durability and
