@@ -1,9 +1,9 @@
 """Generator for the worker-facing handoff validator.
 
-The core's gate (``contracts/gate.py``) only judges a handoff AFTER the worker
-exits, an invalid handoff costs a whole new worker subprocess. To let a worker
-self-correct, the core drops a small validator in the worker's CWD; the worker
-runs it and loops until clean before handing back.
+The core's gate (inline in ``worker._gate_handoff``) only judges a handoff AFTER
+the worker exits, an invalid handoff costs a whole new worker subprocess. To let a
+worker self-correct, the core drops a small validator in the worker's CWD; the
+worker runs it and loops until clean before handing back.
 
 ``generate_check_script`` emits that validator as a **self-contained, stdlib-only**
 Python source string parametrized by ``task_id`` and ``mode``: target repos have
@@ -34,7 +34,7 @@ from grindstone.contracts.models import HANDOFF_MAX_BYTES, HandoffMode
 CHECK_SCRIPT_NAME = "check_handoff.py"
 CHECK_COMMAND = f"python3 {CHECK_SCRIPT_NAME}"
 
-#: Modes whose handoff must carry >= 1 citation (mirrors ``handoff_violations``).
+#: Modes whose handoff must carry >= 1 citation (mirrors ``worker._gate_handoff``).
 _CITATION_MODES = ("research", "review")
 
 #: The wire schema, loaded once at import (same artifact the core gate compiles)

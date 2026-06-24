@@ -170,19 +170,6 @@ def branches_with_prefix(repo: Path, prefix: str) -> list[str]:
     ]
 
 
-def force_branch(repo: Path, branch: str, commit: str) -> None:
-    """Point ``branch`` at ``commit`` (create it, or force-move an existing one).
-
-    The materialization primitive for a commit authored on a DETACHED worktree
-    (the B5 final-polish adoption): without a real ref the commit is dangling
-    (gc-prone) and the run's final branch still points at pre-polish work. The
-    branch is not checked out anywhere (the polish worktree is detached and is
-    torn down right after), so ``branch -f`` always succeeds.
-    """
-
-    _git(repo, "branch", "-f", branch, commit)
-
-
 def fast_forward_branch(repo: Path, run_branch: str, commit: str) -> None:
     """Advance the persistent RUN branch ``run_branch`` to ``commit`` (create it
     there if it does not yet exist).
@@ -194,9 +181,8 @@ def fast_forward_branch(repo: Path, run_branch: str, commit: str) -> None:
     fast-forward (the staging branch was started off the run tip, so it descends
     from it). ``git branch -f`` covers both create-and-move uniformly; the run
     branch is never checked out in a worktree (the epoch worktrees are pruned
-    before this runs), so the force always succeeds. Semantically distinct from
-    ``force_branch`` (which force-MOVES an arbitrary branch to a possibly-divergent
-    commit, the polish adoption): here the move is always a forward advance.
+    before this runs), so the force always succeeds; the move is always a forward
+    advance (the staging branch was started off the run tip).
     """
 
     _git(repo, "branch", "-f", run_branch, commit)
@@ -331,44 +317,17 @@ def path_in_scope(path: str, ownership: list[str]) -> bool:
     return False
 
 
-def _under_dep_dir(path: str, dep_dirs: list[str]) -> bool:
-    """Is ``path`` the declared dependency dir itself, or anything beneath it?
-
-    ``dep_dirs`` are the repo-relative ``prepare.env_dirs`` (e.g. ``node_modules``,
-    ``.venv``), MATERIALIZED dependency dirs, not authored work. A worker that runs
-    ``npm install`` populates them, and the core force-adds + commits them when the
-    worktree has no effective ``.gitignore``, so they would otherwise read as a wall
-    of out-of-scope writes. Only the DECLARED dirs are excluded (an undeclared write
-    outside ownership is still a real violation).
-    """
-
-    for dep in dep_dirs:
-        dep = dep.strip("/")
-        if dep and (path == dep or path.startswith(dep + "/")):
-            return True
-    return False
-
-
-def scope_violations(
-    changed: list[str], ownership: list[str], dep_dirs: list[str] | None = None
-) -> list[str]:
+def scope_violations(changed: list[str], ownership: list[str]) -> list[str]:
     """Changed paths that fall outside every ownership glob. Empty ownership is
     deny-all: with no globs, every changed path is a violation.
 
-    ``dep_dirs`` (the declared ``prepare.env_dirs``) are NEVER violations: a path
-    under a materialized dependency dir is a build artifact, not authored work, so
-    it is excluded before the ownership check. This is the robust fix regardless of
-    whether the fresh worktree carried an effective ``.gitignore``; only the
-    explicitly declared dep dirs are exempt, so a genuine out-of-scope write OUTSIDE
-    them is still reported.
+    A worker that installs project dependencies inside its own worktree (BONES: the
+    setup seam no longer reaches the task worktrees) writes them under its declared
+    ownership or relies on the repo's own ``.gitignore`` keeping them untracked, so
+    only genuinely out-of-scope, tracked writes are reported here.
     """
 
-    deps = dep_dirs or []
-    return [
-        p
-        for p in changed
-        if not _under_dep_dir(p, deps) and not path_in_scope(p, ownership)
-    ]
+    return [p for p in changed if not path_in_scope(p, ownership)]
 
 
 # --- integration ---------------------------------------------------------------

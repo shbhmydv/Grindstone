@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "grindstone/epoch_verdict/v1",
+  "$id": "grindstone/verdict/v1",
   "title": "Grindstone critic verdict: triage, not a grade. The agentic critic ROUTES one task to PASS (merge), RETRY (the bounded same-worker retry), or ESCALATE (the planner). Lenient on purpose, the old rigid multi-field schema is what a weak model fumbled. Pydantic (grindstone.contracts.models.Verdict) is the source of truth.",
   "type": "object",
   "required": ["outcome"],

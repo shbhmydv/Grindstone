@@ -35,7 +35,7 @@ def _decision_validator() -> Draft202012Validator:
 
 
 def _verdict_validator() -> Draft202012Validator:
-    schema = json.loads((_SCHEMA_DIR / "epoch_verdict.json").read_text())
+    schema = json.loads((_SCHEMA_DIR / "verdict.json").read_text())
     Draft202012Validator.check_schema(schema)
     return Draft202012Validator(schema)
 
