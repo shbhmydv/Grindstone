@@ -87,8 +87,10 @@ def test_replay_builds_phase_free_tree(tmp_path: Path) -> None:
     t2 = next(t for t in epoch.tasks if t.id == "T2")
     assert t1.status == "done"  # done clears the earlier verdict note
     assert t1.note is None
+    assert t1.verdict == "PASS"  # ... but the critic outcome is RETAINED past done
     assert t2.status == "gate_rejected"
     assert t2.note == "no citation"
+    assert t2.verdict is None  # no verdict event yet -> no retained outcome
 
 
 def test_replay_run_ended_and_rate_limit(tmp_path: Path) -> None:

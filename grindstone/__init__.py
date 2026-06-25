@@ -8,7 +8,7 @@ integration, the done-predicate, and kill-mid-epoch resume; S3 the multi-epoch
 run loop, the stateless planner (``codex exec`` / mock) behind a transport
 interface, pure stable-head/volatile-tail input construction, the decision
 gate (schema → typed → semantic), 3-way failure classification with injected
-backoff, epoch chaining, ``complete_run`` evidence re-runs, and
-kill-mid-planner-call resume (in-flight calls re-issued, not burned). The
+backoff, epoch chaining, the single final ``done_when`` acceptance run once at the
+END, and kill-mid-planner-call resume (in-flight calls re-issued, not burned). The
 run/phase frame is now owned by the loop, not synthesized in the epoch.
 """

@@ -282,6 +282,9 @@ class TaskNode:
     #: A transient note worth surfacing: a handoff-rejection reason or the critic's
     #: verdict reason (cleared on done). Most-recent wins.
     note: str | None = None
+    #: The last critic triage outcome ("PASS" / "RETRY" / "ESCALATE"), RETAINED past
+    #: ``done`` (unlike ``note``) so the watcher keeps showing the critic verdict.
+    verdict: str | None = None
 
 
 @dataclass
@@ -373,6 +376,7 @@ def replay(events: list[Event]) -> RunTree:
             task = _task(epochs_by_id[ev.epoch_id], ev.task_id)
             task.status = f"verdict_{ev.outcome.lower()}"
             task.note = ev.reason or None
+            task.verdict = ev.outcome  # retained past done (note is cleared, this is not)
         elif isinstance(ev, TaskDone):
             task = _task(epochs_by_id[ev.epoch_id], ev.task_id)
             task.status = "done"

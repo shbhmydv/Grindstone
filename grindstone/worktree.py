@@ -231,10 +231,11 @@ def add_worktree_detached(repo: Path, path: Path, *, ref: str) -> None:
     """Create a read-only-purpose worktree at ``path`` on a DETACHED checkout of
     ``ref``.
 
-    Used by the check evaluator (phase exit criteria / complete_run evidence):
-    it only reads a tree, and `git worktree add <branch>` refuses any branch
-    already checked out elsewhere, including the operator's own checkout (E2E
-    gate2 P0). Detached HEAD cannot collide by construction.
+    Used for the read-only-purpose detached checkouts: the final ``done_when``
+    acceptance, the planner-declared setup commands, the planner's grep workdir,
+    and the per-task read tip. It only reads a tree, and `git worktree add <branch>`
+    refuses any branch already checked out elsewhere, including the operator's own
+    checkout (E2E gate2 P0). Detached HEAD cannot collide by construction.
     """
 
     path.parent.mkdir(parents=True, exist_ok=True)

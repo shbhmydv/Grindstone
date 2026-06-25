@@ -2,17 +2,19 @@
 
 A thin front end over the epoch loop (BONES). ``run`` / ``resume`` build the real
 planner + backends from the repo config and drive the state machine (``loop.run`` /
-``loop.resume``), returning a process exit code; ``watch`` renders a run's journal
-from its append-only ``events.ndjson`` (the journal is the single source of truth,
-so the watcher needs no live state). ``python -m grindstone --help`` lists the verbs.
+``loop.resume``), returning a process exit code; ``watch`` live-renders a run's
+E -> T -> C tree from its append-only ``events.ndjson`` on a TTY (falling back to a
+single static journal render when piped or under ``--once``), so the watcher needs no
+live state beyond the event stream. ``python -m grindstone --help`` lists the verbs.
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
-from grindstone import loop
+from grindstone import loop, tui
 from grindstone.journal import render_run_dir
 from grindstone.rundir import RunDir
 
@@ -52,6 +54,11 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     except FileNotFoundError as exc:
         print(f"grindstone watch: {exc}")
         return 2
+    # Live E -> T -> C tree on an interactive TTY; a single static journal render
+    # when piped / in CI / under an agent, or when --once is asked for explicitly.
+    if not args.once and sys.stdout.isatty():
+        tui.watch(run_dir)
+        return 0
     rendered = render_run_dir(run_dir)
     if rendered is None:
         print(f"grindstone watch: no renderable run at {run_dir.events_path}")
@@ -75,9 +82,13 @@ def _build_parser() -> argparse.ArgumentParser:
     resume.add_argument("--repo", required=True, help="target repo the run lives in")
     resume.set_defaults(func=_cmd_resume)
 
-    watch = sub.add_parser("watch", help="render a run's journal from its events")
+    watch = sub.add_parser("watch", help="live-render a run's tree (static when piped)")
     watch.add_argument("target", help="run dir path, or a run id (with --repo)")
     watch.add_argument("--repo", default=None, help="repo to resolve a run id under")
+    watch.add_argument(
+        "--once", action="store_true",
+        help="print one static journal render and exit (no live loop)",
+    )
     watch.set_defaults(func=_cmd_watch)
 
     return parser
