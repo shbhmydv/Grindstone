@@ -48,6 +48,7 @@ from grindstone.check_decision import (
 from grindstone.contracts.models import Decision, parse_decision
 from grindstone.domain_skills import load_domain_skill_index
 from grindstone.rundir import RunDir
+from grindstone.strategy_skill import load_strategy
 
 if TYPE_CHECKING:  # pragma: no cover - typing only (avoids the loop<->planner cycle)
     from grindstone.loop import CloseoutContext, PlannerContext
@@ -305,6 +306,28 @@ def _domain_skills_block(index: dict[str, str]) -> str:
     )
 
 
+def _strategy_block(text: str) -> str:
+    """The target repo's always-on PLANNER strategy overlay, framed as an ADVISORY
+    extension of the operating preamble - NEVER an override of the mechanics.
+
+    Empty text -> ``""`` (so the no-strategy prompt is byte-identical to today and the
+    byte-stable ``<system>...</system>`` prefix stays cacheable). Non-empty -> a tagged
+    block whose first line subordinates the strategy to the operating rules / decision
+    contract / gates above (preferences, not permissions)."""
+
+    if not text:
+        return ""
+    return (
+        "<strategy_skill>\n"
+        "Repo-specific PLANNING guidance (cadence, focus, decomposition emphasis). It "
+        "REFINES how you plan; it does NOT override the operating rules, the decision "
+        "contract, or the gates above - those WIN on any conflict. Preferences, not "
+        "permissions.\n"
+        f"{text}\n"
+        "</strategy_skill>\n"
+    )
+
+
 _TOOLS_BLOCK = (
     "<tools>\n"
     "Your workdir is a checkout of the current integration tip. GREP and READ it to "
@@ -319,15 +342,18 @@ def build_planner_input(
     context: PlannerContext,
     *,
     domain_skill_index: dict[str, str],
+    strategy: str = "",
     reask_errors: tuple[str, ...] = (),
 ) -> str:
     """Render the full PLAN prompt from ``context`` (PURE, no I/O).
 
-    ``PLAN_PREAMBLE`` (byte-stable) then the volatile tail: the job spec, the running
-    state + keyed-log index, the prior epoch's BATON, the domain-skill catalogue index
-    (when the repo ships one), the read-tools note, any re-ask feedback, and the
-    request. References, not payloads: only the baton text, names, and log keys, never
-    file bodies (the planner greps its workdir for the tree).
+    ``PLAN_PREAMBLE`` (byte-stable) then the repo's always-on STRATEGY overlay (advisory,
+    injected right after ``</system>`` so the cacheable system prefix is unchanged; empty
+    when the repo ships none) then the volatile tail: the job spec, the running state +
+    keyed-log index, the prior epoch's BATON, the domain-skill catalogue index (when the
+    repo ships one), the read-tools note, any re-ask feedback, and the request.
+    References, not payloads: only the baton text, names, and log keys, never file bodies
+    (the planner greps its workdir for the tree).
     """
 
     errors = ""
@@ -339,6 +365,7 @@ def build_planner_input(
         )
     return (
         f"<system>\n{PLAN_PREAMBLE}</system>\n"
+        f"{_strategy_block(strategy)}"
         f"<job>\n{context.job}\n</job>\n"
         f"{_state_block(context)}"
         f"{_baton_block(context)}"
@@ -420,20 +447,25 @@ def build_closeout_input(
     context: CloseoutContext,
     *,
     domain_skill_index: dict[str, str] | None = None,
+    strategy: str = "",
 ) -> str:
     """Render the full CLOSE-OUT prompt from ``context`` (PURE, no I/O).
 
     ``CLOSEOUT_PREAMBLE`` (byte-stable, and it already carries the four-section baton
-    skeleton) then the volatile tail: the job, the prior baton, the epoch report (the
-    deterministic outcomes + keyed-log pointers), this epoch's ``decision.pending``
-    additions (so the ## Pending backlog can be reconciled here, the sole baton write),
-    the domain-skill catalogue index (so the baton's pending list can name a skill the
-    next epoch will select), the tools/vision note, and the request to write ``./baton.md``.
+    skeleton) then the repo's always-on STRATEGY overlay (advisory, injected right after
+    ``</system>`` so the cacheable system prefix is unchanged; empty when absent - the
+    baton-writer steers cadence too: what to prioritise next) then the volatile tail: the
+    job, the prior baton, the epoch report (the deterministic outcomes + keyed-log
+    pointers), this epoch's ``decision.pending`` additions (so the ## Pending backlog can
+    be reconciled here, the sole baton write), the domain-skill catalogue index (so the
+    baton's pending list can name a skill the next epoch will select), the tools/vision
+    note, and the request to write ``./baton.md``.
     """
 
     skills = _domain_skills_block(domain_skill_index or {})
     return (
         f"<system>\n{CLOSEOUT_PREAMBLE}</system>\n"
+        f"{_strategy_block(strategy)}"
         f"<job>\n{context.job}\n</job>\n"
         f"{_prior_baton_block(context)}"
         f"{_epoch_report_block(context)}"
@@ -506,6 +538,7 @@ class ScriptPlanner:
         index = (
             load_domain_skill_index(context.repo) if context.repo is not None else {}
         )
+        strategy = load_strategy(context.repo)
         decision_path = workdir / DECISION_FILE
         out_file = context.run_dir.root / _OUT_FILENAME
 
@@ -513,7 +546,7 @@ class ScriptPlanner:
         last_error = "no attempts"
         for _ in range(self.max_reasks + 1):
             prompt = build_planner_input(
-                context, domain_skill_index=index, reask_errors=reask
+                context, domain_skill_index=index, strategy=strategy, reask_errors=reask
             )
             # Clear stale channels so a rig that silently writes nothing can never
             # feed us a previous boundary's decision.
@@ -555,11 +588,14 @@ class ScriptPlanner:
         index = (
             load_domain_skill_index(context.repo) if context.repo is not None else {}
         )
+        strategy = load_strategy(context.repo)
         baton_path = workdir / BATON_FILE
         out_file = context.run_dir.root / _OUT_FILENAME
         baton_path.unlink(missing_ok=True)
         out_file.unlink(missing_ok=True)
-        prompt = build_closeout_input(context, domain_skill_index=index)
+        prompt = build_closeout_input(
+            context, domain_skill_index=index, strategy=strategy
+        )
         stdout = self.transport.dispatch(
             PlannerDispatch(
                 prompt=prompt, workdir=workdir, out_file=out_file, purpose="closeout"

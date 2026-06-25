@@ -343,6 +343,30 @@ def _domain_skills_block(request: WorkerRequest) -> str:
     )
 
 
+def _critic_skills_block(request: WorkerRequest) -> str:
+    """The CRITIC-framed view of the task's SELECTED domain skills: the rubric the
+    work CLAIMS to meet. Distinct from ``_domain_skills_block`` (worker-facing
+    "authoritative guidance"); here the framing is enforcement, and the critic must
+    NOT be lenient on conformance. Empty when no skills were selected, so the
+    lenient-router prompt stays byte-identical."""
+
+    if not request.domain_skills:
+        return ""
+    blocks = "\n".join(
+        f'<skill name="{name}">\n{text}\n</skill>'
+        for name, text in sorted(request.domain_skills.items())
+    )
+    return (
+        "\n<rubric>\nThese repo skills were SELECTED for this task: they are THE "
+        "RUBRIC THE WORK CLAIMS TO MEET. VERIFY the work conforms to them and do NOT "
+        "be lenient on that conformance - a task that ignored its selected rubric did "
+        "NOT meet its claimed goal: RETRY if the SAME worker can bring it into "
+        "conformance, ESCALATE if not. (This is the one place strictness is required; "
+        "everywhere else the lenient-router bias below still holds.)\n"
+        f"{blocks}\n</rubric>\n"
+    )
+
+
 def _file_ownership_block(task: Task) -> str:
     globs = "\n".join(f"  - {g}" for g in task.file_ownership)
     return f"""
@@ -429,6 +453,10 @@ def build_critic_prompt(request: WorkerRequest, brief: CriticBrief) -> str:
     Python used to gate: done-vs-blocked, grounding / citation quality (research /
     review must cite real files), and an environmental blocker -> ESCALATE. Bias to
     PASS when unsure. The critic ROUTES, it does not grade.
+
+    ONE additive strictness: when the task SELECTED domain skills, they render as a
+    rubric (``_critic_skills_block``) the work must conform to (skill-less tasks keep
+    this byte-identical lenient prompt).
     """
 
     if brief.mode == "implement":
@@ -480,7 +508,7 @@ that is an ESCALATE, not a RETRY:
 <the_work>
 {work_line}
 </the_work>
-{grounding}
+{grounding}{_critic_skills_block(request)}
 <triage>
 The bar is "GOOD ENOUGH TO BUILD ON", not "perfect". Decide ONE outcome:
   - PASS: it accomplished the claimed goal well enough to build on. Minor
@@ -574,10 +602,15 @@ def _critic_verdict(
     critic_read_root: Path | None,
     run_dir: RunDir,
     backends: Backends,
+    domain_skills: dict[str, str],
 ) -> Verdict:
     """Dispatch the tier-matched critic in the task's own scratch, read + relocate
     its ``verdict.json``, return the parsed lenient ``Verdict``. A missing / invalid
-    verdict or a transport raise is a ``CriticError`` (fail-safe, never a pass)."""
+    verdict or a transport raise is a ``CriticError`` (fail-safe, never a pass).
+
+    The task's SELECTED ``domain_skills`` ride along so the critic can VERIFY the work
+    against them as a rubric (the "analyse" step of the composition loop); when empty
+    the critic prompt is byte-identical to the lenient-router prompt."""
 
     implement = task.mode == "implement"
     brief = CriticBrief(
@@ -589,7 +622,8 @@ def _critic_verdict(
         read_root=None if implement or critic_read_root is None else str(critic_read_root),
     )
     request = WorkerRequest(
-        task=task, task_id=task_id, mode=task.mode, scratch=scratch, critic=brief
+        task=task, task_id=task_id, mode=task.mode, scratch=scratch, critic=brief,
+        domain_skills=domain_skills,
     )
     try:
         with backends.slot(task.tier) as transport:
@@ -799,6 +833,7 @@ def run_task(
                 task, task_id, scratch=scratch, base=base,
                 artifact_rel=attempt.artifact_rel, handoff_text=attempt.handoff_text,
                 critic_read_root=critic_read_root, run_dir=run_dir, backends=backends,
+                domain_skills=domain_skills,
             )
         except CriticError as exc:
             _discard(repo, scratch, branch, implement)

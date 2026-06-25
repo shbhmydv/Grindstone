@@ -96,6 +96,60 @@ def test_build_planner_input_renders_every_context_field(run_dir: RunDir) -> Non
     assert "epoch must declare at least one task" in prompt
 
 
+def test_build_planner_input_injects_strategy_after_system_before_job(
+    run_dir: RunDir,
+) -> None:
+    strategy = "Build design tokens FIRST; decompose per-screen; fan out toward 8."
+    prompt = build_planner_input(
+        _raw_context(run_dir), domain_skill_index={}, strategy=strategy
+    )
+    # the advisory block appears exactly once, carries the non-override framing + text
+    assert prompt.count("<strategy_skill>") == 1
+    assert "Preferences, not permissions." in prompt
+    assert "those WIN on any conflict" in prompt
+    assert strategy in prompt
+    # positioned AFTER the byte-stable system preamble and BEFORE the job: the closing
+    # </system> tag, then the strategy block, then <job> (the system prefix stays cacheable)
+    assert "</system>\n<strategy_skill>" in prompt
+    sys_end = prompt.index("</system>")
+    assert prompt.index("<strategy_skill>") > sys_end
+    assert prompt.index("<strategy_skill>") < prompt.index("<job>")
+
+
+def test_build_planner_input_no_strategy_is_byte_identical(run_dir: RunDir) -> None:
+    # the no-strategy path must be byte-for-byte identical to NOT passing one at all (the
+    # prefix-cache invariant: an absent strategy adds zero bytes).
+    ctx = _raw_context(run_dir, baton="## Pending\nfoo\n")
+    base = build_planner_input(ctx, domain_skill_index={"rn-taste": "tasteful RN"})
+    with_empty = build_planner_input(
+        ctx, domain_skill_index={"rn-taste": "tasteful RN"}, strategy=""
+    )
+    assert with_empty == base
+    assert "<strategy_skill>" not in base
+    assert "</system>\n<job>" in base  # the seam is intact when no strategy
+
+
+def test_build_closeout_input_injects_strategy_after_system_before_job(
+    run_dir: RunDir,
+) -> None:
+    strategy = "Prioritise landing the harness next; scaffold before refine."
+    prompt = build_closeout_input(_closeout_context(run_dir), strategy=strategy)
+    assert prompt.count("<strategy_skill>") == 1
+    assert strategy in prompt
+    assert "Preferences, not permissions." in prompt
+    assert "</system>\n<strategy_skill>" in prompt
+    assert prompt.index("<strategy_skill>") < prompt.index("<job>")
+
+
+def test_build_closeout_input_no_strategy_is_byte_identical(run_dir: RunDir) -> None:
+    ctx = _closeout_context(run_dir)
+    base = build_closeout_input(ctx)
+    with_empty = build_closeout_input(ctx, strategy="")
+    assert with_empty == base
+    assert "<strategy_skill>" not in base
+    assert "</system>\n<job>" in base
+
+
 def test_planner_core_carries_backlog_and_scaffold_refine(run_dir: RunDir) -> None:
     # The PLAN preamble teaches the cross-epoch backlog (read the baton's ## Pending,
     # schedule a subset this epoch, record new deferred work in decision.pending) and the

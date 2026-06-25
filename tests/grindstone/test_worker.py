@@ -220,7 +220,7 @@ def test_critic_verdict_relocated_out_of_scratch(
     verdict = _critic_verdict(
         _implement(), "E1/T1", scratch=scratch, base=base, artifact_rel=None,
         handoff_text="", critic_read_root=git_repo, run_dir=run_dir,
-        backends=_backends(worker),
+        backends=_backends(worker), domain_skills={},
     )
     assert verdict.outcome == "PASS"
     # (a) the scratch original is GONE, (b) the keyed-log dest carries the content.
@@ -295,3 +295,74 @@ def test_critic_prompt_encodes_triage() -> None:
     assert "good enough to build on" in low
     assert "same worker" in low
     assert "pass" in low and "retry" in low and "escalate" in low
+
+
+def _critic_request(skills: dict[str, str]) -> "WorkerRequest":  # noqa: F821
+    from grindstone.worker import CriticBrief, WorkerRequest
+
+    return WorkerRequest(
+        task=_implement(), task_id="E1/T1", mode="implement", scratch=Path("/x"),
+        critic=CriticBrief(goal="create a.py", mode="implement", diff_base="HEAD~1"),
+        domain_skills=skills,
+    )
+
+
+def test_critic_prompt_renders_skills_rubric() -> None:
+    # The critic IS the "analyse" step: when the task selected domain skills, the
+    # critic must verify the work against them as the RUBRIC THE WORK CLAIMS TO MEET,
+    # and NOT be lenient on that conformance.
+    req = _critic_request({"rn-composition": "Compose screens from primitives."})
+    prompt = build_critic_prompt(req, req.critic)  # type: ignore[arg-type]
+    low = prompt.lower()
+    # The selected skill's name + body are present (retrieve-not-concatenate).
+    assert "rn-composition" in prompt
+    assert "compose screens from primitives." in low
+    # Critic-framed as a rubric, NOT lenient on conformance.
+    assert "rubric" in low
+    assert "do not be lenient" in low
+    # The additive strictness does NOT replace the lenient-router framing.
+    assert "good enough to build on" in low
+
+
+def test_critic_prompt_byte_identical_when_skill_less() -> None:
+    # SURGICAL: a skill-less critic keeps today's lenient-router prompt EXACTLY. The
+    # rubric block is absent and the lenient framing intact (byte-identical to before).
+    skilled = build_critic_prompt(_critic_request({"s": "x"}), _critic_request({"s": "x"}).critic)  # type: ignore[arg-type]
+    skill_less = build_critic_prompt(_critic_request({}), _critic_request({}).critic)  # type: ignore[arg-type]
+    assert "<rubric>" not in skill_less
+    assert "<rubric>" in skilled  # the rubric ONLY appears with skills present
+    # The lenient-router framing is preserved verbatim in the skill-less prompt.
+    low = skill_less.lower()
+    assert "good enough to build on" in low
+    assert "not to grade it" in low
+    assert "bias to pass when unsure" in low
+
+
+def test_critic_verdict_threads_domain_skills(git_repo: Path, run_dir: RunDir) -> None:
+    # The task's already-loaded domain skills must reach the critic dispatch so the
+    # critic can enforce them. Assert the request the transport receives carries them.
+    from grindstone.worker import (
+        CRITIC_VERDICT_FILENAME,
+        WorkerRequest,
+        _critic_verdict,
+    )
+
+    captured: list[dict[str, str]] = []
+
+    class _Recorder:
+        def run(self, request: WorkerRequest) -> None:
+            captured.append(dict(request.domain_skills))
+            (request.scratch / CRITIC_VERDICT_FILENAME).write_text(
+                json.dumps({"outcome": "PASS", "reason": "ok"}), encoding="utf-8"
+            )
+
+    base = wt.head_commit(git_repo)
+    scratch = run_dir.artifacts_dir("E1/T1/critic")
+    skills = {"rn-composition": "Compose screens from primitives."}
+    verdict = _critic_verdict(
+        _implement(), "E1/T1", scratch=scratch, base=base, artifact_rel=None,
+        handoff_text="", critic_read_root=git_repo, run_dir=run_dir,
+        backends=Backends.single(_Recorder()), domain_skills=skills,
+    )
+    assert verdict.outcome == "PASS"
+    assert captured == [skills]
