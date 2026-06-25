@@ -22,18 +22,27 @@ from typing import Callable
 import pytest
 
 from grindstone import worktree as wt
-from grindstone.contracts.models import EndDecision, Epoch, EpochDecision, Task
+from grindstone.contracts.models import (
+    Decision,
+    EndDecision,
+    Epoch,
+    EpochDecision,
+    Task,
+)
 from grindstone.events import (
     EpochCompleted,
     EpochStarted,
     JournalWriter,
     RunResumed,
     RunStarted,
+    TaskDone,
     TaskRef,
+    WorkGateRejected,
     read_events,
     replay,
 )
 from grindstone.loop import (
+    CloseoutContext,
     PlannerContext,
     make_acceptance,
     resume_run,
@@ -611,3 +620,293 @@ def test_planner_context_carries_tip_each_boundary(
     # Boundary 1 had no baton (first epoch); boundary 2 read E1's close-out baton.
     assert c0.baton == ""
     assert c1.baton == run_dir.read_baton(1) != ""
+
+
+# --- a control file NEVER leaks into the integration tree (>=3-epoch E2E) -------
+
+
+#: The grindstone-internal control files a faithful agent leaves in its scratch CWD
+#: but must NEVER let into the integrated tree: the worker's free-form report, the
+#: critic's verdict, and the local rig's per-CWD settings.
+_CONTROL_NAMES = {HANDOFF_FILENAME, CRITIC_VERDICT_FILENAME}
+
+
+def _control_leaks(tree: list[str]) -> list[str]:
+    """The control-file paths present in a tracked-tree listing (empty == clean): a
+    root-or-nested ``handoff.md`` / ``verdict.json``, or anything under ``.pi/``."""
+
+    return [
+        p for p in tree
+        if Path(p).name in _CONTROL_NAMES or p == ".pi/settings.json" or p.startswith(".pi/")
+    ]
+
+
+@dataclass
+class _FaithfulWorker:
+    """A worker that FAITHFULLY models the real agent's disk contract: on an implement
+    dispatch it writes the claimed files + a free-form ``handoff.md``, then does its
+    OWN ``git add -A && git commit`` IN-WORKTREE (via the production ``commit_all``),
+    exactly like the real pi agent. That self-commit is the leak vector: any stray
+    control file left in scratch is swept into a commit the way the real run swept in
+    ``.pi`` / ``verdict.json``, so the orchestrator's relocation (move-not-copy) is the
+    only thing keeping the report + verdict out of the integrated tree.
+
+    On a critic dispatch it writes ``verdict.json`` (PASS), or RETRY-then-PASS for a
+    task id in ``retry_then_pass`` so the incremental-retry CARRY path (the path the
+    verdict leak rides into a later attempt's scope check) is exercised inside a real
+    run. Concurrency-safe: the only shared state is the per-task critic counter, guarded
+    by a lock (this E2E fans out one task per epoch, so the counter never races)."""
+
+    retry_then_pass: frozenset[str] = frozenset()
+    _critic_calls: dict[str, int] = field(default_factory=dict)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def run(self, request: WorkerRequest) -> None:
+        if request.critic is not None:
+            self._critic(request)
+            return
+        for rel in request.task.file_ownership:
+            path = request.scratch / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                f"# {request.task_id}\nvalue = {request.task_id!r}\n", encoding="utf-8"
+            )
+        (request.scratch / HANDOFF_FILENAME).write_text(
+            f"# handoff {request.task_id}\nDONE\n", encoding="utf-8"
+        )
+        # The agent commits its own work in the worktree (the disk contract): this is
+        # the exact step that historically swept stray control files into the base.
+        wt.commit_all(request.scratch, f"agent self-commit {request.task_id}")
+
+    def _critic(self, request: WorkerRequest) -> None:
+        with self._lock:
+            n = self._critic_calls.get(request.task_id, 0)
+            self._critic_calls[request.task_id] = n + 1
+        retry = request.task_id in self.retry_then_pass and n == 0
+        outcome = "RETRY" if retry else "PASS"
+        (request.scratch / CRITIC_VERDICT_FILENAME).write_text(
+            json.dumps({"outcome": outcome, "reason": f"faithful {outcome}"}),
+            encoding="utf-8",
+        )
+
+
+def test_three_epoch_run_never_leaks_a_control_file(
+    git_repo: Path, run_dir: RunDir, job_path: Path
+) -> None:
+    # The control-file worktree-leak class: a faithful agent commits its scratch CWD
+    # (handoff.md + the critic's verdict.json live there), so if the orchestrator does
+    # not MOVE them out before/around the commit, one rides into the integration base
+    # and detonates a LATER epoch (inherited, then deleted -> a spurious out-of-scope
+    # rejection). Invisible to <=2-epoch runs, so this drives THREE real implement
+    # epochs; E2 takes a critic RETRY-then-PASS so the verdict's incremental-retry CARRY
+    # path is exercised (the leak point the critic move-not-copy fix governs).
+    planner = MockDecisionPlanner(
+        [
+            _epoch(_impl("T1", ["a.py"])),
+            _epoch(_impl("T1", ["b.py"])),
+            _epoch(_impl("T1", ["c.py"])),
+            _end("shipped three"),
+        ]
+    )
+    worker = _FaithfulWorker(retry_then_pass=frozenset({"E2/T1"}))
+    result = start_run(
+        job_path=job_path, run_dir=run_dir, repo=git_repo, planner=planner,
+        backends=_backends(worker), max_epochs=6,
+    )
+    assert result.status == "completed" and result.epochs == 3
+
+    events = read_events(run_dir.events_path)
+    # INVARIANT (no spurious rejection): a leaked control file inherited by a later
+    # epoch and then deleted would surface as an out-of-scope gate rejection. None must
+    # fire across the whole run, so every epoch's task reaches DONE.
+    rejections = [e for e in events if isinstance(e, WorkGateRejected)]
+    assert rejections == [], (
+        "spurious out-of-scope rejection(s): "
+        f"{[(e.task_id, e.reason) for e in rejections]}"
+    )
+    done = [e for e in events if isinstance(e, TaskDone)]
+    assert len(done) == 3  # all three epochs' owned tasks passed and merged
+
+    # INVARIANT (clean tip after EVERY epoch): the planner context's ``tip_ref`` IS the
+    # run-branch tip the loop rebuilt at each boundary, so checking each one asserts the
+    # integrated tree carried ONLY task-owned files, never a control file, after E1/E2/E3.
+    for ctx in planner.contexts:
+        if ctx.tip_ref is None:
+            continue
+        leaks = _control_leaks(wt.list_tree(git_repo, ctx.tip_ref))
+        assert leaks == [], f"control file leaked into tip {ctx.tip_ref}: {leaks}"
+
+    # The work itself landed: all three owned files are on the final run branch, and the
+    # final tree is still free of every control file.
+    tip = wt.list_tree(git_repo, "grind/run-1")
+    assert {"a.py", "b.py", "c.py"} <= set(tip)
+    assert _control_leaks(tip) == []
+
+
+# --- the cross-epoch work backlog (decision.pending -> baton ## Pending) --------
+
+
+def _epoch_with_pending(
+    *tasks: Task, pending: list[str], title: str = "scaffold"
+) -> EpochDecision:
+    return EpochDecision(
+        kind="epoch",
+        epoch=Epoch(title=title, tasks=list(tasks)),
+        pending=pending,
+    )
+
+
+def test_decision_pending_is_wired_into_closeout_context(
+    git_repo: Path, run_dir: RunDir, job_path: Path
+) -> None:
+    # The loop must surface the plan's decision.pending additions to the SOLE baton
+    # writer (close-out), so the backlog can be reconciled there. The plan stage NEVER
+    # writes the baton (the atomic-finalize invariant: EpochCompleted implies baton).
+    additions = ["refine a.py to taste later (senior)", "add integration tests later"]
+    planner = MockDecisionPlanner(
+        [_epoch_with_pending(_impl("T1", ["a.py"]), pending=additions), _end("done")]
+    )
+    result = start_run(
+        job_path=job_path, run_dir=run_dir, repo=git_repo, planner=planner,
+        backends=_backends(LoopWorker()), max_epochs=5,
+    )
+    assert result.status == "completed"
+    assert len(planner.closeout_contexts) == 1
+    assert list(planner.closeout_contexts[0].pending_additions) == additions
+
+
+def _pending_items(baton: str) -> list[str]:
+    """The bullets under a baton's ``## Pending`` section (the persisted backlog)."""
+
+    items: list[str] = []
+    in_section = False
+    for line in baton.splitlines():
+        if line.startswith("## "):
+            in_section = line.strip() == "## Pending"
+            continue
+        if in_section and line.strip().startswith("- "):
+            items.append(line.strip()[2:].strip())
+    return items
+
+
+def _item_tag(item: str) -> str:
+    """The leading ``T<k>:`` tag a test backlog item carries (the short id of the task
+    scheduled to drain it), or ``""`` for a fresh, not-yet-scheduled addition."""
+
+    head = item.split(":", 1)[0].strip()
+    return head if head.startswith("T") and head[1:].isdigit() else ""
+
+
+@dataclass
+class _ReconcilingPlanner:
+    """A loop planner whose close-out performs the DETERMINISTIC backlog reconcile from
+    the context the loop hands it: the new ``## Pending`` is (prior ``## Pending``) +
+    (this decision's pending additions) MINUS (prior items whose scheduled task PASSED).
+
+    "Scheduled-and-passed" is the real model's handoff-read; here it is the test
+    convention that a prior backlog item is tagged with the short id of the task meant to
+    drain it (``"T2: ..."``), and close-out drops it IFF that task PASSED (read from the
+    DETERMINISTIC per-task outcomes, never a guess), so a FAILED scheduled item auto-carries.
+    """
+
+    script: list[Decision]
+    closeout_contexts: list[CloseoutContext] = field(default_factory=list)
+    _calls: int = 0
+
+    def decide(self, context: PlannerContext) -> Decision:
+        entry = self.script[self._calls]
+        self._calls += 1
+        return entry
+
+    def close_out(self, context: CloseoutContext) -> str:
+        self.closeout_contexts.append(context)
+        passed = {
+            o.task_id.rsplit("/", 1)[-1]
+            for o in context.task_outcomes
+            if o.outcome == "passed"
+        }
+        kept = [
+            it for it in _pending_items(context.prior_baton)
+            if _item_tag(it) not in passed
+        ]
+        kept += list(context.pending_additions)
+        body = "\n".join(f"- {it}" for it in kept) or "- (none)"
+        return (
+            "## Project summary\nreconcile demo\n## Tasks done\n- work merged\n"
+            f"## Pending\n{body}\n## Current status\nepoch closed\n"
+        )
+
+
+@dataclass
+class _PerTaskCriticWorker:
+    """A LoopWorker variant whose critic ESCALATEs the (fully-qualified) task ids in
+    ``escalate`` and PASSes the rest, so a scheduled backlog item can be driven to a
+    deterministic FAILED outcome (the auto-carry path). Every implement dispatch writes
+    its claimed files (keyed on the task id, so re-scaffolding an existing file is a real
+    diff) plus a free-form handoff."""
+
+    escalate: frozenset[str] = frozenset()
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def run(self, request: WorkerRequest) -> None:
+        if request.critic is not None:
+            outcome = "ESCALATE" if request.task_id in self.escalate else "PASS"
+            (request.scratch / CRITIC_VERDICT_FILENAME).write_text(
+                json.dumps({"outcome": outcome, "reason": f"per-task {outcome}"}),
+                encoding="utf-8",
+            )
+            return
+        for rel in request.task.file_ownership:
+            path = request.scratch / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                f"# {request.task_id}\nvalue = {request.task_id!r}\n", encoding="utf-8"
+            )
+        (request.scratch / HANDOFF_FILENAME).write_text(
+            f"# handoff {request.task_id}\nDONE\n", encoding="utf-8"
+        )
+
+
+def test_backlog_reconcile_union_minus_passed_and_auto_carry(
+    git_repo: Path, run_dir: RunDir, job_path: Path
+) -> None:
+    # E1 scaffolds a.py + b.py (both pass) and records TWO refine items as pending
+    # additions (tagged with the task that will drain each). E2 schedules both refines:
+    # T1 (a.py) PASSES, T2 (b.py) ESCALATES. The close-out reconcile must drop the
+    # passed-and-scheduled item (T1) and CARRY the failed one (T2), based ONLY on the
+    # deterministic per-task outcomes the loop hands it.
+    e1 = _epoch_with_pending(
+        _impl("T1", ["a.py"]), _impl("T2", ["b.py"]),
+        pending=[
+            "T1: refine a.py to taste (senior)",
+            "T2: refine b.py to taste (senior)",
+        ],
+        title="scaffold a + b",
+    )
+    e2 = _epoch_with_pending(
+        _impl("T1", ["a.py"]), _impl("T2", ["b.py"]),
+        pending=[], title="refine a + b",
+    )
+    planner = _ReconcilingPlanner([e1, e2, _end("shipped")])
+    worker = _PerTaskCriticWorker(escalate=frozenset({"E2/T2"}))
+    result = start_run(
+        job_path=job_path, run_dir=run_dir, repo=git_repo, planner=planner,
+        backends=_backends(worker), max_epochs=6,
+    )
+    assert result.status == "completed" and result.epochs == 2
+
+    # E1's baton: the backlog is the UNION of the (empty) prior + the two additions.
+    e1_pending = _pending_items(run_dir.read_baton(1))
+    assert e1_pending == [
+        "T1: refine a.py to taste (senior)",
+        "T2: refine b.py to taste (senior)",
+    ]
+    # E2's baton: T1 was scheduled AND passed -> dropped; T2 was scheduled but ESCALATED
+    # -> auto-carried. The reconcile read "done" from the gate outcomes, not a guess.
+    e2_pending = _pending_items(run_dir.read_baton(2))
+    assert e2_pending == ["T2: refine b.py to taste (senior)"]
+    # The close-out saw the deterministic per-task outcomes it reconciled on.
+    e2_outcomes = {
+        o.task_id: o.outcome for o in planner.closeout_contexts[1].task_outcomes
+    }
+    assert e2_outcomes == {"E2/T1": "passed", "E2/T2": "escalated"}

@@ -12,6 +12,7 @@ never touch the operator checkout).
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -200,6 +201,68 @@ def test_worktree_isolation_external_base(git_repo: Path, run_dir: RunDir) -> No
     )
     # Nothing the worker wrote landed in the live repo working tree.
     assert not (git_repo / "a.py").exists()
+
+
+# --- orchestration-file hygiene: nothing internal lingers in scratch -----------
+
+
+def test_critic_verdict_relocated_out_of_scratch(
+    git_repo: Path, run_dir: RunDir
+) -> None:
+    # The critic writes verdict.json into scratch; the orchestrator MOVES it to the
+    # keyed log (copy + remove). A lingering scratch verdict.json would be swept into
+    # the next implement commit and poison the integration base (cross-epoch bug).
+    from grindstone.worker import CRITIC_VERDICT_FILENAME, _critic_verdict
+
+    base = wt.head_commit(git_repo)
+    scratch = run_dir.artifacts_dir("E1/T1/critic")
+    worker = MockWorker(script=["PASS"])
+    verdict = _critic_verdict(
+        _implement(), "E1/T1", scratch=scratch, base=base, artifact_rel=None,
+        handoff_text="", critic_read_root=git_repo, run_dir=run_dir,
+        backends=_backends(worker),
+    )
+    assert verdict.outcome == "PASS"
+    # (a) the scratch original is GONE, (b) the keyed-log dest carries the content.
+    assert not (scratch / CRITIC_VERDICT_FILENAME).exists()
+    dest = run_dir.resolve(f"E1/T1/{CRITIC_VERDICT_FILENAME}")
+    assert dest.is_file()
+    assert json.loads(dest.read_text())["outcome"] == "PASS"
+
+
+def test_relocate_handoff_oversized_is_removed(
+    run_dir: RunDir, tmp_path: Path
+) -> None:
+    # A pathologically-large free-form report is DROPPED (never parsed), but must
+    # still be removed from scratch so it cannot be swept into a commit.
+    from grindstone.worker import (
+        _DISK_READ_MAX_BYTES,
+        HANDOFF_FILENAME,
+        _relocate_handoff,
+    )
+
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    (scratch / HANDOFF_FILENAME).write_text(
+        "x" * (_DISK_READ_MAX_BYTES + 1), encoding="utf-8"
+    )
+    path, text = _relocate_handoff(scratch, run_dir=run_dir, task_id="E1/T1")
+    assert path is None and text == ""
+    assert not (scratch / HANDOFF_FILENAME).exists()
+
+
+def test_relocate_handoff_normal_is_moved(run_dir: RunDir, tmp_path: Path) -> None:
+    from grindstone.worker import HANDOFF_FILENAME, _relocate_handoff
+
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    (scratch / HANDOFF_FILENAME).write_text("# report\n", encoding="utf-8")
+    path, text = _relocate_handoff(scratch, run_dir=run_dir, task_id="E1/T1")
+    assert path is not None and path.is_file()
+    assert text == "# report\n"
+    # Moved, not copied: gone from scratch, present at the keyed-log dest.
+    assert not (scratch / HANDOFF_FILENAME).exists()
+    assert run_dir.resolve(f"E1/T1/{HANDOFF_FILENAME}").read_text() == "# report\n"
 
 
 # --- the critic prompt encodes the triage --------------------------------------

@@ -169,6 +169,61 @@ def test_decision_schema_matches_pydantic() -> None:
         parse_decision(bad)
 
 
+# --- the cross-epoch work backlog (decision.pending) ---------------------------
+
+
+def test_epoch_decision_carries_pending_backlog() -> None:
+    """The planner's additions to the persisted backlog ride the decision as an
+    optional ``pending`` list of short prose descriptions of deferred future work."""
+
+    payload = _epoch_payload()
+    payload["pending"] = [
+        "refine the Welcome screen to taste (senior), after its scaffold lands",
+        "wire navigation once the screens exist",
+    ]
+    decision = parse_decision(payload)
+    assert isinstance(decision, EpochDecision)
+    assert decision.pending == [
+        "refine the Welcome screen to taste (senior), after its scaffold lands",
+        "wire navigation once the screens exist",
+    ]
+
+
+def test_epoch_decision_pending_defaults_empty() -> None:
+    """``pending`` is OPTIONAL: a decision that names none round-trips to an empty
+    list (the additive field never breaks an existing planner)."""
+
+    decision = parse_decision(_epoch_payload())
+    assert isinstance(decision, EpochDecision)
+    assert decision.pending == []
+
+
+def test_epoch_decision_rejects_oversized_pending() -> None:
+    """``pending`` is bounded like its sibling list fields (a sane maxItems)."""
+
+    payload = _epoch_payload()
+    payload["pending"] = [f"deferred item {i}" for i in range(17)]  # over the cap
+    with pytest.raises(ValidationError):
+        parse_decision(payload)
+
+
+def test_pending_backlog_matches_schema() -> None:
+    """The additive ``pending`` field is mirrored in the wire schema: a conforming
+    payload passes BOTH layers, an over-cap one fails BOTH (no model/schema drift)."""
+
+    validator = _decision_validator()
+    good = _epoch_payload()
+    good["pending"] = ["refine X to taste in a later epoch (senior)"]
+    assert list(validator.iter_errors(good)) == []
+    parse_decision(good)
+
+    bad = _epoch_payload()
+    bad["pending"] = [f"item {i}" for i in range(17)]
+    assert list(validator.iter_errors(bad)) != []
+    with pytest.raises(ValidationError):
+        parse_decision(bad)
+
+
 # --- verdict: lenient triage ---------------------------------------------------
 
 

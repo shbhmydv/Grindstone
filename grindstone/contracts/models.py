@@ -160,10 +160,22 @@ class Epoch(_Frozen):
 
 
 class EpochDecision(_Frozen):
-    """Propose one epoch to grind."""
+    """Propose one epoch to grind.
+
+    ``pending`` is the planner's ADDITIONS to the persisted cross-epoch work backlog:
+    short prose lines of deferred FUTURE work (e.g. "refine the Welcome screen to taste
+    (senior), after its scaffold lands"). The close-out (the sole baton writer) folds
+    them into the baton's ``## Pending`` section so a multi-epoch plan survives the
+    boundary without being re-derived; the additions MAY exceed the tasks scheduled this
+    epoch. Optional + bounded like the sibling list fields; empty by default.
+    """
 
     kind: Literal["epoch"]
     epoch: Epoch
+    pending: Annotated[
+        list[Annotated[str, StringConstraints(min_length=1, max_length=512)]],
+        Field(max_length=16),
+    ] = Field(default_factory=list)
 
 
 class EndDecision(_Frozen):

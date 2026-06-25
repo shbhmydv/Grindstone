@@ -528,33 +528,20 @@ def _relocate_handoff(
     ``(None, "")`` and let the critic judge the actual work."""
 
     src = scratch / HANDOFF_FILENAME
-    if not src.is_file() or src.stat().st_size > _DISK_READ_MAX_BYTES:
+    if not src.is_file():
+        return None, ""
+    if src.stat().st_size > _DISK_READ_MAX_BYTES:
+        src.unlink()  # oversized report: dropped (never parsed), never committed
         return None, ""
     try:
         text = src.read_text(encoding="utf-8", errors="replace")
     except OSError:
+        src.unlink(missing_ok=True)
         return None, ""
     dest = run_dir.resolve(f"{task_id}/{HANDOFF_FILENAME}")
     dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(src, dest)
+    shutil.move(str(src), str(dest))
     return dest, text
-
-
-# --- orchestration-file hygiene ------------------------------------------------
-
-
-def _strip_orchestration_files(scratch: Path) -> None:
-    """Drop the metadata an implement worker leaves in its scratch (the free-form
-    handoff, any critic verdict, and the worker's per-cwd ``.pi/settings.json``) so
-    none of it enters a commit or trips the scope check."""
-
-    for name in (HANDOFF_FILENAME, CRITIC_VERDICT_FILENAME):
-        (scratch / name).unlink(missing_ok=True)
-    settings = scratch / ".pi" / "settings.json"
-    settings.unlink(missing_ok=True)
-    pi_dir = settings.parent
-    if pi_dir.is_dir() and not any(pi_dir.iterdir()):
-        pi_dir.rmdir()
 
 
 # --- the per-task unit ---------------------------------------------------------
@@ -621,7 +608,7 @@ def _critic_verdict(
         raise CriticError(f"{CRITIC_VERDICT_FILENAME} invalid: {exc}") from exc
     dest = run_dir.resolve(f"{task_id}/{CRITIC_VERDICT_FILENAME}")
     dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(verdict_file, dest)
+    shutil.move(str(verdict_file), str(dest))  # remove from scratch: never committed
     return verdict
 
 
@@ -652,8 +639,9 @@ def _run_attempt(
     events: AttemptEvents | None,
 ) -> _AttemptOutput:
     """Dispatch one worker attempt and gate it on DETERMINISTIC FACTS. For an
-    implement task: relocate the free-form handoff, strip orchestration, commit,
-    scope-check against the EPOCH base, and reject a zero-diff commit. For a non-write
+    implement task: relocate the free-form handoff (always removed from scratch),
+    commit, scope-check against the EPOCH base, and reject a zero-diff commit. For a
+    non-write
     task: ensure the ``artifact_out`` file exists and publish it to its log key.
     Raises ``_Rejected`` on any gate failure; lets ``RateLimited`` escape. The
     handoff report is NEVER parsed.
@@ -694,7 +682,6 @@ def _run_attempt(
 
     if implement:
         assert repo is not None and epoch_base is not None
-        _strip_orchestration_files(scratch)
         wt.commit_all(scratch, f"grind({task_id}): {task.goal.splitlines()[0][:72]}")
         changed = wt.changed_paths(scratch, epoch_base)
         if not changed:
@@ -880,7 +867,6 @@ def _carry_partial(
 
     if not implement or repo is None or branch is None:
         return None
-    _strip_orchestration_files(scratch)
     wt.commit_all(scratch, f"grind-wip({task_id}): partial kept for retry")
     wt.remove_worktree(repo, scratch)
     return branch

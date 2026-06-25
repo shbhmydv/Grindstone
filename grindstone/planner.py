@@ -130,7 +130,7 @@ step; your turn still ends with exactly one decision.
 
 YOUR DECISION. Emit EXACTLY ONE JSON object and nothing else (no prose, no second
 object, no markdown fence), ONE of two shapes:
-  EPOCH: {"kind":"epoch","epoch":{"title":"..","tasks":[ .. ],"setup":[ .. ]}}
+  EPOCH: {"kind":"epoch","epoch":{"title":"..","tasks":[ .. ],"setup":[ .. ]},"pending":[ .. ]}
   END:   {"kind":"end","summary":".."}
 
 Rules for every decision:
@@ -141,11 +141,26 @@ Rules for every decision:
   at the epoch boundary. So if a task would need anything another task produces (code
   under test, a module to import, an interface to build on), it does NOT belong in this
   epoch: schedule the producer now and let the NEXT epoch, which sees it merged, do the
-  consumer. Tests come after the code they test; integration after its parts. Each task
+  consumer. Tests come after the code they test; integration after its parts.
+  SPLIT LIBERALLY within that constraint: prefer MANY small independent tasks over a few
+  big ones - decompose to the finest grain that stays dependency-free (one task per
+  screen, per module, per component group, per report) and fill the fan-out toward the
+  8-task ceiling whenever independent work exists. A task that bundles several independent
+  pieces is a wasted fan-out: break it apart. More tasks puts more work on the cheap local
+  tier, leaves fewer pieces big enough to need senior, and takes fewer TOTAL epochs - so
+  fewer planner boundaries, each of which would otherwise reprocess a growing baton and log.
+  Each task
   carries: an id ("T1".."T8"); a mode (implement | research
   | review | artifact); a routing tier ("local", the default, for mechanical or
   checkable work; "senior" for judgment, taste, synthesis, or visual quality); and a
-  prose goal that states the task's OWN notion of done.
+  prose goal that states the task's OWN notion of done. Default every task to "local"
+  and JUSTIFY each "senior" - it is the scarce, expensive tier. A taste-critical FEATURE
+  is not a wholesale-"senior" feature: split its mechanical substrate (literal
+  transcription of spec'd values into tokens/constants, type definitions, config,
+  scaffolding - work with one correct answer) into "local" tasks, and reserve "senior"
+  for the slices where judgment changes the output (component feel, layout, composition,
+  visual quality). Do not route a whole subsystem to "senior" because part of it needs
+  taste.
   * implement tasks declare file_ownership: a list of CONCRETE files (>= 1) the task may
     create or edit. Ownership across the epoch MUST be DISJOINT; the state machine
     refuses to integrate an overlap. Enumerate real files; never claim a subtree or a
@@ -153,6 +168,26 @@ Rules for every decision:
   * research / review / artifact tasks declare artifact_out: the ONE log key the
     deliverable lands at (a report, a verdict, a rendered image - artifacts may be
     visual). They do not own or edit tree files.
+- Carry a living BACKLOG across epochs. The baton below has a "## Pending" section: the
+  deferred work you recorded in earlier epochs but have not done yet. READ it and treat it
+  as your standing to-do list. THIS epoch, SCHEDULE a SUBSET of those pending items as
+  tasks (fill the fan-out toward the 8-task ceiling whenever the pending items are
+  independent of each other), and record any NEW deferred work you are NOT doing yet in
+  this decision's "pending" field - one short prose line per item (it MAY list more than
+  you scheduled this epoch). There is no drain quota: the backlog is self-balancing (a
+  heavy backlog simply fills all 8 slots and drains fast), so do not try to empty it in
+  one epoch. The close-out reconciles the backlog deterministically (it removes a pending
+  item only when a task that addressed it PASSED the gate), so a pending item you schedule
+  but that fails is carried for you automatically; just keep recording genuinely new work.
+- SCAFFOLD now, REFINE later to keep judgment work small (a GENERIC decomposition). When a
+  task would route to "senior" but most of its body is routine implementation that cannot
+  be cleanly carved into its own "local" task, SPLIT IT ACROSS EPOCHS: a SCAFFOLD task
+  THIS epoch ("local") that builds the complete, correct structure, and a REFINE task in a
+  LATER epoch ("senior") that owns the SAME files and elevates ONLY the judgment layer
+  against the merged result. Record the refine as a "pending" addition now; do NOT
+  schedule it in the same epoch as its scaffold (a refine owning the scaffold's files is a
+  same-epoch ownership overlap the merge gate refuses, and it could not see the scaffold
+  anyway - siblings cannot read each other's output).
 - Declare HOST-GLOBAL prep as SETUP. If an epoch needs a host-level mutation (a
   system-wide tool, a shared directory outside the repo), list it in the epoch's "setup":
   the trusted state machine runs those, in order, before the tasks. Setup runs in a
@@ -208,9 +243,16 @@ Free-form markdown, but ALWAYS these four sections:
   What is genuinely complete and merged (not just attempted). Be concrete - name the
   capability or files, not the task ids.
 
-  ## Tasks pending
-  What still needs doing to meet the job, including anything a failure this epoch left
-  undone. This is your to-do list to your next self.
+  ## Pending
+  The persisted work BACKLOG your next PLAN schedules from: short, actionable lines of
+  deferred work (one bullet each; name the routing tier when it matters, e.g. "(senior)").
+  RECONCILE it deterministically, do not rewrite it from scratch: the new backlog is the
+  prior baton's ## Pending, PLUS this epoch's planned additions (listed below as
+  <pending_additions>), PLUS any new undone work this epoch surfaced, MINUS every prior
+  backlog item that was scheduled as a task this epoch AND whose task PASSED the gate.
+  Base "done" ONLY on the per-task outcomes in the epoch report (read the handoffs to see
+  which backlog item a task addressed); NEVER on your own guess. A backlog item whose
+  scheduled task FAILED (escalated, or never merged) STAYS IN THE BACKLOG - carry it.
 
   ## Current status
   The honest now: what this epoch changed, and for every failure, YOUR read of its nature
@@ -343,6 +385,28 @@ def _epoch_report_block(context: CloseoutContext) -> str:
     return "\n".join(lines)
 
 
+def _pending_additions_block(context: CloseoutContext) -> str:
+    """The plan's ``decision.pending`` additions (this epoch's new deferred work). The
+    close-out folds them INTO the baton's ## Pending backlog (union with the prior
+    ## Pending, minus prior items a task this epoch scheduled AND passed). Always
+    rendered (the empty case is noted) so the model is never left guessing."""
+
+    if not context.pending_additions:
+        return (
+            "<pending_additions>\n"
+            "  (none: the plan recorded no new deferred work this epoch)\n"
+            "</pending_additions>\n"
+        )
+    items = "\n".join(f"  - {p}" for p in context.pending_additions)
+    return (
+        "<pending_additions>\n"
+        "NEW deferred work the plan recorded this epoch (the decision's pending field). "
+        "Fold these INTO the baton's ## Pending backlog (UNION with the prior ## Pending, "
+        "then MINUS any prior backlog item a task this epoch scheduled AND passed):\n"
+        f"{items}\n</pending_additions>\n"
+    )
+
+
 _CLOSEOUT_TOOLS_BLOCK = (
     "<tools>\n"
     "Your workdir is a checkout of this epoch's staging tree. GREP and READ it, and "
@@ -361,9 +425,10 @@ def build_closeout_input(
 
     ``CLOSEOUT_PREAMBLE`` (byte-stable, and it already carries the four-section baton
     skeleton) then the volatile tail: the job, the prior baton, the epoch report (the
-    deterministic outcomes + keyed-log pointers), the domain-skill catalogue index
-    (so the baton's pending list can name a skill the next epoch will select), the
-    tools/vision note, and the request to write ``./baton.md``.
+    deterministic outcomes + keyed-log pointers), this epoch's ``decision.pending``
+    additions (so the ## Pending backlog can be reconciled here, the sole baton write),
+    the domain-skill catalogue index (so the baton's pending list can name a skill the
+    next epoch will select), the tools/vision note, and the request to write ``./baton.md``.
     """
 
     skills = _domain_skills_block(domain_skill_index or {})
@@ -372,6 +437,7 @@ def build_closeout_input(
         f"<job>\n{context.job}\n</job>\n"
         f"{_prior_baton_block(context)}"
         f"{_epoch_report_block(context)}"
+        f"{_pending_additions_block(context)}"
         f"{skills}"
         f"{_CLOSEOUT_TOOLS_BLOCK}"
         "<request>\n"

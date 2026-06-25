@@ -121,7 +121,7 @@ def test_boundary_with_prior_baton_conforms(rig: str) -> None:
         baton=(
             "## Project summary\nBuilding the TODO app.\n"
             "## Tasks done\n- (none yet)\n"
-            "## Tasks pending\n- the add/list/done commands + tests\n"
+            "## Pending\n- the add/list/done commands + tests\n"
             "## Current status\nE1/T1 escalated: pytest is not installed in the "
             "environment; an implement task must install it inside its own worktree.\n"
         ),

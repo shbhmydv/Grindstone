@@ -18,7 +18,14 @@
       "additionalProperties": false,
       "properties": {
         "kind": { "const": "epoch" },
-        "epoch": { "$ref": "#/$defs/epoch" }
+        "epoch": { "$ref": "#/$defs/epoch" },
+        "pending": {
+          "type": "array",
+          "maxItems": 16,
+          "default": [],
+          "description": "This epoch's ADDITIONS to the persisted work backlog: short prose descriptions of deferred FUTURE work the close-out folds into the baton's ## Pending section (the next plan schedules a subset from it). May exceed the tasks scheduled this epoch.",
+          "items": { "type": "string", "minLength": 1, "maxLength": 512 }
+        }
       }
     },
     "end_decision": {

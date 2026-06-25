@@ -53,24 +53,10 @@ handle_out="$(cd "$(dirname "$handle_out")" && pwd)/$(basename "$handle_out")"
 # your agent routes to your local endpoint).
 provider="${GRINDSTONE_LOCAL_PROVIDER:-local-reviewer}"; model="${GRINDSTONE_LOCAL_MODEL:-qwen-3-6-27b-dense}"
 
-# Pin pi-subagents spawned by this worker (the implement plan's `reviewer`) to
-# THIS endpoint's model. pi-subagents does NOT inherit our --provider/--model; it
-# reads the nearest `.pi/settings.json` up the tree and treats that dir as the
-# project root, so writing it into the worktree makes the reviewer run on the same
-# local model instead of silently falling back to the cloud default. Grindstone
-# strips this file (by relpath) before commit, so it never enters the diff.
-mkdir -p "$worktree/.pi"
-cat > "$worktree/.pi/settings.json" <<EOF
-{
-  "subagents": {
-    "agentOverrides": {
-      "reviewer": {
-        "model": "$provider/$model"
-      }
-    }
-  }
-}
-EOF
+# pi-subagents spawned by this worker (the implement plan's `reviewer`) are pinned
+# to the local endpoint via the machine-global ~/.pi/agent/settings.json, NOT a
+# per-worktree file: writing settings into the worktree leaked it into the gated
+# diff (a cross-epoch poison once inherited), so the routing lives outside the tree.
 
 # Write the killable process-group id BEFORE grinding so stop.sh can always reap
 # us. Grindstone launches this script with start_new_session=True, so pi (and the

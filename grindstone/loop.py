@@ -198,6 +198,11 @@ class CloseoutContext:
     task_outcomes: tuple[TaskOutcome, ...]
     setup_error: str | None
     integration_conflict: str | None
+    #: This epoch's planned ADDITIONS to the cross-epoch work backlog (the plan's
+    #: ``decision.pending``). The close-out (the SOLE baton writer) reconciles these +
+    #: the prior baton's ``## Pending`` against the deterministic per-task outcomes into
+    #: the new ``## Pending``. Empty by default (an EndDecision never reaches close-out).
+    pending_additions: tuple[str, ...] = ()
 
 
 class Planner(Protocol):
@@ -878,6 +883,7 @@ def _drive(
                 task_outcomes=_task_outcomes(results, tasks_by_id),
                 setup_error=setup_err,
                 integration_conflict=staging.conflict,
+                pending_additions=tuple(decision.pending),
             )
             # CLOSE-OUT (node #1 parks): a RateLimited escapes to the handler below,
             # which razes + restarts the whole epoch (no advance). The baton is written

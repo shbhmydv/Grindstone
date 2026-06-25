@@ -67,7 +67,7 @@ def _raw_context(run_dir: RunDir, *, baton: str = "") -> PlannerContext:
 
 def test_build_planner_input_renders_every_context_field(run_dir: RunDir) -> None:
     ctx = _raw_context(
-        run_dir, baton="## Tasks pending\nT2 escalated: missing dep foo\n"
+        run_dir, baton="## Pending\nT2 escalated: missing dep foo\n"
     )
     prompt = build_planner_input(
         ctx,
@@ -94,6 +94,21 @@ def test_build_planner_input_renders_every_context_field(run_dir: RunDir) -> Non
     assert "GREP and READ it to ground your plan" in prompt
     # the re-ask feedback
     assert "epoch must declare at least one task" in prompt
+
+
+def test_planner_core_carries_backlog_and_scaffold_refine(run_dir: RunDir) -> None:
+    # The PLAN preamble teaches the cross-epoch backlog (read the baton's ## Pending,
+    # schedule a subset this epoch, record new deferred work in decision.pending) and the
+    # GENERIC scaffold-then-refine decomposition (a senior-bodied-but-mostly-routine task
+    # splits into a local SCAFFOLD now + a senior REFINE in a LATER epoch over the SAME
+    # files, recorded as a pending addition, never scheduled with its scaffold).
+    prompt = build_planner_input(_raw_context(run_dir), domain_skill_index={})
+    assert "## Pending" in prompt  # the backlog section it reads from the baton
+    assert '"pending"' in prompt  # the decision field it records new deferred work in
+    low = prompt.lower()
+    assert "scaffold" in low and "refine" in low
+    assert "later epoch" in low
+    assert "same files" in low
 
 
 def test_planner_core_reframes_setup_as_host_global(run_dir: RunDir) -> None:
@@ -163,6 +178,9 @@ def _closeout_context(run_dir: RunDir) -> CloseoutContext:
         ),
         setup_error=None,
         integration_conflict=None,
+        pending_additions=(
+            "refine the Welcome screen to taste (senior), after its scaffold lands",
+        ),
     )
 
 
@@ -171,9 +189,10 @@ def test_build_closeout_input_renders_report_and_skeleton(run_dir: RunDir) -> No
         _closeout_context(run_dir),
         domain_skill_index={"rn-taste": "tasteful RN component conventions"},
     )
-    # the close-out preamble + the four-section baton skeleton it carries
+    # the close-out preamble + the four-section baton skeleton it carries (the third
+    # section is the persisted work BACKLOG the next PLAN schedules from)
     assert "closing out the epoch you just ran" in prompt
-    for section in ("## Project summary", "## Tasks done", "## Tasks pending",
+    for section in ("## Project summary", "## Tasks done", "## Pending",
                     "## Current status"):
         assert section in prompt
     # the job + the prior baton (the planner's memory to reconcile against)
@@ -188,6 +207,35 @@ def test_build_closeout_input_renders_report_and_skeleton(run_dir: RunDir) -> No
     assert "./baton.md" in prompt
     # the domain catalogue is offered (the pending list can name a skill to select next)
     assert "rn-taste" in prompt
+
+
+def test_build_closeout_input_surfaces_pending_additions_and_reconcile(
+    run_dir: RunDir,
+) -> None:
+    # The close-out is the SOLE baton writer + the SOLE reconciler of the backlog: it
+    # must see the plan's decision.pending additions AND be told the deterministic rule
+    # (union with the prior ## Pending, minus prior items scheduled-and-passed; failed
+    # items auto-carry; "done" reads ONLY the per-task outcomes, never the model's guess).
+    prompt = build_closeout_input(_closeout_context(run_dir))
+    # the additions are surfaced verbatim for the model to fold in
+    assert "refine the Welcome screen to taste (senior), after its scaffold lands" in prompt
+    # the reconcile instruction (gate-grounded, not model-judged)
+    low = prompt.lower()
+    assert "minus" in low
+    assert "passed" in low  # done is the deterministic per-task outcome
+    assert "stays in the backlog" in low or "carry" in low  # failed-item auto-carry
+
+
+def test_build_closeout_input_handles_no_pending_additions(run_dir: RunDir) -> None:
+    ctx = _closeout_context(run_dir)
+    ctx = CloseoutContext(
+        job=ctx.job, repo=ctx.repo, run_dir=ctx.run_dir, staging_ref=ctx.staging_ref,
+        prior_baton=ctx.prior_baton, epoch_index=ctx.epoch_index, epoch_id=ctx.epoch_id,
+        title=ctx.title, task_outcomes=ctx.task_outcomes, setup_error=None,
+        integration_conflict=None, pending_additions=(),
+    )
+    prompt = build_closeout_input(ctx)
+    assert "<pending_additions>" in prompt  # the block is always present (empty noted)
 
 
 def test_build_closeout_input_surfaces_setup_and_conflict(run_dir: RunDir) -> None:

@@ -57,7 +57,7 @@ def render_mock_baton(context: "CloseoutContext") -> str:
         "## Tasks done",
     ]
     lines += [f"- {o.task_id} ({o.mode}) passed" for o in done] or ["- (none this epoch)"]
-    lines.append("## Tasks pending")
+    lines.append("## Pending")
     lines += [
         f"- {o.task_id} {o.outcome}: {o.reason}" for o in pending
     ] or ["- (none)"]
