@@ -910,3 +910,100 @@ def test_backlog_reconcile_union_minus_passed_and_auto_carry(
         o.task_id: o.outcome for o in planner.closeout_contexts[1].task_outcomes
     }
     assert e2_outcomes == {"E2/T1": "passed", "E2/T2": "escalated"}
+
+
+# --- run-scoped SIGTERM/SIGINT reaping is a RESUMABLE stop, mutating no git -------
+
+
+def test_install_reaper_signals_restores_prior_handlers() -> None:
+    """``_install_reaper_signals`` must NEVER leave a global handler installed: tests
+    and library callers depend on the original disposition being restored."""
+
+    import signal as _signal
+
+    from grindstone import loop as _loop
+
+    orig_term = _signal.getsignal(_signal.SIGTERM)
+    orig_int = _signal.getsignal(_signal.SIGINT)
+    prior = _loop._install_reaper_signals()
+    try:
+        # Installed: the live handlers differ from the originals.
+        assert _signal.getsignal(_signal.SIGTERM) is not orig_term
+        assert _signal.getsignal(_signal.SIGINT) is not orig_int
+    finally:
+        _loop._restore_reaper_signals(prior)
+    # Restored byte-for-byte.
+    assert _signal.getsignal(_signal.SIGTERM) is orig_term
+    assert _signal.getsignal(_signal.SIGINT) is orig_int
+
+
+def test_reaper_signal_handler_reaps_then_raises_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The installed handler REAPS the live subprocess groups (processes only) then
+    raises ``_Interrupted`` (a BaseException, so the epoch body's broad excepts cannot
+    swallow it). It touches no git/disk."""
+
+    import signal as _signal
+
+    from grindstone import loop as _loop
+
+    reaped: list[bool] = []
+    monkeypatch.setattr(_loop.reaper, "reap_all", lambda: reaped.append(True))
+
+    prior = _loop._install_reaper_signals()
+    try:
+        handler = _signal.getsignal(_signal.SIGTERM)
+        assert callable(handler)
+        with pytest.raises(_loop._Interrupted):
+            handler(_signal.SIGTERM, None)
+        assert reaped == [True]
+        assert not isinstance(_loop._Interrupted(0), Exception)  # BaseException only
+    finally:
+        _loop._restore_reaper_signals(prior)
+
+
+def test_sigterm_midrun_is_resumable_stop_with_no_git_mutation(
+    git_repo: Path, run_dir: RunDir, job_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A SIGTERM landing during a PLAN call (simulated by a planner that raises the
+    same ``_Interrupted`` the reaper handler would) ends the run as RESUMABLE
+    (``ended``) and performs NO git mutation and NO ``_raze_epoch``: the kill path
+    only reaps processes, resume owns scratch cleanup."""
+
+    from grindstone import loop as _loop
+
+    razed: list[object] = []
+    monkeypatch.setattr(_loop, "_raze_epoch", lambda *a, **k: razed.append(a))
+
+    def _git_state() -> str:
+        return subprocess.run(
+            ["git", "for-each-ref", "--format=%(refname) %(objectname)"],
+            cwd=str(git_repo), capture_output=True, text=True, check=True,
+        ).stdout
+
+    before = _git_state()
+
+    class _Interrupting:
+        """Stands in for a SIGTERM arriving on the very first boundary."""
+
+        def decide(self, context: PlannerContext) -> Decision:
+            raise _loop._Interrupted(15)
+
+        def close_out(self, context: CloseoutContext) -> str:
+            return "unused"
+
+    result = start_run(
+        job_path=job_path, run_dir=run_dir, repo=git_repo, planner=_Interrupting(),
+        backends=_backends(LoopWorker()), max_epochs=5,
+    )
+
+    assert result.status == "ended"
+    assert razed == []  # the kill path NEVER razes (resume does that)
+    assert _git_state() == before  # no branch/ref mutation
+    assert not wt.branch_exists(git_repo, "grind/run-1")  # run branch never created
+    # A clean RESUMABLE terminal in the journal (RunEnded, not RunCompleted).
+    events = read_events(run_dir.events_path)
+    from grindstone.events import RunCompleted, RunEnded
+    assert any(isinstance(e, RunEnded) for e in events)
+    assert not any(isinstance(e, RunCompleted) for e in events)

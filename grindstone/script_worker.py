@@ -27,6 +27,7 @@ import tempfile
 import threading
 from pathlib import Path
 
+from grindstone import reaper
 from grindstone.config import (
     GrindstoneConfig,
     RoleConfig,
@@ -101,20 +102,28 @@ class ScriptWorker:
             text=True,
             start_new_session=True,
         )
+        # The child leads its own group (pgid == pid); register it so a run-level
+        # SIGTERM/SIGINT reaps it instead of orphaning the detached group.
+        reaper.register(proc.pid)
         try:
-            stdout, stderr = proc.communicate(timeout=self.timeout_s)
-        except subprocess.TimeoutExpired as exc:
-            self._stop(handle_file, proc)
-            raise TransportError(
-                f"{self.script.name} timed out after {self.timeout_s}s"
-            ) from exc
-        if proc.returncode != 0:
-            combined = f"{stdout or ''}\n{stderr or ''}"
-            snippet = (stderr.strip() or stdout.strip())[:200]
-            if _RATE_LIMIT_RE.search(combined):
-                raise RateLimited(f"{self.script.name} rate-limited: {snippet}")
-            raise TransportError(f"{self.script.name} exited {proc.returncode}: {snippet}")
-        # Success: run_task reads the disk artifact from request.scratch.
+            try:
+                stdout, stderr = proc.communicate(timeout=self.timeout_s)
+            except subprocess.TimeoutExpired as exc:
+                self._stop(handle_file, proc)
+                raise TransportError(
+                    f"{self.script.name} timed out after {self.timeout_s}s"
+                ) from exc
+            if proc.returncode != 0:
+                combined = f"{stdout or ''}\n{stderr or ''}"
+                snippet = (stderr.strip() or stdout.strip())[:200]
+                if _RATE_LIMIT_RE.search(combined):
+                    raise RateLimited(f"{self.script.name} rate-limited: {snippet}")
+                raise TransportError(
+                    f"{self.script.name} exited {proc.returncode}: {snippet}"
+                )
+            # Success: run_task reads the disk artifact from request.scratch.
+        finally:
+            reaper.unregister(proc.pid)
 
     def _stop(self, handle_file: Path, proc: "subprocess.Popen[str]") -> None:
         """Delegate the kill to ``stop.sh`` (it reads the pgid the role script wrote

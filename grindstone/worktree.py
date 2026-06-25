@@ -192,9 +192,16 @@ def fast_forward_branch(repo: Path, run_branch: str, commit: str) -> None:
 
 
 def add_worktree(repo: Path, path: Path, *, branch: str, base: str) -> None:
-    """Create a fresh worktree at ``path`` on a new ``branch`` rooted at ``base``.
+    """Create a fresh worktree at ``path`` on ``branch`` (force-created) rooted at
+    ``base``.
 
     The leaf dir must not pre-exist (git creates it); the parent is ensured.
+    ``-B`` (not ``-b``) force-creates: a dead run's leftover ``grind-wip/*`` branch is
+    reset to ``base`` instead of HARD-FAILING the collision (a FRESH run never razes,
+    so ``-b`` would brick it). The reset is safe because a wip branch is only
+    (re)created when its task is being (re)done, so it never holds work we still want.
+    ``-B`` still REFUSES a branch checked out in another LIVE worktree (a real
+    conflict), which stays a loud failure.
     """
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -202,7 +209,7 @@ def add_worktree(repo: Path, path: Path, *, branch: str, base: str) -> None:
         shutil.rmtree(path)
     with _WORKTREE_LOCK:
         _git(repo, "worktree", "prune")
-        _git(repo, "worktree", "add", "-b", branch, str(path), base)
+        _git(repo, "worktree", "add", "-B", branch, str(path), base)
 
 
 def add_worktree_on(repo: Path, path: Path, *, branch: str) -> None:

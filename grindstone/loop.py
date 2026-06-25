@@ -52,14 +52,18 @@ build the real planner + backends from config) are wired in a later part.
 from __future__ import annotations
 
 import shutil
+import signal
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Literal, Protocol, Sequence
+from types import FrameType
+from typing import Any, Callable, Literal, Protocol, Sequence
 
+from grindstone import reaper
 from grindstone import worktree as wt
 from grindstone.config import (
     GrindstoneConfig,
@@ -785,6 +789,84 @@ def _plan_with_backoff(
             sleep_fn(backoff_s)
 
 
+# --- run-scoped SIGTERM/SIGINT reaping (resumable stop) ------------------------
+
+
+class _Interrupted(BaseException):
+    """A run-scoped SIGTERM / SIGINT: the handler already reaped the in-flight
+    subprocess groups; the run boundary turns this into a RESUMABLE partial-end.
+
+    A ``BaseException`` (like ``KeyboardInterrupt``), NOT an ``Exception``, so the
+    epoch body's broad ``except Exception`` (the abort node) and the worker / critic
+    transport ``except Exception`` never swallow it: it propagates straight to the
+    run boundary, which ends cleanly (``ended``) and leaves resume to re-enter."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(f"interrupted by signal {signum}")
+        self.signum = signum
+
+
+def _install_reaper_signals() -> dict[int, Any] | None:
+    """Install the run-scoped SIGTERM/SIGINT handler (reap groups, then raise
+    ``_Interrupted``); return the prior handlers to restore.
+
+    Returns ``None`` (a no-op) when NOT on the main thread: ``signal.signal`` is
+    illegal off the main thread, and a library caller that drives a run from a worker
+    thread owns its own signal disposition, which is not ours to touch. Only the kill
+    of PROCESSES happens here, never git or disk: resume owns scratch cleanup."""
+
+    if threading.current_thread() is not threading.main_thread():
+        return None
+
+    def _handler(signum: int, frame: FrameType | None) -> None:
+        reaper.reap_all()
+        raise _Interrupted(signum)
+
+    prior: dict[int, Any] = {}
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        prior[sig] = signal.signal(sig, _handler)
+    return prior
+
+
+def _restore_reaper_signals(prior: dict[int, Any] | None) -> None:
+    """Restore the handlers ``_install_reaper_signals`` replaced (no-op off-main)."""
+
+    if prior is None:
+        return
+    for sig, handler in prior.items():
+        signal.signal(sig, handler)
+
+
+def _run_interruptible(
+    body: Callable[[], RunResult],
+    *,
+    journal: JournalWriter,
+    run_dir: RunDir,
+    now_fn: NowFn,
+) -> RunResult:
+    """Run the epoch loop ``body`` under the run-scoped SIGTERM/SIGINT reaper, turning
+    an interrupt into a RESUMABLE partial-end and restoring the prior handlers on exit.
+
+    On ``_Interrupted`` (the handler already reaped the in-flight subprocess groups)
+    this emits ``RunEnded`` (the existing "stopped, resumable" terminal, exit code 1)
+    and returns ``ended`` with the completed-epoch count read back from the durable
+    journal. It mutates NO git/disk state: the run branch only ever advanced on a
+    completed epoch, the journal is append-only and fsynced per event, and resume owns
+    all scratch cleanup. A subsequent ``resume_run`` re-enters exactly as today."""
+
+    prior = _install_reaper_signals()
+    try:
+        return body()
+    except _Interrupted as exc:
+        summary = f"run interrupted by signal {exc.signum}; resume to continue"
+        _emit_ended(journal, now_fn, summary)
+        return RunResult(
+            "ended", summary, _completed_count(read_events(run_dir.events_path))
+        )
+    finally:
+        _restore_reaper_signals(prior)
+
+
 # --- the core loop -------------------------------------------------------------
 
 
@@ -969,11 +1051,14 @@ def start_run(
                 max_epochs=max_epochs,
             )
         )
-        return _drive(
-            job=job, run_dir=run_dir, repo=repo, run_branch=run_branch,
-            planner=planner, backends=backends, max_epochs=max_epochs,
-            log_root=log_root, acceptance=acceptance, sleep_fn=sleep_fn,
-            backoff_s=backoff_s, now_fn=now_fn, journal=journal, start_index=1,
+        return _run_interruptible(
+            lambda: _drive(
+                job=job, run_dir=run_dir, repo=repo, run_branch=run_branch,
+                planner=planner, backends=backends, max_epochs=max_epochs,
+                log_root=log_root, acceptance=acceptance, sleep_fn=sleep_fn,
+                backoff_s=backoff_s, now_fn=now_fn, journal=journal, start_index=1,
+            ),
+            journal=journal, run_dir=run_dir, now_fn=now_fn,
         )
 
 
@@ -1026,12 +1111,15 @@ def resume_run(
         journal.emit(
             lambda s: RunResumed(seq=s, ts=now_fn(), run_id=run_id, razed_epoch=razed)
         )
-        return _drive(
-            job=job, run_dir=run_dir, repo=repo, run_branch=run_branch,
-            planner=planner, backends=backends, max_epochs=eff_max,
-            log_root=log_root, acceptance=acceptance, sleep_fn=sleep_fn,
-            backoff_s=backoff_s, now_fn=now_fn, journal=journal,
-            start_index=start_index,
+        return _run_interruptible(
+            lambda: _drive(
+                job=job, run_dir=run_dir, repo=repo, run_branch=run_branch,
+                planner=planner, backends=backends, max_epochs=eff_max,
+                log_root=log_root, acceptance=acceptance, sleep_fn=sleep_fn,
+                backoff_s=backoff_s, now_fn=now_fn, journal=journal,
+                start_index=start_index,
+            ),
+            journal=journal, run_dir=run_dir, now_fn=now_fn,
         )
 
 
