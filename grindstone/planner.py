@@ -47,6 +47,7 @@ from grindstone.check_decision import (
 )
 from grindstone.contracts.models import Decision, parse_decision
 from grindstone.domain_skills import load_domain_skill_index
+from grindstone.repo_map import load_repo_map
 from grindstone.rundir import RunDir
 from grindstone.strategy_skill import load_strategy
 
@@ -328,6 +329,25 @@ def _strategy_block(text: str) -> str:
     )
 
 
+def _repo_map_block(text: str) -> str:
+    """The target repo's OPTIONAL navigation map, framed as a starting orientation for
+    grepping the workdir - a reference, NEVER ground truth (the tree wins on conflict).
+
+    Empty text -> ``""`` (so the no-map prompt is byte-identical to today). Non-empty -> a
+    tagged block placed in the volatile tail alongside the other repo context, so the
+    cacheable system prefix and the always-on strategy seam are unchanged."""
+
+    if not text:
+        return ""
+    return (
+        "<repo_map>\n"
+        "A map of this repo (where things live) to orient your grep. It is a STARTING "
+        "POINT, not ground truth: the actual tree you read WINS on any conflict.\n"
+        f"{text}\n"
+        "</repo_map>\n"
+    )
+
+
 _TOOLS_BLOCK = (
     "<tools>\n"
     "Your workdir is a checkout of the current integration tip. GREP and READ it to "
@@ -343,6 +363,7 @@ def build_planner_input(
     *,
     domain_skill_index: dict[str, str],
     strategy: str = "",
+    repo_map: str = "",
     reask_errors: tuple[str, ...] = (),
 ) -> str:
     """Render the full PLAN prompt from ``context`` (PURE, no I/O).
@@ -350,10 +371,11 @@ def build_planner_input(
     ``PLAN_PREAMBLE`` (byte-stable) then the repo's always-on STRATEGY overlay (advisory,
     injected right after ``</system>`` so the cacheable system prefix is unchanged; empty
     when the repo ships none) then the volatile tail: the job spec, the running state +
-    keyed-log index, the prior epoch's BATON, the domain-skill catalogue index (when the
-    repo ships one), the read-tools note, any re-ask feedback, and the request.
-    References, not payloads: only the baton text, names, and log keys, never file bodies
-    (the planner greps its workdir for the tree).
+    keyed-log index, the prior epoch's BATON, the optional repo-navigation map (when the
+    repo ships one), the domain-skill catalogue index (when the repo ships one), the
+    read-tools note, any re-ask feedback, and the request. References, not payloads: only
+    the baton text, names, and log keys, never file bodies (the planner greps its workdir
+    for the tree). An absent ``repo_map`` adds zero bytes (byte-identical to today).
     """
 
     errors = ""
@@ -369,6 +391,7 @@ def build_planner_input(
         f"<job>\n{context.job}\n</job>\n"
         f"{_state_block(context)}"
         f"{_baton_block(context)}"
+        f"{_repo_map_block(repo_map)}"
         f"{_domain_skills_block(domain_skill_index)}"
         f"{_TOOLS_BLOCK}"
         f"{errors}"
@@ -448,6 +471,7 @@ def build_closeout_input(
     *,
     domain_skill_index: dict[str, str] | None = None,
     strategy: str = "",
+    repo_map: str = "",
 ) -> str:
     """Render the full CLOSE-OUT prompt from ``context`` (PURE, no I/O).
 
@@ -457,9 +481,10 @@ def build_closeout_input(
     baton-writer steers cadence too: what to prioritise next) then the volatile tail: the
     job, the prior baton, the epoch report (the deterministic outcomes + keyed-log
     pointers), this epoch's ``decision.pending`` additions (so the ## Pending backlog can
-    be reconciled here, the sole baton write), the domain-skill catalogue index (so the
-    baton's pending list can name a skill the next epoch will select), the tools/vision
-    note, and the request to write ``./baton.md``.
+    be reconciled here, the sole baton write), the optional repo-navigation map (when the
+    repo ships one), the domain-skill catalogue index (so the baton's pending list can
+    name a skill the next epoch will select), the tools/vision note, and the request to
+    write ``./baton.md``. An absent ``repo_map`` adds zero bytes (byte-identical to today).
     """
 
     skills = _domain_skills_block(domain_skill_index or {})
@@ -470,6 +495,7 @@ def build_closeout_input(
         f"{_prior_baton_block(context)}"
         f"{_epoch_report_block(context)}"
         f"{_pending_additions_block(context)}"
+        f"{_repo_map_block(repo_map)}"
         f"{skills}"
         f"{_CLOSEOUT_TOOLS_BLOCK}"
         "<request>\n"
@@ -539,6 +565,7 @@ class ScriptPlanner:
             load_domain_skill_index(context.repo) if context.repo is not None else {}
         )
         strategy = load_strategy(context.repo)
+        repo_map = load_repo_map(context.repo)
         decision_path = workdir / DECISION_FILE
         out_file = context.run_dir.root / _OUT_FILENAME
 
@@ -546,7 +573,11 @@ class ScriptPlanner:
         last_error = "no attempts"
         for _ in range(self.max_reasks + 1):
             prompt = build_planner_input(
-                context, domain_skill_index=index, strategy=strategy, reask_errors=reask
+                context,
+                domain_skill_index=index,
+                strategy=strategy,
+                repo_map=repo_map,
+                reask_errors=reask,
             )
             # Clear stale channels so a rig that silently writes nothing can never
             # feed us a previous boundary's decision.
@@ -589,12 +620,13 @@ class ScriptPlanner:
             load_domain_skill_index(context.repo) if context.repo is not None else {}
         )
         strategy = load_strategy(context.repo)
+        repo_map = load_repo_map(context.repo)
         baton_path = workdir / BATON_FILE
         out_file = context.run_dir.root / _OUT_FILENAME
         baton_path.unlink(missing_ok=True)
         out_file.unlink(missing_ok=True)
         prompt = build_closeout_input(
-            context, domain_skill_index=index, strategy=strategy
+            context, domain_skill_index=index, strategy=strategy, repo_map=repo_map
         )
         stdout = self.transport.dispatch(
             PlannerDispatch(

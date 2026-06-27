@@ -150,6 +150,46 @@ def test_build_closeout_input_no_strategy_is_byte_identical(run_dir: RunDir) -> 
     assert "</system>\n<job>" in base
 
 
+def test_build_planner_input_injects_repo_map(run_dir: RunDir) -> None:
+    repo_map = "src/widget/ holds the package; tests/ mirrors it 1:1."
+    prompt = build_planner_input(
+        _raw_context(run_dir), domain_skill_index={}, repo_map=repo_map
+    )
+    # the navigation block appears exactly once and carries the map text
+    assert prompt.count("<repo_map>") == 1
+    assert repo_map in prompt
+    # positioned in the volatile tail (after the job), so the cacheable system prefix
+    # and the always-on strategy seam are unchanged
+    assert prompt.index("<repo_map>") > prompt.index("<job>")
+
+
+def test_build_planner_input_no_repo_map_is_byte_identical(run_dir: RunDir) -> None:
+    # the no-repo-map path must be byte-for-byte identical to NOT passing one at all.
+    ctx = _raw_context(run_dir, baton="## Pending\nfoo\n")
+    base = build_planner_input(ctx, domain_skill_index={"rn-taste": "tasteful RN"})
+    with_empty = build_planner_input(
+        ctx, domain_skill_index={"rn-taste": "tasteful RN"}, repo_map=""
+    )
+    assert with_empty == base
+    assert "<repo_map>" not in base
+
+
+def test_build_closeout_input_injects_repo_map(run_dir: RunDir) -> None:
+    repo_map = "the staging tree mirrors src/; e2e/ holds the gate specs."
+    prompt = build_closeout_input(_closeout_context(run_dir), repo_map=repo_map)
+    assert prompt.count("<repo_map>") == 1
+    assert repo_map in prompt
+    assert prompt.index("<repo_map>") > prompt.index("<job>")
+
+
+def test_build_closeout_input_no_repo_map_is_byte_identical(run_dir: RunDir) -> None:
+    ctx = _closeout_context(run_dir)
+    base = build_closeout_input(ctx)
+    with_empty = build_closeout_input(ctx, repo_map="")
+    assert with_empty == base
+    assert "<repo_map>" not in base
+
+
 def test_planner_core_carries_backlog_and_scaffold_refine(run_dir: RunDir) -> None:
     # The PLAN preamble teaches the cross-epoch backlog (read the baton's ## Pending,
     # schedule a subset this epoch, record new deferred work in decision.pending) and the

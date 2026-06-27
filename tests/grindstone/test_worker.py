@@ -280,6 +280,36 @@ def test_implement_prompt_allows_in_worktree_dep_install() -> None:
     assert "install" in prompt and "inside this worktree" in prompt
 
 
+def test_worker_prompt_injects_repo_map() -> None:
+    from grindstone.worker import WorkerRequest, build_worker_prompt
+
+    repo_map = "src/widget/ is the package; cli.py is the entry point."
+    request = WorkerRequest(
+        task=_implement(), task_id="E1/T1", mode="implement", scratch=Path("/x"),
+        repo_map=repo_map,
+    )
+    prompt = build_worker_prompt(request)
+    assert prompt.count("<repo_map>") == 1
+    assert repo_map in prompt
+
+
+def test_worker_prompt_no_repo_map_is_byte_identical() -> None:
+    # the no-repo-map path must be byte-for-byte identical to NOT passing one at all.
+    from grindstone.worker import WorkerRequest, build_worker_prompt
+
+    base_req = WorkerRequest(
+        task=_implement(), task_id="E1/T1", mode="implement", scratch=Path("/x"),
+    )
+    empty_req = WorkerRequest(
+        task=_implement(), task_id="E1/T1", mode="implement", scratch=Path("/x"),
+        repo_map="",
+    )
+    base = build_worker_prompt(base_req)
+    with_empty = build_worker_prompt(empty_req)
+    assert with_empty == base
+    assert "<repo_map>" not in base
+
+
 def test_critic_prompt_encodes_triage() -> None:
     from grindstone.worker import CriticBrief, WorkerRequest
 

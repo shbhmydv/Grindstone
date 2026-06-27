@@ -60,6 +60,7 @@ from grindstone.contracts.models import (
     parse_verdict,
 )
 from grindstone.domain_skills import load_domain_skill
+from grindstone.repo_map import load_repo_map
 from grindstone.rundir import RunDir
 
 #: The worker's FREE-FORM report, written in its CWD: a short prose note (what I
@@ -125,8 +126,10 @@ class WorkerRequest:
     """One fully-resolved dispatch: the typed ``task``, its full keyed-log
     ``task_id`` (``E*/T*``), the worker ``mode``, the scratch CWD it writes its
     output into, the resolved ``inputs`` (prior keyed-log artifacts), the SELECTED
-    domain skills (retrieve-not-concatenate), prior-attempt ``failure_context``, and
-    whether a prior attempt's work is already present (incremental retry).
+    domain skills (retrieve-not-concatenate), the repo's OPTIONAL navigation map
+    (``repo_map``, empty when the repo ships none -> byte-identical prompt),
+    prior-attempt ``failure_context``, and whether a prior attempt's work is already
+    present (incremental retry).
 
     When ``critic`` is set the dispatch is the CRITIC pass: the prompt builder
     branches to ``build_critic_prompt`` and the result channel is ``verdict.json``,
@@ -144,6 +147,7 @@ class WorkerRequest:
     scratch: Path
     inputs: dict[str, Path] = field(default_factory=dict)
     domain_skills: dict[str, str] = field(default_factory=dict)
+    repo_map: str = ""
     failure_context: tuple[str, ...] = ()
     prior_work_present: bool = False
     critic: CriticBrief | None = None
@@ -343,6 +347,20 @@ def _domain_skills_block(request: WorkerRequest) -> str:
     )
 
 
+def _repo_map_block(request: WorkerRequest) -> str:
+    """The target repo's OPTIONAL navigation map: a starting orientation for finding
+    things in the tree, NEVER ground truth (the files you read win on conflict). Empty
+    when the repo ships none, so the no-map prompt is byte-identical to today."""
+
+    if not request.repo_map:
+        return ""
+    return (
+        "\n<repo_map>\nA map of this repo (where things live) to orient you. It is a "
+        "STARTING POINT, not ground truth: the actual files you read WIN on any "
+        f"conflict.\n{request.repo_map}\n</repo_map>\n"
+    )
+
+
 def _critic_skills_block(request: WorkerRequest) -> str:
     """The CRITIC-framed view of the task's SELECTED domain skills: the rubric the
     work CLAIMS to meet. Distinct from ``_domain_skills_block`` (worker-facing
@@ -385,8 +403,9 @@ def build_worker_prompt(request: WorkerRequest) -> str:
 
     Skeleton: goal, the worktree-isolation contract, resolved inputs, the per-mode
     guidance, the dynamic per-task lane (implement ownership), selected domain
-    skills, prior-failure context, prior-work note, and the free-form handoff
-    report instruction (NOT a schema; the critic reads it as prose).
+    skills, the optional repo-navigation map (empty when the repo ships none),
+    prior-failure context, prior-work note, and the free-form handoff report
+    instruction (NOT a schema; the critic reads it as prose).
     """
 
     task = request.task
@@ -427,7 +446,7 @@ def build_worker_prompt(request: WorkerRequest) -> str:
 {read_root_block}<inputs>
 {_render_inputs(request)}
 </inputs>
-{plan}{_domain_skills_block(request)}{prior_work_block}{context_block}
+{plan}{_domain_skills_block(request)}{_repo_map_block(request)}{prior_work_block}{context_block}
 <handoff>
 When finished, write a SHORT free-form report named exactly `{HANDOFF_FILENAME}` in
 your current working directory, for the independent reviewer who reads your work
@@ -667,6 +686,7 @@ def _run_attempt(
     epoch_base: str | None,
     backends: Backends,
     domain_skills: dict[str, str],
+    repo_map: str,
     failure_context: tuple[str, ...],
     prior_work_present: bool,
     run_dir: RunDir,
@@ -698,6 +718,7 @@ def _run_attempt(
         scratch=scratch,
         inputs=inputs,
         domain_skills=domain_skills,
+        repo_map=repo_map,
         failure_context=failure_context,
         prior_work_present=prior_work_present,
         read_root=None if implement else cite_root,
@@ -789,6 +810,7 @@ def run_task(
         domain_skills = _load_domain_skills(repo, task)
     except _Rejected as rej:
         return TaskResult(task_id, "escalated", attempts=0, reason=rej.reason)
+    repo_map = load_repo_map(repo)
 
     failure_context: list[str] = []
     prior_branch: str | None = None  # implement incremental-retry chain base
@@ -811,6 +833,7 @@ def run_task(
                 scratch=scratch, repo=repo, read_root=read_root, epoch_base=base,
                 backends=backends,
                 domain_skills=domain_skills,
+                repo_map=repo_map,
                 failure_context=tuple(failure_context),
                 prior_work_present=implement and prior_branch is not None,
                 run_dir=run_dir,
