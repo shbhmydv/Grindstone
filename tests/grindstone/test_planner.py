@@ -471,6 +471,22 @@ def test_close_out_returns_baton_free_form(git_repo: Path, run_dir: RunDir) -> N
     assert (run_dir.root / "_planner_tip").is_dir()
 
 
+def test_close_out_reads_baton_from_the_workdir_file(
+    git_repo: Path, run_dir: RunDir
+) -> None:
+    # The writable disk contract a grinding rig (claude self-validate, OR codex now that
+    # it runs -s workspace-write in the worktree) relies on: the rig WRITES baton.md INTO
+    # the _planner_tip workdir, and close_out reads it back from there (baton.md > --out >
+    # stdout). This is the round-trip the read-only codex rig used to break (it could not
+    # write the file at all, so the capture chain caught its filesystem error as the
+    # "baton"). A different --out proves the workdir FILE wins.
+    baton = "## Project summary\nbuilt via the worktree file channel\n## Pending\n- (none)\n"
+    rig = MockRig(baton=baton, out="## Project summary\nstale --out fallback\n")
+    planner = ScriptPlanner(MockPlannerTransport([rig]))
+    result = planner.close_out(_live_closeout_context(git_repo, run_dir))
+    assert result == baton  # the workdir baton.md, not the --out fallback
+
+
 def test_close_out_rate_limit_propagates(git_repo: Path, run_dir: RunDir) -> None:
     # A rate limit propagates (node #1): the loop razes + restarts the epoch.
     planner = ScriptPlanner(MockPlannerTransport(["rate_limit"]))
