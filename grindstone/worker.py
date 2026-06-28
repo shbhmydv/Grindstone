@@ -76,9 +76,12 @@ HANDOFF_FILENAME = "handoff.md"
 #: Pydantic; stdout is never parsed.
 CRITIC_VERDICT_FILENAME = "verdict.json"
 
-#: Bounded SAME-tier retry budget (BONES: keep a tiny 1-2x local retry that absorbs
-#: a free self-heal; NO tier escalation). A second RETRY exhausts to escalation.
-MAX_ATTEMPTS = 2
+#: Per-tier attempt budgets for the IN-EPOCH tier ladder. A local task gets a few
+#: same-tier self-heal attempts, then (when the rig has a DISTINCT senior endpoint)
+#: escalates to senior for a final attempt on the carried wip. A senior-only task
+#: (planner-routed senior, or every-tier-local rig) runs just its own stage.
+LOCAL_MAX_ATTEMPTS = 3  # 1 initial + 2 retries
+SENIOR_MAX_ATTEMPTS = 2  # 1 initial + 1 retry
 
 #: DoS sanity backstop on the disk reads (reject, never truncate, a pathological /
 #: corrupt multi-megabyte file before reading it into memory). A real handoff /
@@ -173,6 +176,7 @@ class AttemptEvents(Protocol):
     def work_gate_passed(self, task_id: str) -> None: ...
     def work_gate_rejected(self, task_id: str, reason: str) -> None: ...
     def verdict(self, task_id: str, outcome: VerdictOutcome, reason: str) -> None: ...
+    def tier_escalated(self, task_id: str, to_tier: str, attempt: int) -> None: ...
 
 
 # --- per-backend concurrency seam (BONES concurrency ruling) -------------------
@@ -220,6 +224,17 @@ class Backends:
         endpoint = self._endpoints[key]
         with endpoint.sem:
             yield endpoint.transport
+
+    def has_distinct_tier(self, tier: str) -> bool:
+        """Does ``tier`` resolve to a DISTINCT endpoint from local (a real, separate
+        rig), so an in-epoch escalation to it actually changes which model grinds?
+
+        False when the tier is unmapped or shares local's endpoint (every tier grinds
+        on the one backend) - in that case ``slot(tier)`` silently falls back to local,
+        so escalating to it would just re-run the same model and the ladder must not."""
+
+        key = self._tier_endpoint.get(tier)
+        return key is not None and key != self._tier_endpoint["local"]
 
 
 # --- result type ---------------------------------------------------------------
@@ -398,56 +413,10 @@ it from this rule and from your commit.)
 """
 
 
-def build_worker_prompt(request: WorkerRequest) -> str:
-    """Construct the worker prompt (pure, no transport, no I/O).
-
-    Skeleton: goal, the worktree-isolation contract, resolved inputs, the per-mode
-    guidance, the dynamic per-task lane (implement ownership), selected domain
-    skills, the optional repo-navigation map (empty when the repo ships none),
-    prior-failure context, prior-work note, and the free-form handoff report
-    instruction (NOT a schema; the critic reads it as prose).
-    """
-
-    task = request.task
-    artifact_line = ""
-    if task.mode != "implement" and task.artifact_out is not None:
-        artifact_line = f"\nProduce the artifact at log key `{task.artifact_out}`.\n"
-    read_root_block = ""
-    if task.mode != "implement" and request.read_root is not None:
-        read_root_block = (
-            "\n<read_root>\nRead the repository AT ITS CURRENT IN-RUN STATE under "
-            f"`{request.read_root}` (the integration tip, including everything prior "
-            "epochs built). Ground your citations in files under that path; do NOT "
-            "read the operator's base checkout.\n</read_root>\n"
-        )
-    plan = "\n" + _MODE_GUIDANCE[task.mode]
-    if task.mode == "implement":
-        plan += _file_ownership_block(task)
-    prior_work_block = ""
-    if request.prior_work_present:
-        prior_work_block = (
-            "\n<prior_work>\nA PRIOR attempt at this task left its work IN PLACE in "
-            "this working directory. Build on it: fix what the prior failures report "
-            "and complete what is unfinished rather than starting from scratch; you "
-            "MAY reset and redo if you judge the prior approach wrong.\n</prior_work>\n"
-        )
-    context_block = ""
-    if request.failure_context:
-        joined = "\n".join(f"  - {c}" for c in request.failure_context)
-        context_block = (
-            "\n<prior_failures>\nEarlier attempts failed for these reasons; fix "
-            f"them:\n{joined}\n</prior_failures>\n"
-        )
-    return f"""<task id="{request.task_id}">
-{task.goal}
-</task>
-{artifact_line}
-{_WORKTREE_CONTRACT}
-{read_root_block}<inputs>
-{_render_inputs(request)}
-</inputs>
-{plan}{_domain_skills_block(request)}{_repo_map_block(request)}{prior_work_block}{context_block}
-<handoff>
+#: The free-form handoff-report instruction, identical on a fresh OR a resume prompt
+#: (the report contract never changes). A module constant so both prompt shapes reuse
+#: the one wording.
+_HANDOFF_BLOCK = f"""<handoff>
 When finished, write a SHORT free-form report named exactly `{HANDOFF_FILENAME}` in
 your current working directory, for the independent reviewer who reads your work
 next. Plain prose (no required schema): what you did, what is DONE, what is still
@@ -459,6 +428,105 @@ reviewer; the orchestrator gates your actual work (the committed diff or the
 produced artifact), never this file.
 </handoff>
 """
+
+
+def build_worker_prompt(request: WorkerRequest) -> str:
+    """Construct the worker prompt (pure, no transport, no I/O).
+
+    Two shapes, branched on ``prior_work_present``:
+
+    * FRESH (no prior work): leads with ``<task>{goal}</task>`` - the full original
+      brief as the active instruction - then the worktree contract, inputs, per-mode
+      guidance + ownership, skills, the optional repo map, and the handoff. A fresh
+      prompt is BYTE-IDENTICAL to the historical prompt (a poisoned-tree retry that
+      restarts clean is fresh: it shows ``<prior_failures>`` but no resume frame).
+    * RESUME (a prior attempt's wip is on the tree, from a same-tier retry or a tier
+      ESCALATION): leads with a ``<resume>`` frame + the full untruncated
+      ``<prior_failures>``, so a small local model reads "fix THESE, on the SAME tree"
+      as the dominant instruction; the original goal follows as marked REFERENCE
+      context only, NOT a re-build command.
+    """
+
+    if request.prior_work_present:
+        return _resume_worker_prompt(request)
+    task = request.task
+    context_block = ""
+    if request.failure_context:
+        joined = "\n".join(f"  - {c}" for c in request.failure_context)
+        context_block = (
+            "\n<prior_failures>\nEarlier attempts failed for these reasons; fix "
+            f"them:\n{joined}\n</prior_failures>\n"
+        )
+    return f"""<task id="{request.task_id}">
+{task.goal}
+</task>
+{_artifact_line(task)}
+{_WORKTREE_CONTRACT}
+{_read_root_block(request)}<inputs>
+{_render_inputs(request)}
+</inputs>
+{_plan_block(task)}{_domain_skills_block(request)}{_repo_map_block(request)}{context_block}
+{_HANDOFF_BLOCK}"""
+
+
+def _resume_worker_prompt(request: WorkerRequest) -> str:
+    """The RESUME shape (a prior attempt's wip is present): lead with the fix frame so
+    the worker repairs the same tree rather than rebuilding. Pure (no I/O)."""
+
+    task = request.task
+    if request.failure_context:
+        joined = "\n".join(f"  - {c}" for c in request.failure_context)
+    else:
+        joined = "  - (the prior attempt did not land; see the work already on the tree)"
+    return f"""<resume id="{request.task_id}">
+A PRIOR attempt at this task FAILED and you are RESUMING it on the SAME working tree -
+all prior work is already present here. Your ONLY goal now is to FIX the specific
+failures listed below; do NOT rebuild from scratch. You MAY reset and redo a file if
+the prior approach was genuinely wrong, but default to a minimal targeted fix.
+</resume>
+
+<prior_failures>
+These are the failures you must fix; address each one:
+{joined}
+</prior_failures>
+
+<original_task>
+For reference, the original brief was the following. This is CONTEXT, not the active
+instruction - the active instruction is to fix the failures above on the existing tree:
+{task.goal}
+</original_task>
+{_artifact_line(task)}
+{_WORKTREE_CONTRACT}
+{_read_root_block(request)}<inputs>
+{_render_inputs(request)}
+</inputs>
+{_plan_block(task)}{_domain_skills_block(request)}{_repo_map_block(request)}
+{_HANDOFF_BLOCK}"""
+
+
+def _artifact_line(task: Task) -> str:
+    if task.mode != "implement" and task.artifact_out is not None:
+        return f"\nProduce the artifact at log key `{task.artifact_out}`.\n"
+    return ""
+
+
+def _read_root_block(request: WorkerRequest) -> str:
+    task = request.task
+    if task.mode != "implement" and request.read_root is not None:
+        return (
+            "\n<read_root>\nRead the repository AT ITS CURRENT IN-RUN STATE under "
+            f"`{request.read_root}` (the integration tip, including everything prior "
+            "epochs built). Ground your citations in files under that path; do NOT "
+            "read the operator's base checkout.\n</read_root>\n"
+        )
+    return ""
+
+
+def _plan_block(task: Task) -> str:
+    plan = "\n" + _MODE_GUIDANCE[task.mode]
+    if task.mode == "implement":
+        plan += _file_ownership_block(task)
+    return plan
 
 
 def build_critic_prompt(request: WorkerRequest, brief: CriticBrief) -> str:
@@ -614,6 +682,7 @@ def _critic_verdict(
     task: Task,
     task_id: str,
     *,
+    tier: str,
     scratch: Path,
     base: str | None,
     artifact_rel: str | None,
@@ -623,9 +692,11 @@ def _critic_verdict(
     backends: Backends,
     domain_skills: dict[str, str],
 ) -> Verdict:
-    """Dispatch the tier-matched critic in the task's own scratch, read + relocate
-    its ``verdict.json``, return the parsed lenient ``Verdict``. A missing / invalid
-    verdict or a transport raise is a ``CriticError`` (fail-safe, never a pass).
+    """Dispatch the critic at the attempt's STAGE ``tier`` in the task's own scratch,
+    read + relocate its ``verdict.json``, return the parsed lenient ``Verdict``. A
+    missing / invalid verdict or a transport raise is a ``CriticError`` (fail-safe,
+    never a pass). The critic runs at the SAME tier the attempt did, so an escalated
+    (senior) attempt is judged by the senior critic, not the local one.
 
     The task's SELECTED ``domain_skills`` ride along so the critic can VERIFY the work
     against them as a rubric (the "analyse" step of the composition loop); when empty
@@ -645,7 +716,7 @@ def _critic_verdict(
         domain_skills=domain_skills,
     )
     try:
-        with backends.slot(task.tier) as transport:
+        with backends.slot(tier) as transport:
             transport.run(request)
     except RateLimited:
         raise
@@ -680,6 +751,7 @@ def _run_attempt(
     task: Task,
     task_id: str,
     *,
+    tier: str,
     scratch: Path,
     repo: Path | None,
     read_root: Path | None,
@@ -724,7 +796,7 @@ def _run_attempt(
         read_root=None if implement else cite_root,
     )
     try:
-        with backends.slot(task.tier) as transport:
+        with backends.slot(tier) as transport:
             transport.run(request)
     except RateLimited:
         raise
@@ -790,17 +862,25 @@ def run_task(
 ) -> TaskResult:
     """Run ONE task to a triage verdict (reusable, safe to call concurrently).
 
+    The task climbs an IN-EPOCH TIER LADDER of STAGES. A planner-``local`` task on a
+    rig with a DISTINCT senior endpoint runs ``[local x LOCAL_MAX_ATTEMPTS, senior x
+    SENIOR_MAX_ATTEMPTS]``; a planner-``senior`` task runs ``[senior x
+    SENIOR_MAX_ATTEMPTS]``; a ``local`` task on an every-tier-local rig runs
+    ``[local x LOCAL_MAX_ATTEMPTS]`` (escalating would just re-run the same model).
     Each attempt grinds in a fresh isolated worktree (implement) or scratch dir
-    (non-write) off the EXTERNAL base, dispatches the tier's rig, and gates on
+    (non-write) off the EXTERNAL base, dispatches the STAGE's rig, and gates on
     DETERMINISTIC FACTS (a non-empty in-scope commit, or a present artifact). A
-    gate-clean attempt ALWAYS runs the tier-matched critic, which routes: PASS ->
-    merge-ready, RETRY -> bounded same-tier retry that inherits the prior wip,
-    ESCALATE -> planner. A failed gate is a failed attempt (bounded retry, then
-    escalate). ``RateLimited`` escapes un-burned.
+    gate-clean attempt ALWAYS runs the stage-tier critic, which routes: PASS ->
+    merge-ready, RETRY -> a bounded retry within the stage, ESCALATE -> the next stage
+    (or the planner from the last stage). The incremental wip carries ACROSS attempts
+    AND across the stage boundary, so senior RESUMES the local attempt's tree rather
+    than rebuilding. A failed gate is a failed attempt. ``RateLimited`` escapes
+    un-burned.
 
     A non-write task reads + grounds against ``read_root`` (the integration tip) when
-    the driver supplies one. ``events`` (optional) lands the gate + triage in the
-    journal live; ``None`` keeps this callable standalone for the unit tests.
+    the driver supplies one. ``events`` (optional) lands the gate + triage + tier
+    escalation in the journal live; ``None`` keeps this callable standalone for the
+    unit tests.
     """
 
     implement = task.mode == "implement"
@@ -812,82 +892,105 @@ def run_task(
         return TaskResult(task_id, "escalated", attempts=0, reason=rej.reason)
     repo_map = load_repo_map(repo)
 
+    if task.tier == "local" and backends.has_distinct_tier("senior"):
+        stages = [("local", LOCAL_MAX_ATTEMPTS), ("senior", SENIOR_MAX_ATTEMPTS)]
+    elif task.tier == "senior":
+        stages = [("senior", SENIOR_MAX_ATTEMPTS)]
+    else:
+        stages = [("local", LOCAL_MAX_ATTEMPTS)]
+
     failure_context: list[str] = []
-    prior_branch: str | None = None  # implement incremental-retry chain base
-    attempts = 0
-    while attempts < MAX_ATTEMPTS:
-        attempts += 1
-        attempt_base = prior_branch if prior_branch is not None else base
-        if implement:
-            assert repo is not None and attempt_base is not None
-            scratch = run_dir.worktrees_root / slug / f"attempt-{attempts}"
-            branch = f"grind-wip/{slug}/attempt-{attempts}"
-            wt.add_worktree(repo, scratch, branch=branch, base=attempt_base)
-        else:
-            scratch = run_dir.artifacts_dir(f"{task_id}/attempt-{attempts}")
-            branch = None
+    prior_branch: str | None = None  # implement incremental-retry/escalation chain base
+    attempts = 0  # TOTAL dispatch count across every stage (for TaskResult.attempts)
+    for stage_idx, (tier, budget) in enumerate(stages):
+        last_stage = stage_idx == len(stages) - 1
+        if stage_idx > 0 and events is not None:
+            # The ladder just escalated to a stronger tier on the carried wip.
+            events.tier_escalated(task_id, tier, attempts + 1)
+        stage_attempt = 0
+        while stage_attempt < budget:
+            stage_attempt += 1
+            attempts += 1
+            attempt_base = prior_branch if prior_branch is not None else base
+            if implement:
+                assert repo is not None and attempt_base is not None
+                scratch = run_dir.worktrees_root / slug / f"attempt-{attempts}"
+                branch = f"grind-wip/{slug}/attempt-{attempts}"
+                wt.add_worktree(repo, scratch, branch=branch, base=attempt_base)
+            else:
+                scratch = run_dir.artifacts_dir(f"{task_id}/attempt-{attempts}")
+                branch = None
 
-        try:
-            attempt = _run_attempt(
-                task, task_id,
-                scratch=scratch, repo=repo, read_root=read_root, epoch_base=base,
-                backends=backends,
-                domain_skills=domain_skills,
-                repo_map=repo_map,
-                failure_context=tuple(failure_context),
-                prior_work_present=implement and prior_branch is not None,
-                run_dir=run_dir,
-                events=events,
-            )
-        except _Rejected as rej:
+            try:
+                attempt = _run_attempt(
+                    task, task_id, tier=tier,
+                    scratch=scratch, repo=repo, read_root=read_root, epoch_base=base,
+                    backends=backends,
+                    domain_skills=domain_skills,
+                    repo_map=repo_map,
+                    failure_context=tuple(failure_context),
+                    prior_work_present=prior_branch is not None,
+                    run_dir=run_dir,
+                    events=events,
+                )
+            except _Rejected as rej:
+                if events is not None:
+                    events.work_gate_rejected(task_id, rej.reason)
+                failure_context.append(rej.reason)
+                prior_branch = _carry_or_discard(
+                    rej, repo=repo, scratch=scratch, branch=branch,
+                    implement=implement, task_id=task_id,
+                )
+                continue
+
+            # Gate-clean -> the stage-tier critic triages it (in the same scratch: the
+            # post-commit worktree for implement, the artifact dir for a non-write task).
+            try:
+                verdict = _critic_verdict(
+                    task, task_id, tier=tier, scratch=scratch, base=base,
+                    artifact_rel=attempt.artifact_rel,
+                    handoff_text=attempt.handoff_text,
+                    critic_read_root=critic_read_root, run_dir=run_dir,
+                    backends=backends, domain_skills=domain_skills,
+                )
+            except CriticError as exc:
+                _discard(repo, scratch, branch, implement)
+                return TaskResult(
+                    task_id, "escalated", attempts=attempts,
+                    handoff_path=attempt.handoff_path, reason=str(exc),
+                )
             if events is not None:
-                events.work_gate_rejected(task_id, rej.reason)
-            failure_context.append(rej.reason)
-            prior_branch = _carry_or_discard(
-                rej, repo=repo, scratch=scratch, branch=branch, implement=implement,
-                task_id=task_id,
-            )
-            continue
+                events.verdict(task_id, verdict.outcome, verdict.reason)
 
-        # Gate-clean -> the tier-matched critic triages it (in the same scratch: the
-        # post-commit worktree for implement, the artifact dir for a non-write task).
-        try:
-            verdict = _critic_verdict(
-                task, task_id, scratch=scratch, base=base,
-                artifact_rel=attempt.artifact_rel, handoff_text=attempt.handoff_text,
-                critic_read_root=critic_read_root, run_dir=run_dir, backends=backends,
-                domain_skills=domain_skills,
-            )
-        except CriticError as exc:
-            _discard(repo, scratch, branch, implement)
-            return TaskResult(
-                task_id, "escalated", attempts=attempts,
-                handoff_path=attempt.handoff_path, reason=str(exc),
-            )
-        if events is not None:
-            events.verdict(task_id, verdict.outcome, verdict.reason)
-
-        if verdict.outcome == "PASS":
-            return TaskResult(
-                task_id, "passed", attempts=attempts,
-                handoff_path=attempt.handoff_path, verdict=verdict,
-                branch=branch, head=attempt.head, artifact_key=attempt.artifact_rel,
-            )
-        if verdict.outcome == "ESCALATE":
-            _discard(repo, scratch, branch, implement)
-            return TaskResult(
-                task_id, "escalated", attempts=attempts,
-                handoff_path=attempt.handoff_path, verdict=verdict,
-                reason=verdict.reason or "critic escalated to planner",
-            )
-        # RETRY: a defect the same worker can fix; chain the committed wip.
-        failure_context.append(f"critic RETRY: {verdict.reason}")
-        prior_branch = _carry_partial(repo, scratch, branch, implement, task_id)
+            if verdict.outcome == "PASS":
+                return TaskResult(
+                    task_id, "passed", attempts=attempts,
+                    handoff_path=attempt.handoff_path, verdict=verdict,
+                    branch=branch, head=attempt.head, artifact_key=attempt.artifact_rel,
+                )
+            if verdict.outcome == "ESCALATE":
+                if last_stage:
+                    _discard(repo, scratch, branch, implement)
+                    return TaskResult(
+                        task_id, "escalated", attempts=attempts,
+                        handoff_path=attempt.handoff_path, verdict=verdict,
+                        reason=verdict.reason or "critic escalated to planner",
+                    )
+                # Not the last stage: carry the wip up to the next (senior) tier.
+                failure_context.append(f"critic ESCALATE: {verdict.reason}")
+                prior_branch = _carry_partial(repo, scratch, branch, implement, task_id)
+                break
+            # RETRY: a defect the same worker can fix; chain the committed wip.
+            failure_context.append(f"critic RETRY: {verdict.reason}")
+            prior_branch = _carry_partial(repo, scratch, branch, implement, task_id)
+        # The stage ended without a PASS (budget exhausted, or ESCALATE broke out of a
+        # non-last stage): the loop advances to the next stage, which resumes the
+        # carried ``prior_branch``. The last stage falls through to the terminal below.
 
     reason = failure_context[-1] if failure_context else "no attempts"
     return TaskResult(
         task_id, "escalated", attempts=attempts,
-        reason=f"retries exhausted: {reason}",
+        reason=f"ladder exhausted: {reason}",
     )
 
 

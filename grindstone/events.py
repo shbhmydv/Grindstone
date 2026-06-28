@@ -138,6 +138,59 @@ class RateLimited(_Event):
     detail: str = ""
 
 
+# --- strike ladder (per-task repair-escalation) --------------------------------
+
+
+class StrikeLedgerEntry(BaseModel):
+    """One struck lineage's persisted shape inside a ``StrikeLedger`` snapshot: the
+    carried-unfinished task identity (its ``ownership`` globs for implement, or its
+    ``artifact_out`` for a non-write task) and the accumulated ``strikes`` (failed
+    epochs). Matched to a next-epoch task by ownership OVERLAP / artifact identity, so
+    the count survives a re-decomposition."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    ownership: list[str] = Field(default_factory=list)
+    artifact_out: str | None = None
+    mode: str
+    strikes: int
+    reason: str = ""
+
+
+class StrikeLedger(_Event):
+    # The authoritative snapshot of every currently-struck lineage AFTER an epoch's
+    # close (the DETERMINISTIC, resume-safe persistence of the strike ladder: a resumed
+    # run rebuilds the counts from the LAST snapshot, no in-memory state survives the
+    # crash). Emitted only when the ledger is non-empty or transitions to empty, so a
+    # run that never carries a task adds zero strike events (byte-identical journal).
+    event: Literal["strike_ledger"] = "strike_ledger"
+    epoch_id: str
+    entries: list[StrikeLedgerEntry]
+
+
+class TaskParked(_Event):
+    # Strike 2: a task whose lineage failed the WHOLE in-epoch tier ladder twice is
+    # REMOVED (BLOCKED) from the active set (not re-dispatched) so the run can still
+    # reach a clean partial-end. The structured, operator-visible signal ("the rig
+    # could not close this"); how an operator is notified lives OUTSIDE the engine.
+    event: Literal["task_parked"] = "task_parked"
+    epoch_id: str
+    task_id: str
+    strikes: int
+    reason: str = ""
+    descriptor: str = ""
+
+
+class TierEscalated(_Event):
+    # The IN-EPOCH tier ladder climbed: ``run_task`` exhausted a task's local stage and
+    # re-dispatched it (on the carried wip) at ``to_tier`` within the same epoch.
+    # ``attempt`` is the total dispatch number the escalated stage starts at.
+    event: Literal["tier_escalated"] = "tier_escalated"
+    epoch_id: str
+    task_id: str
+    to_tier: str
+    attempt: int
+
+
 Event = Annotated[
     Union[
         RunStarted,
@@ -152,6 +205,9 @@ Event = Annotated[
         WorkGateRejected,
         Verdict,
         RateLimited,
+        StrikeLedger,
+        TaskParked,
+        TierEscalated,
     ],
     Field(discriminator="event"),
 ]
@@ -298,6 +354,23 @@ class EpochNode:
 
 
 @dataclass
+class ParkedNode:
+    """A task the strike ladder PARKED (removed/BLOCKED from the active set at strike
+    2): the operator-facing "the rig could not close this" record. Surfaced at the run
+    level
+    (the parked task was removed BEFORE its epoch's task tree was built, so it has no
+    ``TaskNode``)."""
+
+    task_id: str
+    epoch_id: str
+    strikes: int
+    reason: str
+    #: The lineage descriptor (owned files / artifact key), the dedup key across the
+    #: epochs that re-propose the same parked lineage.
+    descriptor: str = ""
+
+
+@dataclass
 class RunTree:
     run_id: str
     job_path: str
@@ -313,6 +386,9 @@ class RunTree:
     end_summary: str | None = None
     #: The most recent rate-limit signal "role: detail", cleared on the next epoch.
     last_rate_limit: str | None = None
+    #: Tasks the strike ladder parked (strike 4), newest last. Deduped by lineage so a
+    #: lineage the planner re-proposes each epoch surfaces once (highest strike kept).
+    parked: list[ParkedNode] = field(default_factory=list)
 
 
 def _task(epoch: EpochNode, task_id: str) -> TaskNode:
@@ -351,6 +427,14 @@ def replay(events: list[Event]) -> RunTree:
             tree.end_summary = ev.summary
         elif isinstance(ev, RateLimited):
             tree.last_rate_limit = f"{ev.role}: {ev.detail}" if ev.detail else ev.role
+        elif isinstance(ev, TaskParked):
+            # Dedup by lineage descriptor: the planner may re-propose a parked lineage
+            # each epoch, so keep ONE entry (the latest, highest-strike) per descriptor.
+            key = ev.descriptor or ev.task_id
+            tree.parked = [p for p in tree.parked if (p.descriptor or p.task_id) != key]
+            tree.parked.append(
+                ParkedNode(ev.task_id, ev.epoch_id, ev.strikes, ev.reason, ev.descriptor)
+            )
         elif isinstance(ev, EpochStarted):
             tasks = [TaskNode(t.id, t.mode, "pending") for t in ev.tasks]
             epoch = EpochNode(ev.epoch_id, ev.title, "started", tasks, started_ts=ev.ts)

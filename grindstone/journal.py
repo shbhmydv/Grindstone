@@ -70,6 +70,16 @@ def render_journal(tree: RunTree) -> str:
             )
         lines.append("")
 
+    if tree.parked:
+        lines.append("## Parked (the rig could not close these)")
+        for p in tree.parked:
+            who = f"{p.descriptor} ({p.task_id}, {p.epoch_id})" if p.descriptor else (
+                f"{p.task_id} ({p.epoch_id})"
+            )
+            reason = f"  - {p.reason}" if p.reason else ""
+            lines.append(f"    [parked] {who}, {p.strikes} strikes{reason}")
+        lines.append("")
+
     if tree.end_summary:
         lines.append(f"Ended: {tree.end_summary}")
 

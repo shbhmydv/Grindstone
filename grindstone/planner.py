@@ -50,6 +50,7 @@ from grindstone.domain_skills import load_domain_skill_index
 from grindstone.repo_map import load_repo_map
 from grindstone.rundir import RunDir
 from grindstone.strategy_skill import load_strategy
+from grindstone.strikes import CarriedItem
 
 if TYPE_CHECKING:  # pragma: no cover - typing only (avoids the loop<->planner cycle)
     from grindstone.loop import CloseoutContext, PlannerContext
@@ -292,6 +293,51 @@ def _baton_block(context: PlannerContext) -> str:
     )
 
 
+def _carried_block(items: tuple[CarriedItem, ...]) -> str:
+    """The strike-ladder NUDGE (soft planner guidance): the task lineages that failed
+    the WHOLE in-epoch tier ladder (both local and senior already tried, in one epoch)
+    and were carried unfinished, each flagged with what the DETERMINISTIC state machine
+    will do if you re-issue an overlapping task (one reframe chance at strike 1, BLOCK
+    at strike 2).
+
+    Empty ``items`` -> ``""`` (so a run that never carried a task is byte-identical to
+    today and the cacheable system prefix is untouched). The instruction line is the
+    repair-epoch guidance: do NOT re-issue the same framing, REFRAME or RE-DECOMPOSE;
+    a re-decomposed child inherits its parent's strikes, so splitting cannot dodge the
+    block."""
+
+    if not items:
+        return ""
+    lines = []
+    for it in items:
+        if it.parked:
+            tag = "BLOCKED by the state machine - do NOT re-issue this; it was dropped"
+        else:
+            tag = (
+                "carried unfinished once (BOTH the local and senior tiers already "
+                "failed it in-epoch) - REFRAME or RE-DECOMPOSE into smaller pieces; a "
+                "re-decomposed child INHERITS the strike and a second failure BLOCKS "
+                "the lineage"
+            )
+        reason = f"; last failure: {it.reason}" if it.reason else ""
+        lines.append(
+            f"  - {it.descriptor} [{it.mode}], carried unfinished "
+            f"{it.strikes}x: {tag}{reason}"
+        )
+    body = "\n".join(lines)
+    return (
+        "<carried>\n"
+        "These task LINEAGES failed the WHOLE in-epoch tier ladder (each attempt was "
+        "already retried locally AND escalated to the senior tier within its epoch) and "
+        "were carried unfinished (one strike per failed epoch). Re-issuing the SAME "
+        "framing has not worked: when you schedule one again, REFRAME or RE-DECOMPOSE it "
+        "into smaller, differently-shaped tasks. A re-decomposed child INHERITS its "
+        "parent's strikes (splitting does not reset the ladder), and a SECOND full-ladder "
+        "failure BLOCKS the lineage: the state machine drops it from the active set.\n"
+        f"{body}\n</carried>\n"
+    )
+
+
 def _domain_skills_block(index: dict[str, str]) -> str:
     if not index:
         return ""
@@ -391,6 +437,7 @@ def build_planner_input(
         f"<job>\n{context.job}\n</job>\n"
         f"{_state_block(context)}"
         f"{_baton_block(context)}"
+        f"{_carried_block(context.carried)}"
         f"{_repo_map_block(repo_map)}"
         f"{_domain_skills_block(domain_skill_index)}"
         f"{_TOOLS_BLOCK}"
@@ -457,6 +504,25 @@ def _pending_additions_block(context: CloseoutContext) -> str:
     )
 
 
+def _parked_block(context: CloseoutContext) -> str:
+    """The strike-ladder BLOCK note for close-out: lineages the state machine dropped
+    this epoch (strike 2). The baton's ## Pending / ## Current status should record
+    them as "could not close" so the next self does not keep re-proposing them. Empty
+    ``parked`` -> ``""`` (byte-identical to a run that parked nothing)."""
+
+    if not context.parked:
+        return ""
+    items = "\n".join(f"  - {d}" for d in context.parked)
+    return (
+        "<parked>\n"
+        "The state machine BLOCKED these task lineages this epoch (they failed the WHOLE "
+        "in-epoch tier ladder - local AND senior - across two epochs and were dropped, so "
+        "the run can still reach a clean end). Note them in the baton as unclosed - do "
+        "NOT keep re-proposing them:\n"
+        f"{items}\n</parked>\n"
+    )
+
+
 _CLOSEOUT_TOOLS_BLOCK = (
     "<tools>\n"
     "Your workdir is a checkout of this epoch's staging tree. GREP and READ it, and "
@@ -495,6 +561,7 @@ def build_closeout_input(
         f"{_prior_baton_block(context)}"
         f"{_epoch_report_block(context)}"
         f"{_pending_additions_block(context)}"
+        f"{_parked_block(context)}"
         f"{_repo_map_block(repo_map)}"
         f"{skills}"
         f"{_CLOSEOUT_TOOLS_BLOCK}"

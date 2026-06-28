@@ -1007,3 +1007,207 @@ def test_sigterm_midrun_is_resumable_stop_with_no_git_mutation(
     from grindstone.events import RunCompleted, RunEnded
     assert any(isinstance(e, RunEnded) for e in events)
     assert not any(isinstance(e, RunCompleted) for e in events)
+
+
+# --- the strike ladder (per-task repair-escalation) ----------------------------
+
+
+@dataclass
+class _FileEscalatingWorker:
+    """A concurrency-safe loop worker for the strike-ladder tests. An implement task
+    whose ownership intersects ``escalate_files`` writes its files (so the
+    deterministic gate passes) but its critic routes ESCALATE, so that file's lineage
+    fails one WHOLE epoch (one strike); every other task PASSES. Records each worker
+    grind's full task id in ``dispatched``, so a two-endpoint test (a distinct local +
+    senior instance) can prove BOTH tiers ran within one epoch's in-epoch ladder."""
+
+    escalate_files: frozenset[str]
+    dispatched: list[str] = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def _escalates(self, task: Task) -> bool:
+        return task.mode == "implement" and any(
+            f in self.escalate_files for f in task.file_ownership
+        )
+
+    def run(self, request: WorkerRequest) -> None:
+        task = request.task
+        if request.critic is not None:
+            outcome = "ESCALATE" if self._escalates(task) else "PASS"
+            (request.scratch / CRITIC_VERDICT_FILENAME).write_text(
+                json.dumps({"outcome": outcome, "reason": f"file {outcome}"}),
+                encoding="utf-8",
+            )
+            return
+        with self._lock:
+            self.dispatched.append(request.task_id)
+        if request.mode == "implement":
+            for f in task.file_ownership:
+                path = request.scratch / f
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    f"# {request.task_id}\nvalue = {request.task_id!r}\n",
+                    encoding="utf-8",
+                )
+        (request.scratch / HANDOFF_FILENAME).write_text(
+            f"# handoff {request.task_id}\nattempted\n", encoding="utf-8"
+        )
+
+
+def _two_tier_backends(
+    local: WorkerTransport, senior: WorkerTransport, *, slots: int = 2
+) -> Backends:
+    """A Backends with DISTINCT local + senior endpoints, so ``run_task``'s in-epoch
+    tier ladder actually escalates (``has_distinct_tier('senior')`` is True). Each tier
+    dispatches its own transport instance, so a test can see which tier ran."""
+
+    from grindstone.worker import _Endpoint
+
+    endpoints = {
+        "local": _Endpoint(local, threading.Semaphore(slots)),
+        "senior": _Endpoint(senior, threading.Semaphore(slots)),
+    }
+    return Backends(endpoints, {"local": "local", "senior": "senior"})
+
+
+def _strike_events(run_dir: RunDir) -> list[object]:
+    from grindstone.events import StrikeLedger, TaskParked, TierEscalated
+    return [
+        e for e in read_events(run_dir.events_path)
+        if isinstance(e, (StrikeLedger, TaskParked, TierEscalated))
+    ]
+
+
+def test_strike_ladder_blocks_after_two_full_ladder_failures(
+    git_repo: Path, run_dir: RunDir, job_path: Path
+) -> None:
+    # Senior is now reached IN-EPOCH every epoch: E1 grinds x.py at local, the critic
+    # ESCALATEs, the ladder re-dispatches it at SENIOR on the carried wip (still in E1),
+    # senior ESCALATEs too -> the WHOLE in-epoch ladder failed = strike 1. The planner
+    # re-issues at E2 (its one reframe chance) -> strike 2. At E3 the strike-2 lineage
+    # is BLOCKED (parked, dropped from dispatch). No cross-epoch force-senior rung.
+    from grindstone import strikes
+    from grindstone.events import TaskParked, TierEscalated
+
+    script = [_epoch(_impl("T1", ["x.py"])) for _ in range(3)] + [_end("stopping")]
+    planner = MockDecisionPlanner(script)
+    local_w = _FileEscalatingWorker(escalate_files=frozenset({"x.py"}))
+    senior_w = _FileEscalatingWorker(escalate_files=frozenset({"x.py"}))
+    result = start_run(
+        job_path=job_path, run_dir=run_dir, repo=git_repo, planner=planner,
+        backends=_two_tier_backends(local_w, senior_w), max_epochs=8,
+        acceptance=lambda ctx: False,
+    )
+    assert result.status == "ended"
+
+    events = read_events(run_dir.events_path)
+    # E1's in-epoch ladder dispatched x.py at BOTH tiers (local first, then senior on the
+    # carried wip) within the ONE epoch, signalled by a TierEscalated event.
+    assert "E1/T1" in local_w.dispatched
+    assert "E1/T1" in senior_w.dispatched
+    e1_esc = [e for e in events if isinstance(e, TierEscalated) and e.epoch_id == "E1"]
+    assert len(e1_esc) == 1 and e1_esc[0].to_tier == "senior"
+
+    # Strike 2 BLOCKED the lineage at E3: a structured park event + removed from dispatch.
+    parked = [e for e in events if isinstance(e, TaskParked)]
+    assert len(parked) == 1
+    assert parked[0].epoch_id == "E3" and parked[0].strikes == 2
+    assert parked[0].descriptor == "x.py"
+    e3_dispatched = [
+        e for e in events
+        if e.event == "task_dispatched" and e.epoch_id == "E3"
+    ]
+    assert e3_dispatched == []  # blocked => never dispatched
+
+    # The reconstructed ledger persisted the lineage at 2 strikes (resume-safe), and
+    # the blocked lineage surfaced in the run summary so the operator sees it.
+    ledger = strikes.reconstruct_entries(events)
+    assert {e.ownership: e.strikes for e in ledger} == {("x.py",): 2}
+    assert "PARKED" in result.summary and "x.py" in result.summary
+    # x.py never merged: the blocked, never-passing work is not on the run branch.
+    assert "x.py" not in wt.list_tree(git_repo, "grind/run-1")
+
+
+def test_redecomposed_child_inherits_parent_strikes(
+    git_repo: Path, run_dir: RunDir, job_path: Path
+) -> None:
+    # E1 issues ONE task owning a.py + b.py; it escalates (strike 1 for that lineage).
+    # E2 RE-DECOMPOSES it into two tasks (a.py alone, b.py alone): a.py lands, b.py
+    # escalates. The b.py child must INHERIT the parent's strike and climb to 2 -
+    # relabelling cannot reset the ladder.
+    from grindstone import strikes
+
+    planner = MockDecisionPlanner(
+        [
+            _epoch(_impl("T1", ["a.py", "b.py"])),
+            _epoch(_impl("T1", ["a.py"]), _impl("T2", ["b.py"])),
+            _end("done"),
+        ]
+    )
+    worker = _FileEscalatingWorker(escalate_files=frozenset({"b.py"}))
+    result = start_run(
+        job_path=job_path, run_dir=run_dir, repo=git_repo, planner=planner,
+        backends=_backends(worker), max_epochs=6, acceptance=lambda ctx: False,
+    )
+    assert result.status == "ended"
+
+    ledger = strikes.reconstruct_entries(read_events(run_dir.events_path))
+    # ONLY the b.py lineage remains, at strike 2 (parent's 1 + this epoch): the a.py
+    # half resolved, the parent [a,b] lineage was superseded by the inheriting child.
+    assert {e.ownership: e.strikes for e in ledger} == {("b.py",): 2}
+    # a.py merged (it passed in E2); b.py never did.
+    tip = wt.list_tree(git_repo, "grind/run-1")
+    assert "a.py" in tip and "b.py" not in tip
+
+
+def test_no_carry_run_has_no_strike_events(
+    git_repo: Path, run_dir: RunDir, job_path: Path
+) -> None:
+    # Backward-compat: a run where every task lands never strikes a lineage, so it emits
+    # ZERO strike-ladder events (the journal is byte-identical to before the feature).
+    planner = MockDecisionPlanner(
+        [_epoch(_impl("T1", ["a.py"])), _epoch(_impl("T1", ["b.py"])), _end()]
+    )
+    result = start_run(
+        job_path=job_path, run_dir=run_dir, repo=git_repo, planner=planner,
+        backends=_backends(LoopWorker()), max_epochs=5,
+    )
+    assert result.status == "completed"
+    assert _strike_events(run_dir) == []
+    assert "PARKED" not in result.summary
+
+
+def test_resume_reconstructs_strike_state_across_a_fresh_run(
+    git_repo: Path, run_dir: RunDir, job_path: Path
+) -> None:
+    # Two epochs fail the whole in-epoch ladder for x.py (the ledger reaches 2 strikes,
+    # persisted on disk), then the planner ENDS -> a resumable partial-end. A FRESH
+    # resume_run (new planner, new worker, no in-memory state) re-proposes x.py at E3;
+    # the strike count must be rebuilt FROM THE JOURNAL so the deterministic BLOCK (park
+    # at strike 2) still fires.
+    from grindstone.events import TaskParked
+
+    first = MockDecisionPlanner(
+        [_epoch(_impl("T1", ["x.py"])) for _ in range(2)] + [_end("paused")]
+    )
+    w1 = _FileEscalatingWorker(escalate_files=frozenset({"x.py"}))
+    r1 = start_run(
+        job_path=job_path, run_dir=run_dir, repo=git_repo, planner=first,
+        backends=_backends(w1), max_epochs=8, acceptance=lambda ctx: False,
+    )
+    assert r1.status == "ended" and r1.epochs == 2
+    # No park yet in the first run (it only reached strike 2 AT the E3 boundary, where
+    # the planner ended instead of grinding).
+    assert not any(isinstance(e, TaskParked) for e in read_events(run_dir.events_path))
+
+    resumed = MockDecisionPlanner([_epoch(_impl("T1", ["x.py"])), _end("done2")])
+    w2 = _FileEscalatingWorker(escalate_files=frozenset({"x.py"}))
+    r2 = resume_run(
+        run_dir=run_dir, repo=git_repo, planner=resumed,
+        backends=_backends(w2), max_epochs=8, acceptance=lambda ctx: False,
+    )
+    assert r2.status == "ended"
+    parked = [e for e in read_events(run_dir.events_path) if isinstance(e, TaskParked)]
+    assert len(parked) == 1 and parked[0].epoch_id == "E3"  # reconstructed from disk
+    assert parked[0].strikes == 2
+    assert w2.dispatched == []  # blocked => the fresh worker never ground x.py

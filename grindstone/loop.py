@@ -64,6 +64,7 @@ from types import FrameType
 from typing import Any, Callable, Literal, Protocol, Sequence
 
 from grindstone import reaper
+from grindstone import strikes
 from grindstone import worktree as wt
 from grindstone.config import (
     GrindstoneConfig,
@@ -91,9 +92,13 @@ from grindstone.events import (
     RunEnded,
     RunResumed,
     RunStarted,
+    StrikeLedger,
+    StrikeLedgerEntry,
     TaskDispatched,
     TaskDone,
+    TaskParked,
     TaskRef,
+    TierEscalated,
     read_events,
 )
 from grindstone.events import Verdict as VerdictEvent
@@ -165,6 +170,12 @@ class PlannerContext:
     #: The 1-based epoch number about to be planned, and the backstop.
     epoch_index: int
     max_epochs: int
+    #: The strike-ladder NUDGE (soft): the lineages carried unfinished across prior
+    #: epochs, each flagged with the deterministic action the state machine will take
+    #: (force senior at 3, park at 4). Reconstructed from the journal, so it survives a
+    #: resume. Empty (the default) for a run that never carried a task -> byte-identical
+    #: planner prompt.
+    carried: tuple[strikes.CarriedItem, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -207,6 +218,10 @@ class CloseoutContext:
     #: the prior baton's ``## Pending`` against the deterministic per-task outcomes into
     #: the new ``## Pending``. Empty by default (an EndDecision never reaches close-out).
     pending_additions: tuple[str, ...] = ()
+    #: The lineage descriptors the strike ladder PARKED this epoch (strike 4: removed
+    #: from the active set). The close-out notes them in the baton as unclosed. Empty by
+    #: default (a run that parked nothing is byte-identical to today).
+    parked: tuple[str, ...] = ()
 
 
 class Planner(Protocol):
@@ -327,6 +342,15 @@ class _JournalAttemptEvents:
             )
         )
 
+    def tier_escalated(self, task_id: str, to_tier: str, attempt: int) -> None:
+        tid = _short_id(task_id)
+        self._journal.emit(
+            lambda s: TierEscalated(
+                seq=s, ts=self._now(), epoch_id=self._epoch_id, task_id=tid,
+                to_tier=to_tier, attempt=attempt,
+            )
+        )
+
 
 # --- tip + context -------------------------------------------------------------
 
@@ -358,10 +382,12 @@ def _build_context(
     tip_ref: str | None,
     epoch_index: int,
     max_epochs: int,
+    carried: tuple[strikes.CarriedItem, ...] = (),
 ) -> PlannerContext:
     """Reconstruct the PLAN window FROM DISK: the keyed-log index + the prior epoch's
-    baton (``read_baton(epoch_index - 1)``, ``""`` for epoch 1). No file-name dump (the
-    planner greps its own workdir for the tree)."""
+    baton (``read_baton(epoch_index - 1)``, ``""`` for epoch 1) + the strike-ladder
+    nudge (``carried``, reconstructed from the journal by the caller). No file-name dump
+    (the planner greps its own workdir for the tree)."""
 
     return PlannerContext(
         job=job,
@@ -373,6 +399,7 @@ def _build_context(
         baton=run_dir.read_baton(epoch_index - 1),
         epoch_index=epoch_index,
         max_epochs=max_epochs,
+        carried=carried,
     )
 
 
@@ -674,13 +701,17 @@ def _finalize_epoch(
     run_branch: str | None,
     journal: JournalWriter,
     now_fn: NowFn,
+    strike_entries: list[StrikeLedgerEntry] | None = None,
 ) -> None:
     """The atomic durable commit point, run AFTER close-out wrote the baton: if work
     merged, fast-forward the run branch to the staging tip and delete the staging +
     every transient ``grind-wip/`` branch (this epoch's only); then persist the baton
-    to ``E<n>/baton.md`` and emit ``EpochCompleted`` (which now IMPLIES "baton
-    written"). With no merged work (no passers / setup failure / conflict) there is
-    nothing to fast-forward, but the epoch still completes WITH a baton."""
+    to ``E<n>/baton.md``, emit the strike-ledger snapshot (when the ladder changed this
+    epoch), and emit ``EpochCompleted`` (which now IMPLIES "baton written" AND "strike
+    snapshot final": both are emitted immediately before it, so an epoch that crashes
+    before ``EpochCompleted`` leaves no counted strike snapshot). With no merged work
+    (no passers / setup failure / conflict) there is nothing to fast-forward, but the
+    epoch still completes WITH a baton."""
 
     epoch_id = f"E{epoch_index}"
     if staging.staging_tip is not None:
@@ -692,6 +723,13 @@ def _finalize_epoch(
     baton_path = run_dir.baton_path(epoch_index)
     baton_path.parent.mkdir(parents=True, exist_ok=True)
     baton_path.write_text(baton_text, encoding="utf-8")
+    if strike_entries is not None:
+        entries = strike_entries
+        journal.emit(
+            lambda s: StrikeLedger(
+                seq=s, ts=now_fn(), epoch_id=epoch_id, entries=entries
+            )
+        )
     journal.emit(lambda s: EpochCompleted(seq=s, ts=now_fn(), epoch_id=epoch_id))
 
 
@@ -751,6 +789,39 @@ def _raze_epoch(
 
 
 # --- terminal emitters ---------------------------------------------------------
+
+
+def _park_event(
+    pk: strikes.ParkedTask, epoch_id: str, now_fn: NowFn
+) -> Callable[[int], TaskParked]:
+    """A seq-assigning factory for the ``task_parked`` event (one parked lineage)."""
+
+    return lambda s: TaskParked(
+        seq=s, ts=now_fn(), epoch_id=epoch_id, task_id=pk.task_id,
+        strikes=pk.strikes, reason=pk.reason, descriptor=pk.descriptor,
+    )
+
+
+def _result_reason(result: TaskResult) -> str:
+    """The strike's recorded reason for a non-landed task: the escalation reason, else
+    the critic verdict's reason, else a terse default (never empty in the ledger)."""
+
+    if result.reason:
+        return result.reason
+    if result.verdict is not None and result.verdict.reason:
+        return result.verdict.reason
+    return "did not land"
+
+
+def _append_parked(summary: str, run_dir: RunDir) -> str:
+    """Append the parked-lineage block to a terminal summary so the operator sees "the
+    rig could not close these N tasks". Reconstructed from the journal (the last
+    completed strike snapshot), so it is resume-stable. A no-park run adds nothing (the
+    summary stays byte-identical to today)."""
+
+    entries = strikes.reconstruct_entries(read_events(run_dir.events_path))
+    block = strikes.summarize_parked(entries)
+    return f"{summary}\n\n{block}" if block else summary
 
 
 def _emit_completed(journal: JournalWriter, now_fn: NowFn) -> None:
@@ -858,7 +929,9 @@ def _run_interruptible(
     try:
         return body()
     except _Interrupted as exc:
-        summary = f"run interrupted by signal {exc.signum}; resume to continue"
+        summary = _append_parked(
+            f"run interrupted by signal {exc.signum}; resume to continue", run_dir
+        )
         _emit_ended(journal, now_fn, summary)
         return RunResult(
             "ended", summary, _completed_count(read_events(run_dir.events_path))
@@ -900,9 +973,13 @@ def _drive(
     while epoch_index <= max_epochs:
         _reap_prior_logs(log_root, epoch_index)
         tip_ref = _resolve_tip(repo, run_branch)
+        # Strike ladder: rebuild the struck-lineage ledger FROM DISK (resume-safe) and
+        # render the carried nudge into the PLAN context BEFORE the planner decides.
+        ledger = strikes.reconstruct_entries(read_events(run_dir.events_path))
         context = _build_context(
             job=job, repo=repo, run_dir=run_dir, run_branch=run_branch,
             tip_ref=tip_ref, epoch_index=epoch_index, max_epochs=max_epochs,
+            carried=strikes.render_carried(ledger),
         )
         try:
             decision = _plan_with_backoff(
@@ -911,45 +988,68 @@ def _drive(
             )
         except PlannerError as exc:
             summary = f"planner could not continue at E{epoch_index}: {exc}"
+            summary = _append_parked(summary, run_dir)
             _emit_ended(journal, now_fn, summary)
             return RunResult("ended", summary, epoch_index - 1)
 
         if isinstance(decision, EndDecision):
             if acceptance is None or acceptance(context):
                 _emit_completed(journal, now_fn)
-                return RunResult("completed", decision.summary, epoch_index - 1)
-            _emit_ended(journal, now_fn, decision.summary)
-            return RunResult("ended", decision.summary, epoch_index - 1)
+                return RunResult(
+                    "completed", _append_parked(decision.summary, run_dir),
+                    epoch_index - 1,
+                )
+            summary = _append_parked(decision.summary, run_dir)
+            _emit_ended(journal, now_fn, summary)
+            return RunResult("ended", summary, epoch_index - 1)
 
         epoch = decision.epoch
         epoch_id = f"E{epoch_index}"
         base = tip_ref
+        # The plan-time rung (DETERMINISTIC, pre-dispatch): match the proposed tasks to
+        # the struck ledger and PARK (BLOCK) any lineage at strike 2 (its second
+        # whole-ladder failure). Only the kept set is dispatched; the parked drops are
+        # journaled here. Senior is reached in-epoch now, so there is no tier override.
+        ladder = strikes.apply_ladder(epoch.tasks, ledger)
+        for pk in ladder.parked:
+            # ``emit`` invokes the factory synchronously, so the loop var is captured
+            # before it advances (no late-binding hazard, no default-arg needed).
+            journal.emit(_park_event(pk, epoch_id, now_fn))
+        kept = list(ladder.tasks)
+        parked_descriptors = tuple(pk.descriptor for pk in ladder.parked)
         try:
-            setup_err = _run_setup(
-                list(epoch.setup), repo=repo, run_dir=run_dir, base=base,
-            )
+            if kept:
+                run_epoch = epoch.model_copy(update={"tasks": kept})
+                setup_err = _run_setup(
+                    list(run_epoch.setup), repo=repo, run_dir=run_dir, base=base,
+                )
+            else:
+                # Every proposed task is a parked lineage: nothing to grind. Skip setup
+                # too (no work to prepare), close out, and advance so the planner re-plans.
+                run_epoch = epoch
+                setup_err = None
             journal.emit(
                 lambda s: EpochStarted(
                     seq=s, ts=now_fn(), epoch_id=epoch_id, title=epoch.title,
-                    tasks=[TaskRef(id=t.id, mode=t.mode) for t in epoch.tasks],
+                    tasks=[TaskRef(id=t.id, mode=t.mode) for t in kept],
                 )
             )
-            if setup_err is None:
+            if kept and setup_err is None:
                 results = _grind_epoch(
-                    epoch, epoch_id, base, repo=repo, run_dir=run_dir,
+                    run_epoch, epoch_id, base, repo=repo, run_dir=run_dir,
                     run_branch=run_branch, backends=backends, journal=journal,
                     log_root=log_root, sleep_fn=sleep_fn, backoff_s=backoff_s,
                     now_fn=now_fn,
                 )
-                tasks_by_id = {f"{epoch_id}/{t.id}": t for t in epoch.tasks}
+                tasks_by_id = {f"{epoch_id}/{t.id}": t for t in kept}
                 staging = _integrate_to_staging(
                     epoch_id, base, repo=repo, run_dir=run_dir, run_branch=run_branch,
                     results=results, tasks_by_id=tasks_by_id,
                 )
             else:
-                # A bad setup command will not pass on re-run; skip the grind, let the
-                # close-out baton record the setup error, and finalize so the planner
-                # sees it next boundary and changes its plan (NOT an abort).
+                # A bad setup command will not pass on re-run (and an all-parked epoch
+                # has nothing to grind); skip the grind, let the close-out baton record
+                # it, and finalize so the planner sees it next boundary (NOT an abort).
                 results = []
                 tasks_by_id = {}
                 staging = _Staging(conflict=None, staging_branch=None, staging_tip=None)
@@ -966,14 +1066,31 @@ def _drive(
                 setup_error=setup_err,
                 integration_conflict=staging.conflict,
                 pending_additions=tuple(decision.pending),
+                parked=parked_descriptors,
             )
             # CLOSE-OUT (node #1 parks): a RateLimited escapes to the handler below,
             # which razes + restarts the whole epoch (no advance). The baton is written
             # by finalize, BEFORE the EpochCompleted that marks the epoch done.
             baton_text = planner.close_out(closeout_ctx)
+            # Recompute the struck ledger from this epoch's deterministic outcomes; emit
+            # the new snapshot only when it CHANGED (so a no-carry run's journal stays
+            # byte-identical, while a transition to empty is still recorded).
+            new_ledger = strikes.next_ledger(
+                ledger,
+                landed=[tasks_by_id[r.task_id] for r in results if r.outcome == "passed"],
+                failed=[
+                    (tasks_by_id[r.task_id], _result_reason(r))
+                    for r in results
+                    if r.outcome != "passed"
+                ],
+            )
+            snapshot = (
+                strikes.to_event_entries(new_ledger) if new_ledger != ledger else None
+            )
             _finalize_epoch(
                 staging, baton_text, epoch_index, repo=repo, run_dir=run_dir,
                 run_branch=run_branch, journal=journal, now_fn=now_fn,
+                strike_entries=snapshot,
             )
             consec_aborts = 0
         except WorkerRateLimited:
@@ -1005,16 +1122,19 @@ def _drive(
             )
             _raze_epoch(run_dir, repo, run_branch, epoch_id, log_root)
             if consec_aborts >= MAX_CONSECUTIVE_ABORTS:
-                summary = (
+                summary = _append_parked(
                     f"{consec_aborts} consecutive epochs aborted on unexpected "
-                    f"errors (persistent infra fault); last: {detail}"
+                    f"errors (persistent infra fault); last: {detail}",
+                    run_dir,
                 )
                 _emit_ended(journal, now_fn, summary)
                 return RunResult("ended", summary, epoch_index - 1)
             continue
         epoch_index += 1
 
-    summary = f"max epochs ({max_epochs}) reached without a planned end"
+    summary = _append_parked(
+        f"max epochs ({max_epochs}) reached without a planned end", run_dir
+    )
     _emit_ended(journal, now_fn, summary)
     return RunResult("ended", summary, epoch_index - 1)
 

@@ -134,3 +134,28 @@ def test_reap_sibling_journals(tmp_path: Path) -> None:
     reap_sibling_journals(keep)
     assert keep.journal_path.is_file()  # the current run keeps its journal
     assert not other.journal_path.exists()  # siblings are reaped
+
+
+def test_render_surfaces_parked_lineages(tmp_path: Path) -> None:
+    # The strike ladder's task_parked events fold into a tree-level "Parked" section so
+    # an operator post-mortem shows "the rig could not close these", deduped by lineage.
+    from grindstone.events import TaskParked
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    rd = create_run_dir(repo, "run-p")
+    with JournalWriter(rd.events_path) as jw:
+        jw.emit(lambda s: RunStarted(seq=s, ts=_ts(0), run_id="run-p", job_path="j.md"))
+        jw.emit(lambda s: TaskParked(seq=s, ts=_ts(1), epoch_id="E5", task_id="T1",
+                                     strikes=2, reason="cannot close", descriptor="x.py"))
+        # The planner re-proposed the parked lineage next epoch; it dedups to one row.
+        jw.emit(lambda s: TaskParked(seq=s, ts=_ts(2), epoch_id="E6", task_id="T1",
+                                     strikes=2, reason="cannot close", descriptor="x.py"))
+        jw.emit(lambda s: RunEnded(seq=s, ts=_ts(3), summary="stopped"))
+    tree = replay(read_events(rd.events_path))
+    assert len(tree.parked) == 1 and tree.parked[0].descriptor == "x.py"
+    md = render_journal(tree)
+    assert "## Parked (the rig could not close these)" in md
+    assert "x.py" in md and "cannot close" in md and "2 strikes" in md
+    assert md.count("[parked]") == 1  # deduped to one row (latest epoch E6)
+    assert "E6" in md and "E5" not in md
