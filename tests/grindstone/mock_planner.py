@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Union
 
 from grindstone import worktree as wt
 from grindstone.check_decision import DECISION_FILE
+from grindstone.planner import BATON_FILE
 from grindstone.contracts.models import (
     Decision,
     EndDecision,
@@ -148,12 +149,14 @@ def _decision_text(decision: dict[str, object]) -> str:
 @dataclass(frozen=True)
 class MockRig:
     """One simulated rig run for ``MockPlannerTransport``: the content it writes to
-    each result channel. ``decision_json`` lands at ``workdir/decision.json`` (the
-    self-validated disk contract), ``out`` at the ``--out`` file, ``stdout`` is
-    returned. ``None`` leaves a channel un-written, so a test pins exactly which
-    channel the read-priority must pick (and can put DIFFERENT content on each)."""
+    each result channel. ``decision_json`` lands at ``workdir/decision.json`` and
+    ``baton`` at ``workdir/baton.md`` (the self-validated / free-form disk contracts a
+    writable rig grinds in the worktree), ``out`` at the ``--out`` file, ``stdout`` is
+    returned. ``None`` leaves a channel un-written, so a test pins exactly which channel
+    the read-priority must pick (and can put DIFFERENT content on each)."""
 
     decision_json: str | None = None
+    baton: str | None = None
     out: str | None = None
     stdout: str = ""
 
@@ -199,6 +202,8 @@ class MockPlannerTransport:
             (request.workdir / DECISION_FILE).write_text(
                 entry.decision_json, encoding="utf-8"
             )
+        if entry.baton is not None:
+            (request.workdir / BATON_FILE).write_text(entry.baton, encoding="utf-8")
         if entry.out is not None:
             request.out_file.write_text(entry.out, encoding="utf-8")
         return entry.stdout
