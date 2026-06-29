@@ -72,7 +72,7 @@ class ScriptWorker:
         self.timeout_s = timeout_s
         self.log_root = Path(log_root)
 
-    def run(self, request: WorkerRequest) -> None:
+    def run(self, request: WorkerRequest) -> str:
         prompt = build_prompt(request)
         slug = request.task_id.replace("/", "-")
         kind = "critic" if request.critic is not None else "worker"
@@ -121,7 +121,10 @@ class ScriptWorker:
                 raise TransportError(
                     f"{self.script.name} exited {proc.returncode}: {snippet}"
                 )
-            # Success: run_task reads the disk artifact from request.scratch.
+            # Success: run_task gates the worker's disk artifact (stdout discarded), and
+            # the CRITIC falls back to this stdout when it chatted its verdict instead of
+            # writing verdict.json (the local-model quirk; mirrors the planner's read).
+            return stdout or ""
         finally:
             reaper.unregister(proc.pid)
 

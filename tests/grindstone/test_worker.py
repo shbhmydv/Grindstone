@@ -389,11 +389,12 @@ def test_critic_verdict_threads_domain_skills(git_repo: Path, run_dir: RunDir) -
     captured: list[dict[str, str]] = []
 
     class _Recorder:
-        def run(self, request: WorkerRequest) -> None:
+        def run(self, request: WorkerRequest) -> str:
             captured.append(dict(request.domain_skills))
             (request.scratch / CRITIC_VERDICT_FILENAME).write_text(
                 json.dumps({"outcome": "PASS", "reason": "ok"}), encoding="utf-8"
             )
+            return ""
 
     base = wt.head_commit(git_repo)
     scratch = run_dir.artifacts_dir("E1/T1/critic")
@@ -419,7 +420,7 @@ class _TierWorker:
     critic_outcome: str
     worker_calls: list[str] = field(default_factory=list)
 
-    def run(self, request: "WorkerRequest") -> None:
+    def run(self, request: "WorkerRequest") -> str:
         if request.critic is not None:
             (request.scratch / CRITIC_VERDICT_FILENAME).write_text(
                 json.dumps(
@@ -427,7 +428,7 @@ class _TierWorker:
                 ),
                 encoding="utf-8",
             )
-            return
+            return ""
         self.worker_calls.append(request.task_id)
         for rel in request.task.file_ownership:
             path = request.scratch / rel
@@ -436,6 +437,7 @@ class _TierWorker:
                 f"# {request.task_id}\nvalue = {request.task_id!r}\n", encoding="utf-8"
             )
         (request.scratch / HANDOFF_FILENAME).write_text("# handoff\n", encoding="utf-8")
+        return ""
 
 
 def _two_tier_backends(
@@ -618,3 +620,182 @@ def test_worker_prompt_resume_leads_with_fix_frame() -> None:
     assert "create a.py" in prompt  # the goal text, as reference
     # No leading active <task> command (that is the fresh shape).
     assert not prompt.startswith("<task")
+
+
+# --- the CRITIC FAILURE NODE: a chatted verdict is recovered, not lost --------------
+
+
+@dataclass
+class _EventRecorder:
+    """An ``AttemptEvents`` sink that records every hook as a tuple, so a test can
+    assert the CRITIC FAILURE NODE emitted the right observability events."""
+
+    events: list[tuple[object, ...]] = field(default_factory=list)
+
+    def work_gate_passed(self, task_id: str) -> None:
+        self.events.append(("work_gate_passed", task_id))
+
+    def work_gate_rejected(self, task_id: str, reason: str) -> None:
+        self.events.append(("work_gate_rejected", task_id, reason))
+
+    def verdict(self, task_id: str, outcome: str, reason: str) -> None:
+        self.events.append(("verdict", task_id, outcome, reason))
+
+    def tier_escalated(self, task_id: str, to_tier: str, attempt: int) -> None:
+        self.events.append(("tier_escalated", task_id, to_tier, attempt))
+
+    def critic_recovered(self, task_id: str, tier: str) -> None:
+        self.events.append(("critic_recovered", task_id, tier))
+
+    def critic_escalated(self, task_id: str, to_tier: str) -> None:
+        self.events.append(("critic_escalated", task_id, to_tier))
+
+    def critic_failed(self, task_id: str, tier: str, snippet: str) -> None:
+        self.events.append(("critic_failed", task_id, tier, snippet))
+
+
+class _ChatCritic:
+    """A critic transport that NEVER writes ``verdict.json``: it CHATS its verdict to
+    stdout (the local-model quirk the fallback must recover). ``outcome=None`` chats
+    junk with no parseable JSON object at all."""
+
+    def __init__(self, outcome: str | None) -> None:
+        self.outcome = outcome
+
+    def run(self, request: WorkerRequest) -> str:
+        if self.outcome is None:
+            return "I looked at the work; it seems okay but I will not emit any JSON."
+        return (
+            "Sure, here is my triage.\n\n```json\n"
+            + json.dumps({"outcome": self.outcome, "reason": "chatted not filed"})
+            + "\n```\nThat is my verdict."
+        )
+
+
+class _BothChannelsCritic:
+    """Writes ``verdict.json`` (PASS) AND chats a DIFFERENT verdict (ESCALATE): the
+    disk-contract file MUST win and stdout be ignored (byte-identical to today)."""
+
+    def run(self, request: WorkerRequest) -> str:
+        (request.scratch / CRITIC_VERDICT_FILENAME).write_text(
+            json.dumps({"outcome": "PASS", "reason": "from file"}), encoding="utf-8"
+        )
+        return json.dumps({"outcome": "ESCALATE", "reason": "from stdout"})
+
+
+def test_critic_verdict_recovers_chatted_verdict_from_stdout(
+    git_repo: Path, run_dir: RunDir
+) -> None:
+    # The bug: a critic that answers in CHAT (no verdict.json) USED to be lost as a
+    # CriticError. Now the stdout fallback recovers the JSON, persists it to the
+    # keyed-log dest, and emits critic_recovered.
+    from grindstone.worker import _critic_verdict
+
+    base = wt.head_commit(git_repo)
+    scratch = run_dir.artifacts_dir("E1/T1/critic")
+    rec = _EventRecorder()
+    verdict = _critic_verdict(
+        _implement(), "E1/T1", tier="local", scratch=scratch, base=base,
+        artifact_rel=None, handoff_text="", critic_read_root=git_repo, run_dir=run_dir,
+        backends=Backends.single(_ChatCritic("PASS")), domain_skills={}, events=rec,
+    )
+    assert verdict.outcome == "PASS"
+    # Persisted to the keyed-log dest even though NO scratch verdict.json ever existed.
+    dest = run_dir.resolve(f"E1/T1/{CRITIC_VERDICT_FILENAME}")
+    assert dest.is_file()
+    assert json.loads(dest.read_text())["outcome"] == "PASS"
+    assert ("critic_recovered", "E1/T1", "local") in rec.events
+
+
+def test_critic_verdict_file_takes_precedence_over_stdout(
+    git_repo: Path, run_dir: RunDir
+) -> None:
+    # When verdict.json IS present the stdout channel is IGNORED (the 90% path stays
+    # byte-identical): the file's PASS wins over the stdout's ESCALATE, no recovery.
+    from grindstone.worker import _critic_verdict
+
+    base = wt.head_commit(git_repo)
+    scratch = run_dir.artifacts_dir("E1/T1/critic")
+    rec = _EventRecorder()
+    verdict = _critic_verdict(
+        _implement(), "E1/T1", tier="local", scratch=scratch, base=base,
+        artifact_rel=None, handoff_text="", critic_read_root=git_repo, run_dir=run_dir,
+        backends=Backends.single(_BothChannelsCritic()), domain_skills={}, events=rec,
+    )
+    assert verdict.outcome == "PASS" and verdict.reason == "from file"
+    assert not any(e[0] == "critic_recovered" for e in rec.events)
+    # The disk file was MOVED out of scratch (never swept into a later commit).
+    assert not (scratch / CRITIC_VERDICT_FILENAME).exists()
+
+
+@dataclass
+class _ChatCriticWorker:
+    """Lands implement work on a WORKER dispatch (the deterministic gate passes), and
+    on a CRITIC dispatch answers in CHAT: ``critic_verdict`` None = unparseable junk,
+    else a JSON verdict wrapped in prose (the stdout fallback recovers it). Records
+    every worker grind so a test can prove the worker is NOT re-run when the critic
+    node escalates the CRITIC alone."""
+
+    critic_verdict: str | None
+    worker_calls: list[str] = field(default_factory=list)
+
+    def run(self, request: WorkerRequest) -> str:
+        if request.critic is not None:
+            if self.critic_verdict is None:
+                return "I cannot decide and I will not emit any JSON for this."
+            return "Verdict:\n" + json.dumps(
+                {"outcome": self.critic_verdict, "reason": "chatted"}
+            )
+        self.worker_calls.append(request.task_id)
+        for rel in request.task.file_ownership:
+            path = request.scratch / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                f"# {request.task_id}\nvalue = {request.task_id!r}\n", encoding="utf-8"
+            )
+        (request.scratch / HANDOFF_FILENAME).write_text("# handoff\n", encoding="utf-8")
+        return ""
+
+
+def test_resilient_critic_escalates_to_senior_on_chatted_local_critic(
+    git_repo: Path, run_dir: RunDir
+) -> None:
+    # The local critic chats UNPARSEABLE junk for both of its dispatches; the resilient
+    # node bumps the CRITIC (not the worker) to senior, which judges the SAME passed
+    # work and chats a recoverable PASS. The worker grinds exactly ONCE.
+    base = wt.head_commit(git_repo)
+    local = _ChatCriticWorker(critic_verdict=None)
+    senior = _ChatCriticWorker(critic_verdict="PASS")
+    rec = _EventRecorder()
+    result = run_task(
+        _implement(), "E1/T1", run_dir=run_dir, repo=git_repo, base=base,
+        backends=_two_tier_backends(local, senior), events=rec,
+    )
+    assert result.outcome == "passed"
+    assert result.verdict is not None and result.verdict.outcome == "PASS"
+    # The WORKER ran once (at local); the node reached senior for the CRITIC only.
+    assert local.worker_calls == ["E1/T1"]
+    assert senior.worker_calls == []  # senior only judged; it never grinded
+    assert ("critic_escalated", "E1/T1", "senior") in rec.events
+    assert ("critic_recovered", "E1/T1", "senior") in rec.events
+
+
+def test_resilient_critic_never_faults_and_carries_chat_snippet(
+    git_repo: Path, run_dir: RunDir
+) -> None:
+    # Every critic dispatch chats unparseable junk and there is no distinct senior:
+    # the node exhausts WITHOUT a crash -> run_task returns "escalated" (the planner
+    # route), the reason carries a snippet of the model's chat, and CriticFailed fires.
+    base = wt.head_commit(git_repo)
+    worker = _ChatCriticWorker(critic_verdict=None)
+    rec = _EventRecorder()
+    result = run_task(
+        _implement(), "E1/T1", run_dir=run_dir, repo=git_repo, base=base,
+        backends=Backends.single(worker), events=rec,
+    )
+    assert result.outcome == "escalated"
+    assert "will not emit any JSON" in result.reason
+    failed = [e for e in rec.events if e[0] == "critic_failed"]
+    assert failed and "will not emit any JSON" in str(failed[0][3])
+    # The worker ran exactly once: only the CRITIC failed, the gate had passed.
+    assert worker.worker_calls == ["E1/T1"]

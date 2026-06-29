@@ -73,21 +73,17 @@ def _balanced_object_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _is_decision_like(obj: object) -> bool:
-    """True for an object carrying the discriminator ``kind`` (epoch or end)."""
+def _select_json_object(text: str, discriminator: str) -> str | None:
+    """Return the source of the JSON object carrying ``discriminator``, or ``None``.
 
-    return isinstance(obj, dict) and "kind" in obj
-
-
-def extract_decision_json(text: str) -> str | None:
-    """Return the source text of the decision JSON object, or ``None``.
-
-    Scan every balanced top-level object, keep those that parse, and prefer the
-    LAST one carrying a ``kind`` key (a model may reason before the final answer).
-    Falls back to the last parsing object, then to ``None`` when nothing parses.
+    The generic free-text sniffer shared by ``extract_decision_json`` (discriminator
+    ``kind``) and ``extract_verdict_json`` (discriminator ``outcome``): scan every
+    balanced top-level object, keep those that parse, and prefer the LAST one carrying
+    the discriminator key (a model may reason before its final answer). Falls back to
+    the last parsing object, then to ``None`` when nothing parses.
     """
 
-    decision_like: list[str] = []
+    discriminated: list[str] = []
     any_object: list[str] = []
     for start, end in _balanced_object_spans(text):
         sub = text[start:end]
@@ -97,13 +93,29 @@ def extract_decision_json(text: str) -> str | None:
             continue
         if isinstance(obj, dict):
             any_object.append(sub)
-            if _is_decision_like(obj):
-                decision_like.append(sub)
-    if decision_like:
-        return decision_like[-1]
+            if discriminator in obj:
+                discriminated.append(sub)
+    if discriminated:
+        return discriminated[-1]
     if any_object:
         return any_object[-1]
     return None
+
+
+def extract_decision_json(text: str) -> str | None:
+    """Recover the planner's decision object from free text (it may reason first),
+    preferring the LAST object carrying the ``kind`` discriminator."""
+
+    return _select_json_object(text, "kind")
+
+
+def extract_verdict_json(text: str) -> str | None:
+    """Recover the critic's lenient verdict object from free-text chat (a local model
+    that answered in prose instead of writing ``verdict.json``), preferring the LAST
+    object carrying the ``outcome`` discriminator. The verdict twin of
+    ``extract_decision_json`` (both share ``_select_json_object``)."""
+
+    return _select_json_object(text, "outcome")
 
 
 # --- the gate (re-execs the real core validator) -------------------------------

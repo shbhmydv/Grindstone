@@ -191,6 +191,41 @@ class TierEscalated(_Event):
     attempt: int
 
 
+# --- the critic FAILURE NODE (gate passed, but the critic could not emit a verdict) --
+
+
+class CriticRecovered(_Event):
+    # The critic answered in CHAT instead of writing ``verdict.json`` (the local-model
+    # transport quirk), and the stdout fallback recovered a parseable lenient verdict.
+    # Observability only: the work proceeds on the recovered verdict, no retry burned.
+    event: Literal["critic_recovered"] = "critic_recovered"
+    epoch_id: str
+    task_id: str
+    tier: str
+
+
+class CriticEscalated(_Event):
+    # The critic FAILURE NODE bumped a chatted-out (no parseable verdict) critic up to
+    # the senior tier to judge the SAME already-passed work (no re-grind), after the
+    # task-tier critic exhausted its own dispatches.
+    event: Literal["critic_escalated"] = "critic_escalated"
+    epoch_id: str
+    task_id: str
+    to_tier: str
+
+
+class CriticFailed(_Event):
+    # The critic FAILURE NODE exhausted every dispatch (task tier + senior) without a
+    # parseable verdict: the task routes to the planner (the existing ``escalated``
+    # path). ``snippet`` is a short echo of the model's actual chat output, for the
+    # operator to see WHY the critic could not land a verdict.
+    event: Literal["critic_failed"] = "critic_failed"
+    epoch_id: str
+    task_id: str
+    tier: str
+    snippet: str = ""
+
+
 Event = Annotated[
     Union[
         RunStarted,
@@ -208,6 +243,9 @@ Event = Annotated[
         StrikeLedger,
         TaskParked,
         TierEscalated,
+        CriticRecovered,
+        CriticEscalated,
+        CriticFailed,
     ],
     Field(discriminator="event"),
 ]

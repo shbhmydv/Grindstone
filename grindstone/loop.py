@@ -82,6 +82,9 @@ from grindstone.contracts.models import (
 )
 from grindstone.events import (
     Event,
+    CriticEscalated,
+    CriticFailed,
+    CriticRecovered,
     EpochCompleted,
     EpochStarted,
     WorkGatePassed,
@@ -348,6 +351,32 @@ class _JournalAttemptEvents:
             lambda s: TierEscalated(
                 seq=s, ts=self._now(), epoch_id=self._epoch_id, task_id=tid,
                 to_tier=to_tier, attempt=attempt,
+            )
+        )
+
+    def critic_recovered(self, task_id: str, tier: str) -> None:
+        tid = _short_id(task_id)
+        self._journal.emit(
+            lambda s: CriticRecovered(
+                seq=s, ts=self._now(), epoch_id=self._epoch_id, task_id=tid, tier=tier,
+            )
+        )
+
+    def critic_escalated(self, task_id: str, to_tier: str) -> None:
+        tid = _short_id(task_id)
+        self._journal.emit(
+            lambda s: CriticEscalated(
+                seq=s, ts=self._now(), epoch_id=self._epoch_id, task_id=tid,
+                to_tier=to_tier,
+            )
+        )
+
+    def critic_failed(self, task_id: str, tier: str, snippet: str) -> None:
+        tid = _short_id(task_id)
+        self._journal.emit(
+            lambda s: CriticFailed(
+                seq=s, ts=self._now(), epoch_id=self._epoch_id, task_id=tid,
+                tier=tier, snippet=snippet,
             )
         )
 

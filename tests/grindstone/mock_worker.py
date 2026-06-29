@@ -71,14 +71,14 @@ class MockWorker:
     artifacts: dict[str, str] = field(default_factory=dict)
     _calls: int = 0
 
-    def run(self, request: WorkerRequest) -> None:
+    def run(self, request: WorkerRequest) -> str:
         if self._calls >= len(self.script):
             raise AssertionError("mock worker script exhausted")
         behavior = self.script[self._calls]
         self._calls += 1
         if request.critic is not None:
             self._critic(request, behavior)
-            return
+            return ""
 
         handoff = request.scratch / HANDOFF_FILENAME
 
@@ -86,7 +86,7 @@ class MockWorker:
             raise RateLimited(f"mock {behavior}")
         if behavior == "empty":
             # No work and no report: a zero-diff / missing-artifact gate failure.
-            return
+            return ""
         if behavior == "timeout":
             # Hung-then-killed: a partial report lands, then the supervisor kills the
             # worker. No real sleep, the kill is modelled as a raise.
@@ -97,7 +97,7 @@ class MockWorker:
             handoff.write_text(
                 _handoff_md(request, blocked=behavior == "blocked"), encoding="utf-8"
             )
-            return
+            return ""
         raise ValueError(f"unknown mock behavior: {behavior!r}")
 
     def _write_artifacts(self, request: WorkerRequest) -> None:
@@ -142,7 +142,7 @@ class LoopWorker:
     _rl_fired: bool = False
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def run(self, request: WorkerRequest) -> None:
+    def run(self, request: WorkerRequest) -> str:
         if request.critic is not None:
             (request.scratch / CRITIC_VERDICT_FILENAME).write_text(
                 json.dumps(
@@ -150,7 +150,7 @@ class LoopWorker:
                 ),
                 encoding="utf-8",
             )
-            return
+            return ""
 
         if self.rate_limit_once:
             with self._lock:
@@ -180,6 +180,7 @@ class LoopWorker:
         (request.scratch / HANDOFF_FILENAME).write_text(
             _handoff_md(request), encoding="utf-8"
         )
+        return ""
 
 
 def fuzz_script(seed: int, length: int) -> list[str]:
@@ -241,13 +242,13 @@ class StochasticWorker:
         rng = random.Random(f"{self.seed}|{task_id}")
         return rng.choices(STOCHASTIC_OUTCOMES, weights=list(self.weights), k=1)[0]
 
-    def run(self, request: WorkerRequest) -> None:
+    def run(self, request: WorkerRequest) -> str:
         if request.critic is not None:
             (request.scratch / CRITIC_VERDICT_FILENAME).write_text(
                 json.dumps({"outcome": "PASS", "reason": "stochastic critic PASS"}),
                 encoding="utf-8",
             )
-            return
+            return ""
 
         with self._lock:
             if self.rate_limit_once and not self._rl_fired:
@@ -259,11 +260,12 @@ class StochasticWorker:
         clean = outcome == "pass" or (outcome == "retry_pass" and is_retry)
         if not clean:
             # No work and no report: the deterministic gate rejects the attempt.
-            return
+            return ""
         self._write_work(request)
         (request.scratch / HANDOFF_FILENAME).write_text(
             _handoff_md(request), encoding="utf-8"
         )
+        return ""
 
     def _write_work(self, request: WorkerRequest) -> None:
         """Write exactly the claimed deliverables (mirrors the ``LoopWorker`` happy
@@ -311,10 +313,10 @@ class CrashingWorker:
     _n: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def run(self, request: WorkerRequest) -> None:
+    def run(self, request: WorkerRequest) -> str:
         if request.critic is None:
             with self._lock:
                 self._n += 1
                 if self._n == self.crash_on:
                     raise SimulatedKill("simulated kill (mid-epoch crash)")
-        self.inner.run(request)
+        return self.inner.run(request)

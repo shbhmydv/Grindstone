@@ -265,15 +265,15 @@ class _SelectiveWorker:
     critic_outcome: str = "PASS"
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def run(self, request: WorkerRequest) -> None:
+    def run(self, request: WorkerRequest) -> str:
         if request.critic is not None:
             (request.scratch / CRITIC_VERDICT_FILENAME).write_text(
                 json.dumps({"outcome": self.critic_outcome, "reason": "sel"}),
                 encoding="utf-8",
             )
-            return
+            return ""
         if request.task.id in self.fail_ids:
-            return  # no work -> zero diff -> gate rejects -> retries exhaust -> escalate
+            return ""  # no work -> zero diff -> gate rejects -> retries exhaust -> escalate
         for rel in request.task.file_ownership:
             path = request.scratch / rel
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -281,6 +281,7 @@ class _SelectiveWorker:
         (request.scratch / HANDOFF_FILENAME).write_text(
             f"# handoff {request.task_id}\nDONE\n", encoding="utf-8"
         )
+        return ""
 
 
 def test_partial_fail_finalizes_only_passers(
@@ -661,10 +662,10 @@ class _FaithfulWorker:
     _critic_calls: dict[str, int] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def run(self, request: WorkerRequest) -> None:
+    def run(self, request: WorkerRequest) -> str:
         if request.critic is not None:
             self._critic(request)
-            return
+            return ""
         for rel in request.task.file_ownership:
             path = request.scratch / rel
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -677,6 +678,7 @@ class _FaithfulWorker:
         # The agent commits its own work in the worktree (the disk contract): this is
         # the exact step that historically swept stray control files into the base.
         wt.commit_all(request.scratch, f"agent self-commit {request.task_id}")
+        return ""
 
     def _critic(self, request: WorkerRequest) -> None:
         with self._lock:
@@ -848,14 +850,14 @@ class _PerTaskCriticWorker:
     escalate: frozenset[str] = frozenset()
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def run(self, request: WorkerRequest) -> None:
+    def run(self, request: WorkerRequest) -> str:
         if request.critic is not None:
             outcome = "ESCALATE" if request.task_id in self.escalate else "PASS"
             (request.scratch / CRITIC_VERDICT_FILENAME).write_text(
                 json.dumps({"outcome": outcome, "reason": f"per-task {outcome}"}),
                 encoding="utf-8",
             )
-            return
+            return ""
         for rel in request.task.file_ownership:
             path = request.scratch / rel
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -865,6 +867,7 @@ class _PerTaskCriticWorker:
         (request.scratch / HANDOFF_FILENAME).write_text(
             f"# handoff {request.task_id}\nDONE\n", encoding="utf-8"
         )
+        return ""
 
 
 def test_backlog_reconcile_union_minus_passed_and_auto_carry(
@@ -1030,7 +1033,7 @@ class _FileEscalatingWorker:
             f in self.escalate_files for f in task.file_ownership
         )
 
-    def run(self, request: WorkerRequest) -> None:
+    def run(self, request: WorkerRequest) -> str:
         task = request.task
         if request.critic is not None:
             outcome = "ESCALATE" if self._escalates(task) else "PASS"
@@ -1038,7 +1041,7 @@ class _FileEscalatingWorker:
                 json.dumps({"outcome": outcome, "reason": f"file {outcome}"}),
                 encoding="utf-8",
             )
-            return
+            return ""
         with self._lock:
             self.dispatched.append(request.task_id)
         if request.mode == "implement":
@@ -1052,6 +1055,7 @@ class _FileEscalatingWorker:
         (request.scratch / HANDOFF_FILENAME).write_text(
             f"# handoff {request.task_id}\nattempted\n", encoding="utf-8"
         )
+        return ""
 
 
 def _two_tier_backends(

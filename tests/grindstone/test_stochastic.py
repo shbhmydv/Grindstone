@@ -333,7 +333,7 @@ class _ScriptedCriticWorker:
         self._critic_outcomes = critic_outcomes
         self._critic_calls = 0
 
-    def run(self, request: WorkerRequest) -> None:
+    def run(self, request: WorkerRequest) -> str:
         if request.critic is not None:
             outcome = self._critic_outcomes[
                 min(self._critic_calls, len(self._critic_outcomes) - 1)
@@ -343,7 +343,7 @@ class _ScriptedCriticWorker:
                 json.dumps({"outcome": outcome, "reason": f"honest critic {outcome}"}),
                 encoding="utf-8",
             )
-            return
+            return ""
         # Always produce valid implement work so the gate passes and the critic runs.
         for rel in request.task.file_ownership:
             (request.scratch / rel).write_text(
@@ -353,6 +353,7 @@ class _ScriptedCriticWorker:
             f"# handoff {request.task_id}\nDONE; built the claimed files.\n",
             encoding="utf-8",
         )
+        return ""
 
 
 def test_honest_critic_retry_re_runs_then_passes(
