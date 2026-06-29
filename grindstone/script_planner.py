@@ -11,11 +11,13 @@ gate-clean ``decision.json`` into the worktree (and/or its final message to ``--
 ``dispatch`` returns raw stdout and the core (``ScriptPlanner.decide``) reads the
 channels back by priority. stdout is never parsed here.
 
-BONES two-node failure mapping (mirrors the worker): a non-zero exit whose output
-names a rate / quota limit raises ``RateLimited`` (the loop parks ~1/hr, node #1);
-every other non-zero exit and every timeout raises ``PlannerError`` (node #2, the
-loop ends cleanly). The CLI wires one ``ScriptPlannerTransport`` from config in a
-later part.
+BONES failure mapping (mirrors the worker): a non-zero exit whose output names a rate /
+quota limit raises ``RateLimited`` (the loop parks ~1/hr, node #1); a wall-clock timeout
+raises ``PlannerTimeout`` (the loop retries it once, then backs off); every other
+non-zero exit raises ``PlannerError``. On the PLAN call the loop retries ALL of these
+under a consecutive-failure cap before the clean partial-end; on CLOSE-OUT a non-rate
+error routes to the epoch abort node. The CLI wires one ``ScriptPlannerTransport`` from
+config in a later part.
 """
 
 from __future__ import annotations
@@ -29,7 +31,12 @@ import threading
 from pathlib import Path
 
 from grindstone import reaper
-from grindstone.planner import PlannerDispatch, PlannerError, RateLimited
+from grindstone.planner import (
+    PlannerDispatch,
+    PlannerError,
+    PlannerTimeout,
+    RateLimited,
+)
 
 #: A non-zero exit whose combined stdout/stderr matches this is a rate / quota
 #: refusal (node #1): ``RateLimited`` so the loop parks, not a hard failure.
@@ -97,7 +104,7 @@ class ScriptPlannerTransport:
                     stdout, stderr = proc.communicate(timeout=self.timeout_s)
                 except subprocess.TimeoutExpired as exc:
                     self._stop(handle_file, proc)
-                    raise PlannerError(
+                    raise PlannerTimeout(
                         f"{self.script.name} timed out after {self.timeout_s}s"
                     ) from exc
                 if proc.returncode != 0:

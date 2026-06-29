@@ -529,6 +529,67 @@ def test_k_consecutive_aborts_end_cleanly(
     assert result.epochs <= 3
 
 
+# --- unified planner-failure retry (no halt on a transient) --------------------
+
+
+def test_planner_timeout_retries_immediately_then_backoff(
+    git_repo: Path, run_dir: RunDir, job_path: Path
+) -> None:
+    # A flaky planner timeout must NOT halt an unattended run. The FIRST timeout retries
+    # IMMEDIATELY (no park); a CONSECUTIVE timeout parks once, then it lands the epoch and
+    # the run completes. No premature RunEnded.
+    calls, fake = _no_sleep()
+    planner = MockDecisionPlanner(
+        ["timeout", "timeout", _epoch(_impl("T1", ["a.py"])), _end("shipped")]
+    )
+    result = start_run(
+        job_path=job_path, run_dir=run_dir, repo=git_repo, planner=planner,
+        backends=_backends(LoopWorker()), sleep_fn=fake, backoff_s=9.0, max_epochs=5,
+    )
+    assert result.status == "completed" and result.summary == "shipped"
+    assert calls == [9.0]  # the first timeout was immediate; only the repeat parked
+    tree = replay(read_events(run_dir.events_path))
+    assert tree.status == "completed"  # never a partial-end mid-run
+
+
+def test_planner_decide_rate_limit_parks_then_retries(
+    git_repo: Path, run_dir: RunDir, job_path: Path
+) -> None:
+    # A PLAN-call rate limit parks ~1/hr then re-issues the boundary (node #1), exactly
+    # like the close-out / worker rate limit, and the run completes.
+    calls, fake = _no_sleep()
+    planner = MockDecisionPlanner(
+        ["rate_limit", _epoch(_impl("T1", ["a.py"])), _end()]
+    )
+    result = start_run(
+        job_path=job_path, run_dir=run_dir, repo=git_repo, planner=planner,
+        backends=_backends(LoopWorker()), sleep_fn=fake, backoff_s=13.0, max_epochs=5,
+    )
+    assert result.status == "completed"
+    assert calls == [13.0]  # parked once at the backoff
+    assert any(e.event == "rate_limited" for e in read_events(run_dir.events_path))
+
+
+def test_planner_failure_cap_ends_cleanly(
+    git_repo: Path, run_dir: RunDir, job_path: Path
+) -> None:
+    # The ONE backstop: a permanently-broken planner (every PLAN call errors) cannot
+    # spin forever. After MAX_CONSECUTIVE_ABORTS consecutive failures the run clean-ends
+    # (node #2), resumable by a human - it never reaches a single completed epoch.
+    from grindstone.loop import MAX_CONSECUTIVE_ABORTS
+
+    calls, fake = _no_sleep()
+    planner = MockDecisionPlanner(["error"] * MAX_CONSECUTIVE_ABORTS)
+    result = start_run(
+        job_path=job_path, run_dir=run_dir, repo=git_repo, planner=planner,
+        backends=_backends(LoopWorker()), sleep_fn=fake, backoff_s=5.0, max_epochs=20,
+    )
+    assert result.status == "ended" and result.epochs == 0
+    assert "consecutively" in result.summary
+    tree = replay(read_events(run_dir.events_path))
+    assert tree.status == "ended" and not tree.epochs
+
+
 # --- resume re-plans reading the prior epoch's persisted baton -----------------
 
 

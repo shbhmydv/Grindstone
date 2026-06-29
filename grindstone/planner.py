@@ -60,14 +60,23 @@ if TYPE_CHECKING:  # pragma: no cover - typing only (avoids the loop<->planner c
 
 
 class PlannerError(Exception):
-    """Any planner failure that cannot be recovered (auth, transport, a decision the
-    planner could not make valid within its budget). Routes to the run's clean
-    partial-end (BONES failure model #2)."""
+    """A planner failure (auth, transport, a decision the planner could not make valid
+    within its budget). On the PLAN call the loop RETRIES it under a consecutive-failure
+    cap (a transport fault is a transient, not the planner's judgment to end); only when
+    the cap is exhausted does it fall to the run's clean partial-end (BONES failure model
+    #2). On the CLOSE-OUT call it routes to the epoch abort node."""
 
 
 class RateLimited(PlannerError):
     """A rate-limit / quota refusal (BONES failure model #1): the loop backs off
     (~1/hr) and re-issues the boundary call; nothing is burned."""
+
+
+class PlannerTimeout(PlannerError):
+    """A planner wall-clock timeout: a TRANSIENT (often a flaky 1-in-N), NOT the
+    planner's judgment to end. A ``PlannerError`` subclass so the loop's unified
+    planner-retry gives it the immediate-retry-once treatment (then a backoff on a
+    repeat) without a string match, rather than halting an unattended run."""
 
 
 # --- the transport seam (the rig dispatch boundary) ----------------------------

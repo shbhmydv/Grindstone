@@ -82,9 +82,6 @@ from grindstone.contracts.models import (
 )
 from grindstone.events import (
     Event,
-    CriticEscalated,
-    CriticFailed,
-    CriticRecovered,
     EpochCompleted,
     EpochStarted,
     WorkGatePassed,
@@ -106,7 +103,7 @@ from grindstone.events import (
 )
 from grindstone.events import Verdict as VerdictEvent
 from grindstone.journal import reap_sibling_journals, write_journal
-from grindstone.planner import PlannerError, ScriptPlanner
+from grindstone.planner import PlannerError, PlannerTimeout, ScriptPlanner
 from grindstone.planner import RateLimited as PlannerRateLimited
 from grindstone.rundir import RunDir, create_run_dir
 from grindstone.script_planner import ScriptPlannerTransport
@@ -351,32 +348,6 @@ class _JournalAttemptEvents:
             lambda s: TierEscalated(
                 seq=s, ts=self._now(), epoch_id=self._epoch_id, task_id=tid,
                 to_tier=to_tier, attempt=attempt,
-            )
-        )
-
-    def critic_recovered(self, task_id: str, tier: str) -> None:
-        tid = _short_id(task_id)
-        self._journal.emit(
-            lambda s: CriticRecovered(
-                seq=s, ts=self._now(), epoch_id=self._epoch_id, task_id=tid, tier=tier,
-            )
-        )
-
-    def critic_escalated(self, task_id: str, to_tier: str) -> None:
-        tid = _short_id(task_id)
-        self._journal.emit(
-            lambda s: CriticEscalated(
-                seq=s, ts=self._now(), epoch_id=self._epoch_id, task_id=tid,
-                to_tier=to_tier,
-            )
-        )
-
-    def critic_failed(self, task_id: str, tier: str, snippet: str) -> None:
-        tid = _short_id(task_id)
-        self._journal.emit(
-            lambda s: CriticFailed(
-                seq=s, ts=self._now(), epoch_id=self._epoch_id, task_id=tid,
-                tier=tier, snippet=snippet,
             )
         )
 
@@ -872,21 +843,51 @@ def _plan_with_backoff(
     sleep_fn: SleepFn,
     backoff_s: float,
     now_fn: NowFn,
+    max_failures: int = MAX_CONSECUTIVE_ABORTS,
 ) -> Decision:
-    """Call the planner, PARKING (~1/hr) and re-issuing on a rate limit (node #1).
-    A non-rate-limit ``PlannerError`` escapes (the loop ends cleanly, node #2)."""
+    """Call the planner, RETRYING every transient PLAN failure under ONE cap.
 
+    BONES unification: a planner transport fault is a transient like a worker timeout
+    (NOT the planner's judgment to end), so ALL of them auto-recover here instead of
+    halting an unattended run. By failure kind:
+
+      * RATE LIMIT (node #1): emit ``rate_limited``, park ~1/hr, then re-issue.
+      * TIMEOUT: retry IMMEDIATELY the first time (a flaky 1-in-N), then park on a
+        consecutive repeat.
+      * any other ``PlannerError`` (bad output exhausting the rig's re-asks, a non-zero
+        exit): retry.
+
+    The ONE backstop is ``max_failures`` CONSECUTIVE failures: the last ``PlannerError``
+    then propagates to ``_drive``'s clean partial-end (node #2). This reuses the
+    ``MAX_CONSECUTIVE_ABORTS`` cap-then-clean-end idiom (the same shape as the epoch
+    abort node and ``max_epochs``), so a permanently-broken planner cannot spin forever
+    while a flaky one no longer needs a human."""
+
+    failures = 0
+    prev_timeout = False
     while True:
         try:
             return planner.decide(context)
-        except PlannerRateLimited as exc:
-            detail = str(exc)
-            journal.emit(
-                lambda s: RateLimitedEvent(
-                    seq=s, ts=now_fn(), role="planner", detail=detail
+        except PlannerError as exc:
+            failures += 1
+            if failures >= max_failures:
+                raise  # the cap: fall to _drive's clean partial-end (node #2)
+            if isinstance(exc, PlannerRateLimited):
+                detail = str(exc)
+                journal.emit(
+                    lambda s: RateLimitedEvent(
+                        seq=s, ts=now_fn(), role="planner", detail=detail
+                    )
                 )
-            )
-            sleep_fn(backoff_s)
+                sleep_fn(backoff_s)
+                prev_timeout = False
+            elif isinstance(exc, PlannerTimeout):
+                if prev_timeout:
+                    sleep_fn(backoff_s)  # a consecutive timeout: park before retrying
+                # else the first timeout: retry immediately
+                prev_timeout = True
+            else:
+                prev_timeout = False  # bad output / other: retry
 
 
 # --- run-scoped SIGTERM/SIGINT reaping (resumable stop) ------------------------
@@ -1016,7 +1017,14 @@ def _drive(
                 backoff_s=backoff_s, now_fn=now_fn,
             )
         except PlannerError as exc:
-            summary = f"planner could not continue at E{epoch_index}: {exc}"
+            # Node #2 backstop, reached ONLY after MAX_CONSECUTIVE_ABORTS consecutive
+            # planner failures (the unified retry above parks/retries every transient
+            # first): a permanently-broken planner clean-ends the run, resumable by a
+            # human, instead of spinning forever or halting on the first flaky call.
+            summary = (
+                f"planner failed {MAX_CONSECUTIVE_ABORTS} times consecutively at "
+                f"E{epoch_index}: {exc}"
+            )
             summary = _append_parked(summary, run_dir)
             _emit_ended(journal, now_fn, summary)
             return RunResult("ended", summary, epoch_index - 1)

@@ -84,14 +84,9 @@ CRITIC_VERDICT_FILENAME = "verdict.json"
 LOCAL_MAX_ATTEMPTS = 3  # 1 initial + 2 retries
 SENIOR_MAX_ATTEMPTS = 2  # 1 initial + 1 retry
 
-#: The CRITIC FAILURE NODE's same-tier budget: a critic that chatted its verdict (wrote
-#: no parseable verdict.json AND no recoverable JSON in stdout) gets one MORE dispatch
-#: at the task tier before the node bumps to the senior critic. Distinct from the worker
-#: ladder above: this re-dispatches ONLY the critic on the SAME already-passed work.
-CRITIC_MAX_ATTEMPTS = 2  # 1 initial + 1 retry at the task tier
-
-#: Cap on the model's chat output echoed into a ``CriticFailed`` reason / event (so an
-#: operator can see WHY the critic could not land a verdict, without dumping a transcript).
+#: Cap on the model's chat output echoed into the ``CriticError`` reason when the critic
+#: could not land a verdict on EITHER channel (so an operator sees WHY, without dumping a
+#: transcript). The error routes the task to the planner via the existing escalate path.
 _CRITIC_SNIPPET_MAX = 200
 
 #: DoS sanity backstop on the disk reads (reject, never truncate, a pathological /
@@ -184,17 +179,13 @@ class AttemptEvents(Protocol):
     ``run_task`` standalone for the unit tests). The driver's adapter maps these to
     ``work_gate_passed`` / ``work_gate_rejected`` / ``verdict`` journal events.
     ``work_gate_passed`` now fires when the DETERMINISTIC gate passes (a non-empty
-    in-scope commit, or a present artifact), before the critic runs. The ``critic_*``
-    hooks surface the CRITIC FAILURE NODE: a verdict recovered from chat, a bump to the
-    senior critic, or the node exhausting without a verdict."""
+    in-scope commit, or a present artifact), before the critic runs. ``tier_escalated``
+    fires when the in-epoch ladder climbs a task to a stronger tier."""
 
     def work_gate_passed(self, task_id: str) -> None: ...
     def work_gate_rejected(self, task_id: str, reason: str) -> None: ...
     def verdict(self, task_id: str, outcome: VerdictOutcome, reason: str) -> None: ...
     def tier_escalated(self, task_id: str, to_tier: str, attempt: int) -> None: ...
-    def critic_recovered(self, task_id: str, tier: str) -> None: ...
-    def critic_escalated(self, task_id: str, to_tier: str) -> None: ...
-    def critic_failed(self, task_id: str, tier: str, snippet: str) -> None: ...
 
 
 # --- per-backend concurrency seam (BONES concurrency ruling) -------------------
@@ -709,21 +700,20 @@ def _critic_verdict(
     run_dir: RunDir,
     backends: Backends,
     domain_skills: dict[str, str],
-    events: AttemptEvents | None = None,
 ) -> Verdict:
     """Dispatch the critic at the attempt's STAGE ``tier`` in the task's own scratch,
-    read the lenient ``Verdict`` by CHANNEL PRIORITY (mirroring the planner's resilient
-    read), persist it to the keyed log, and return it. The critic runs at the SAME tier
-    the attempt did, so an escalated (senior) attempt is judged by the senior critic.
+    read the lenient ``Verdict`` by CHANNEL PRIORITY (mirroring the planner's read),
+    persist it to the keyed log, and return it. The critic runs at the SAME tier the
+    attempt did, so an escalated (senior) attempt is judged by the senior critic.
 
-    Channel priority: (a) ``verdict.json`` in scratch (the disk contract, the 90% path,
-    byte-identical to before); ELSE (b) a JSON verdict object sniffed out of the
-    dispatch's STDOUT (the local model answered in CHAT instead of writing the file).
-    The recovered verdict is PERSISTED to the keyed-log dest either way (a moved file,
-    or the recovered JSON written there). Only when NEITHER channel yields a parseable
-    lenient verdict is it a ``CriticError`` (fail-safe, never a silent pass); its message
-    carries a short snippet of the model's chat output for observability. A stdout
-    recovery emits ``critic_recovered`` when an event sink is threaded in.
+    Channel priority: (a) ``verdict.json`` in scratch (the disk contract, the 90% path);
+    ELSE (b) a JSON verdict object sniffed out of the dispatch's STDOUT (the local model
+    answered in CHAT instead of writing the file). This stdout fallback is a SILENT normal
+    path (it mirrors the planner's ``decision.json`` > stdout read; no event needed). The
+    verdict is PERSISTED to the keyed-log dest either way (a moved file, or the recovered
+    JSON written there). Only when NEITHER channel yields a parseable lenient verdict is it
+    a ``CriticError`` (fail-safe, never a silent pass), which ``run_task`` routes to the
+    planner via the existing escalate path; its message carries a short chat snippet.
 
     The task's SELECTED ``domain_skills`` ride along so the critic can VERIFY the work
     against them as a rubric (the "analyse" step of the composition loop); when empty
@@ -773,8 +763,6 @@ def _critic_verdict(
             recovered_verdict = None
         if recovered_verdict is not None:
             dest.write_text(recovered, encoding="utf-8")
-            if events is not None:
-                events.critic_recovered(task_id, tier)
             return recovered_verdict
 
     snippet = stdout.strip()[:_CRITIC_SNIPPET_MAX] or "(no output)"
@@ -782,71 +770,6 @@ def _critic_verdict(
         f"critic wrote no {CRITIC_VERDICT_FILENAME} and no parseable verdict in its "
         f"chat output: {snippet}"
     )
-
-
-def _resilient_critic_verdict(
-    task: Task,
-    task_id: str,
-    *,
-    tier: str,
-    scratch: Path,
-    base: str | None,
-    artifact_rel: str | None,
-    handoff_text: str,
-    critic_read_root: Path | None,
-    run_dir: RunDir,
-    backends: Backends,
-    domain_skills: dict[str, str],
-    events: AttemptEvents | None,
-) -> Verdict:
-    """The CRITIC FAILURE NODE: judge an already-gate-passed attempt to a lenient
-    ``Verdict``, resiliently, NEVER faulting the run.
-
-    A single critic dispatch can fail to land a verdict (a local model that answers in
-    chat without even a sniffable JSON object). This node re-dispatches ONLY the critic
-    (never the worker / ``_run_attempt``, the work already passed the deterministic
-    gate) up an escalating ladder on the SAME scratch:
-
-    1. up to ``CRITIC_MAX_ATTEMPTS`` dispatches at the task ``tier``;
-    2. then, if the rig has a DISTINCT senior endpoint and this is not already senior,
-       ONE senior-critic dispatch (the senior model judges the same passed diff /
-       artifact, no re-grind, no new worktree).
-
-    On success it returns the verdict (``critic_recovered`` already emitted by
-    ``_critic_verdict`` if it came from chat). If every dispatch fails it emits
-    ``critic_failed`` (with a short chat snippet) and raises ``CriticError`` carrying
-    that snippet, which ``run_task`` turns into the existing ``escalated`` planner route.
-    ``RateLimited`` is NOT a critic failure: it escapes un-caught so the loop parks."""
-
-    def _dispatch(at_tier: str) -> Verdict:
-        return _critic_verdict(
-            task, task_id, tier=at_tier, scratch=scratch, base=base,
-            artifact_rel=artifact_rel, handoff_text=handoff_text,
-            critic_read_root=critic_read_root, run_dir=run_dir,
-            backends=backends, domain_skills=domain_skills, events=events,
-        )
-
-    last_exc: CriticError | None = None
-    for _ in range(CRITIC_MAX_ATTEMPTS):
-        try:
-            return _dispatch(tier)
-        except CriticError as exc:
-            last_exc = exc
-
-    if tier != "senior" and backends.has_distinct_tier("senior"):
-        if events is not None:
-            events.critic_escalated(task_id, "senior")
-        try:
-            return _dispatch("senior")
-        except CriticError as exc:
-            last_exc = exc
-
-    snippet = (str(last_exc) if last_exc else "critic produced no verdict")[
-        :_CRITIC_SNIPPET_MAX
-    ]
-    if events is not None:
-        events.critic_failed(task_id, tier, snippet)
-    raise CriticError(snippet)
 
 
 @dataclass
@@ -1058,15 +981,16 @@ def run_task(
 
             # Gate-clean -> the stage-tier critic triages it (in the same scratch: the
             # post-commit worktree for implement, the artifact dir for a non-write task).
-            # The resilient node recovers a chatted verdict + escalates a stuck critic
-            # to senior, and only raises CriticError when it cannot land any verdict.
+            # ``_critic_verdict`` reads the verdict by channel priority (verdict.json ELSE
+            # a stdout-chatted verdict) and raises CriticError only when it can land none,
+            # which routes to the planner via the ``escalated`` terminal below.
             try:
-                verdict = _resilient_critic_verdict(
+                verdict = _critic_verdict(
                     task, task_id, tier=tier, scratch=scratch, base=base,
                     artifact_rel=attempt.artifact_rel,
                     handoff_text=attempt.handoff_text,
                     critic_read_root=critic_read_root, run_dir=run_dir,
-                    backends=backends, domain_skills=domain_skills, events=events,
+                    backends=backends, domain_skills=domain_skills,
                 )
             except CriticError as exc:
                 _discard(repo, scratch, branch, implement)

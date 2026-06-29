@@ -14,10 +14,12 @@ Three test doubles for the planner seams the rewrite exposes:
   Decision``): scripts typed decisions, recording each context so a loop test can
   assert the boundary was rebuilt from disk.
 
-Failure taxonomy (the bones two-node model): ``rate_limit`` / ``session_limit`` ->
-``RateLimited`` (back off and re-issue); ``transient`` / ``timeout`` / ``hard`` /
-``error`` -> ``PlannerError`` (the cannot-continue catch-all); ``bad_json`` /
-``empty`` / ``invalid`` -> un-gateable output the core re-asks on.
+Failure taxonomy: ``rate_limit`` / ``session_limit`` -> ``RateLimited`` (node #1, the
+loop parks and re-issues); ``timeout`` -> ``PlannerTimeout`` (the loop retries once then
+backs off); ``transient`` / ``hard`` / ``error`` -> ``PlannerError`` (a generic transport
+fault the loop retries under its cap); ``bad_json`` / ``empty`` / ``invalid`` ->
+un-gateable output the core re-asks on. All planner failures auto-recover on the PLAN
+call now; only the consecutive-failure cap ends the run.
 """
 
 from __future__ import annotations
@@ -38,7 +40,12 @@ from grindstone.contracts.models import (
     EpochDecision,
     Task,
 )
-from grindstone.planner import PlannerDispatch, PlannerError, RateLimited
+from grindstone.planner import (
+    PlannerDispatch,
+    PlannerError,
+    PlannerTimeout,
+    RateLimited,
+)
 
 if TYPE_CHECKING:
     from grindstone.loop import CloseoutContext, PlannerContext
@@ -120,7 +127,9 @@ class MockPlanner:
     def _failure(self, token: str) -> str:
         if token in ("rate_limit", "session_limit"):
             raise RateLimited(f"mock planner {token}")
-        if token in ("transient", "timeout", "hard"):
+        if token == "timeout":
+            raise PlannerTimeout(f"mock planner {token}")
+        if token in ("transient", "hard"):
             raise PlannerError(f"mock planner {token}")
         if token == "bad_json":
             return "here is the decision: { not valid json"
@@ -212,7 +221,9 @@ class MockPlannerTransport:
     def _failure(token: str) -> str:
         if token in ("rate_limit", "session_limit"):
             raise RateLimited(f"mock planner {token}")
-        if token in ("error", "transient", "hard", "timeout"):
+        if token == "timeout":
+            raise PlannerTimeout(f"mock planner {token}")
+        if token in ("error", "transient", "hard"):
             raise PlannerError(f"mock planner {token}")
         raise ValueError(f"unknown mock rig failure token: {token!r}")
 
@@ -250,6 +261,8 @@ class MockDecisionPlanner:
         if isinstance(entry, str):
             if entry in ("rate_limit", "session_limit"):
                 raise RateLimited(f"mock planner {entry}")
+            if entry == "timeout":
+                raise PlannerTimeout(f"mock planner {entry}")
             if entry in ("error", "hard", "transient"):
                 raise PlannerError(f"mock planner {entry}")
             raise ValueError(f"unknown mock decision token: {entry!r}")
