@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Union
 
 from grindstone import worktree as wt
 from grindstone.check_decision import DECISION_FILE
-from grindstone.planner import BATON_FILE
+from grindstone.planner import BATON_ARTIFACTS_DIRNAME, BATON_FILE
 from grindstone.contracts.models import (
     Decision,
     EndDecision,
@@ -168,6 +168,12 @@ class MockRig:
     baton: str | None = None
     out: str | None = None
     stdout: str = ""
+    #: An evidence bundle the close-out persists in its workdir under ``baton-artifacts/``
+    #: (relpath -> text): the render PNG(s), gate output, notable diffs. The state machine
+    #: relocates it to the keyed log after ``close_out``. ``None`` writes no bundle (the
+    #: functional-run / no-evidence case); an empty dict writes the dir but no files (the
+    #: empty-bundle no-op case).
+    artifacts: dict[str, str] | None = None
 
     @classmethod
     def from_decision(
@@ -213,6 +219,13 @@ class MockPlannerTransport:
             )
         if entry.baton is not None:
             (request.workdir / BATON_FILE).write_text(entry.baton, encoding="utf-8")
+        if entry.artifacts is not None:
+            bundle = request.workdir / BATON_ARTIFACTS_DIRNAME
+            bundle.mkdir(parents=True, exist_ok=True)
+            for rel, content in entry.artifacts.items():
+                dest = bundle / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(content, encoding="utf-8")
         if entry.out is not None:
             request.out_file.write_text(entry.out, encoding="utf-8")
         return entry.stdout

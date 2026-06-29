@@ -34,6 +34,7 @@ The real subprocess transport is ``script_planner.ScriptPlannerTransport`` (mirr
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -133,12 +134,19 @@ plan - and it is given to you below as your memory. At the end of THIS epoch you
 asked to update it. There are no phases and no fixed budget: you steer, epoch by epoch,
 until the job is met, then you END.
 
-WHAT YOU CAN SEE AND READ. Your CWD is a throwaway checkout of the current integration
-tip. GREP and READ it to ground every decision in what actually exists. You can SEE:
-read images directly (screenshots, mockups, diagrams, rendered UI) - never plan blind to
-a visual you could open. The keyed log (indexed below) holds prior tasks' handoffs,
-critic verdicts, and produced artifacts; read any of them. Reading is your own internal
-step; your turn still ends with exactly one decision.
+WHAT YOU CAN SEE, READ, AND RUN. Your CWD is a throwaway checkout of the current
+integration tip, and you have a FULL shell in it - nothing you do here touches durable
+state, so investigate freely. GREP and READ it to ground every decision in what actually
+exists. You can SEE: read images directly (screenshots, mockups, diagrams, rendered UI) -
+never plan blind to a visual you could open. The keyed log (indexed below) holds prior
+tasks' handoffs, critic verdicts, and produced artifacts; read any of them. Your last
+close-out persisted an EVIDENCE bundle at E<n-1>/baton-artifacts/ (pointed to below when
+it exists) - the render it built and viewed, the gate output, the diffs: OPEN it and VIEW
+the render as PRIMARY ground truth, ahead of the baton's prose. And you MAY RUN
+verification commands here (build, test, render, inspect) to see the real state with your
+own eyes before you decide. This is you informing YOURSELF: it does NOT change the rule
+below that you author no verify or check commands as worker tasks. Reading and running
+are your own internal step; your turn still ends with exactly one decision.
 
 YOUR DECISION. Emit EXACTLY ONE JSON object and nothing else (no prose, no second
 object, no markdown fence), ONE of two shapes:
@@ -230,22 +238,37 @@ ONLY output.
 CLOSEOUT_PREAMBLE = """\
 You are the planner for Grindstone, closing out the epoch you just ran. A fixed state
 machine ran the epoch's tasks, gated and integrated the work, and now asks you for ONE
-thing: the updated BATON - your living plan, the memory you pass to your next self.
+thing: the updated BATON - your living plan, the memory you pass to your next self. You
+are the deep-survey right-hand man: do not take the field reports at face value, go and
+SEE for yourself what really happened, then report ground truth forward.
 
 You are the only one who can judge what really happened, so judge it. A task that the
 machine marks "escalated" might be partial progress, no progress, or a regression - only
-you can tell, by reading what was attempted. Do not let the machine's flat label stand
-in for your judgment.
+you can tell, by reading what was attempted. A worker handoff claims success; the critic
+verdict is one lenient read. Neither is proof. VERIFY: do not let a flat label or a
+worker's own claim stand in for your judgment.
 
 WHAT TO READ. Your CWD is a throwaway checkout of this epoch's STAGING tree - the work
 that actually merged. Grep and read it to see what now exists. For each task in the epoch
 report below, READ its handoff (the worker's own report) and its critic verdict at the
-keyed-log paths given. You can SEE: VIEW any image the work produced or referenced
-(screenshots, rendered UI) and judge it with your eyes, not a description. Reconcile all
-of it against your prior baton.
+keyed-log paths given. Reconcile all of it against your prior baton.
 
-WHAT TO WRITE. Write your updated baton to ./baton.md and nothing else (do not print it).
-Free-form markdown, but ALWAYS these four sections:
+GO VERIFY (you have a full shell in this throwaway checkout, and nothing you run here
+touches durable state). Actively confirm what the workers claim rather than trusting it:
+- For UI / visual work, BUILD and RENDER the merged result and VIEW the screenshot with
+  your own eyes (you can SEE images) - never sign off on a look you only read described.
+- For functional work, RUN the relevant checks (build, type-check, tests, a quick probe)
+  and watch them pass or fail for real.
+
+WHAT TO PERSIST AS EVIDENCE. Alongside the baton, save a ``baton-artifacts/`` directory
+in your CWD holding the EVIDENCE you gathered: the render PNG(s) you produced and viewed,
+the key gate / check output, the notable diffs. The state machine relocates this bundle
+into the keyed log, so your NEXT self opens GROUND TRUTH - the actual render, the actual
+output - not your prose description of it. Keep it small and high-signal; omit it
+entirely for a purely functional epoch that produced nothing worth showing.
+
+WHAT TO WRITE. Write your updated baton to ./baton.md and nothing else printed (do not
+print the baton). Free-form markdown, but ALWAYS these four sections:
 
   ## Project summary
   Where the whole job stands, in a few sentences. Carry it forward and refine it; this is
@@ -299,6 +322,29 @@ def _baton_block(context: PlannerContext) -> str:
         "Reconcile it against the actual tree (grep your workdir) - the tree is "
         "ground truth, the baton is your intent:\n"
         f"{context.baton}\n</baton>\n"
+    )
+
+
+def _baton_artifacts_block(keys: tuple[str, ...]) -> str:
+    """The prior epoch's persisted EVIDENCE bundle: the keyed-log paths the deep-survey
+    close-out left at ``E<n-1>/baton-artifacts/`` (the render it built + viewed, the gate
+    output it ran, the diffs it kept). Point the plan-step at it as PRIMARY ground truth -
+    open it, VIEW the render - rather than trusting the baton's prose description of it.
+
+    Empty ``keys`` -> ``""`` (epoch 1, or a run that persisted none: byte-identical to a
+    run without the bundle, so the cacheable prefix and the absent path are untouched)."""
+
+    if not keys:
+        return ""
+    lines = "\n".join(f"  - {k}" for k in keys)
+    return (
+        "<baton_artifacts>\n"
+        "The EVIDENCE your last close-out persisted: the render(s) it built and viewed, "
+        "the gate/check output it ran, the notable diffs - ground truth, not a "
+        "description of it. OPEN these keyed-log files and VIEW the render(s) before you "
+        "decide; trust them over the baton's prose:\n"
+        f"{lines}\n"
+        "</baton_artifacts>\n"
     )
 
 
@@ -405,10 +451,13 @@ def _repo_map_block(text: str) -> str:
 
 _TOOLS_BLOCK = (
     "<tools>\n"
-    "Your workdir is a checkout of the current integration tip. GREP and READ it to "
-    "ground your plan (what already exists, where things live). Reading is your own "
-    "internal step; your turn still ends with exactly one decision written to "
-    "./decision.json.\n"
+    "Your workdir is a checkout of the current integration tip with a FULL shell - "
+    "nothing you run here touches durable state. GREP and READ it to ground your plan "
+    "(what already exists, where things live), OPEN the prior epoch's baton-artifacts "
+    "bundle (VIEW its render), and you MAY RUN verification commands (build, test, "
+    "render, inspect) to see real state before deciding - this informs YOU, it does not "
+    "make verification a worker task. Reading and running are your own internal step; "
+    "your turn still ends with exactly one decision written to ./decision.json.\n"
     "</tools>\n"
 )
 
@@ -426,9 +475,10 @@ def build_planner_input(
     ``PLAN_PREAMBLE`` (byte-stable) then the repo's always-on STRATEGY overlay (advisory,
     injected right after ``</system>`` so the cacheable system prefix is unchanged; empty
     when the repo ships none) then the volatile tail: the job spec, the running state +
-    keyed-log index, the prior epoch's BATON, the optional repo-navigation map (when the
-    repo ships one), the domain-skill catalogue index (when the repo ships one), the
-    read-tools note, any re-ask feedback, and the request. References, not payloads: only
+    keyed-log index, the prior epoch's BATON, the pointer to its persisted EVIDENCE bundle
+    (when it produced one), the optional repo-navigation map (when the repo ships one), the
+    domain-skill catalogue index (when the repo ships one), the read-tools note, any re-ask
+    feedback, and the request. References, not payloads: only
     the baton text, names, and log keys, never file bodies (the planner greps its workdir
     for the tree). An absent ``repo_map`` adds zero bytes (byte-identical to today).
     """
@@ -446,6 +496,7 @@ def build_planner_input(
         f"<job>\n{context.job}\n</job>\n"
         f"{_state_block(context)}"
         f"{_baton_block(context)}"
+        f"{_baton_artifacts_block(context.baton_artifacts)}"
         f"{_carried_block(context.carried)}"
         f"{_repo_map_block(repo_map)}"
         f"{_domain_skills_block(domain_skill_index)}"
@@ -534,9 +585,12 @@ def _parked_block(context: CloseoutContext) -> str:
 
 _CLOSEOUT_TOOLS_BLOCK = (
     "<tools>\n"
-    "Your workdir is a checkout of this epoch's staging tree. GREP and READ it, and "
-    "READ the keyed-log handoffs + verdicts named above (VIEW any images - you can "
-    "see). Then write ./baton.md and stop.\n"
+    "Your workdir is a checkout of this epoch's staging tree with a FULL shell - nothing "
+    "you run here touches durable state. GREP and READ it, READ the keyed-log handoffs + "
+    "verdicts named above (VIEW any images - you can see), and GO VERIFY: build / render "
+    "/ run the relevant checks to confirm what the workers claim. Save the evidence you "
+    "gather (renders, gate output, diffs) under ./baton-artifacts/, then write ./baton.md "
+    "and stop.\n"
     "</tools>\n"
 )
 
@@ -575,8 +629,9 @@ def build_closeout_input(
         f"{skills}"
         f"{_CLOSEOUT_TOOLS_BLOCK}"
         "<request>\n"
-        "Write your updated baton (the four sections) to ./baton.md and nothing else. "
-        "Do not print it.\n"
+        "Verify what really happened, then write your updated baton (the four sections) "
+        "to ./baton.md, and save the evidence you gathered under ./baton-artifacts/. Do "
+        "not print the baton.\n"
         "</request>\n"
     )
 
@@ -593,6 +648,11 @@ _OUT_FILENAME = "_planner_out.txt"
 #: The free-form close-out BATON the rig writes in its workdir (the disk contract,
 #: NEVER parsed, like the worker handoff).
 BATON_FILE = "baton.md"
+#: The close-out's EVIDENCE bundle dir (render PNGs, gate/check output, notable diffs)
+#: written alongside the baton in its throwaway workdir, relocated to the keyed log
+#: (``E<n>/baton-artifacts/``) so the next plan-step opens ground truth, not a
+#: description of it. Free-form, NEVER parsed, like the baton + handoff.
+BATON_ARTIFACTS_DIRNAME = "baton-artifacts"
 
 
 def _read_result(decision_path: Path, out_file: Path, stdout: str) -> str:
@@ -608,6 +668,30 @@ def _read_result(decision_path: Path, out_file: Path, stdout: str) -> str:
             if text.strip():
                 return text
     return stdout
+
+
+def _relocate_baton_artifacts(
+    workdir: Path, *, run_dir: RunDir, epoch_index: int
+) -> Path | None:
+    """Relocate the close-out's EVIDENCE bundle (``baton-artifacts/``) from the throwaway
+    planner worktree to the keyed log at ``E<n>/baton-artifacts/``, so the next plan-step
+    OPENS ground truth (the render PNG, the gate output, the diffs), not a description of
+    it. Mirrors ``worker._relocate_handoff``: free-form evidence, MOVED verbatim, never
+    parsed.
+
+    A no-op (returns ``None``) when the dir is absent or holds no files (a functional run,
+    or a close-out that produced none): nothing is relocated and no keyed-log key appears.
+    Returns the dest dir when files moved."""
+
+    src = workdir / BATON_ARTIFACTS_DIRNAME
+    if not src.is_dir():
+        return None
+    if not any(p.is_file() for p in src.rglob("*")):
+        return None
+    dest = run_dir.baton_artifacts_dir(epoch_index)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dest))
+    return dest
 
 
 @dataclass
@@ -709,7 +793,15 @@ class ScriptPlanner:
                 prompt=prompt, workdir=workdir, out_file=out_file, purpose="closeout"
             )
         )
-        return _read_result(baton_path, out_file, stdout)
+        baton = _read_result(baton_path, out_file, stdout)
+        # Relocate the deep-survey EVIDENCE bundle out of the throwaway worktree (where it
+        # would evaporate) into the durable keyed log, so the next plan-step sees it. A
+        # no-op when the close-out produced none (functional runs). The baton itself is
+        # persisted by the loop's _finalize_epoch, as before.
+        _relocate_baton_artifacts(
+            workdir, run_dir=context.run_dir, epoch_index=context.epoch_index
+        )
+        return baton
 
     def _ensure_worktree(
         self, repo: Path | None, ref: str | None, run_dir: RunDir

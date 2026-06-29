@@ -119,6 +119,16 @@ class RunDir:
 
         return self.resolve(f"E{epoch_index}/baton.md")
 
+    def baton_artifacts_dir(self, epoch_index: int) -> Path:
+        """The keyed-log dir the close-out planner's EVIDENCE bundle is relocated to for
+        epoch ``epoch_index`` (``E<n>/baton-artifacts/``): the render PNG(s), key gate
+        output, notable diffs the deep-survey close-out persisted, so the NEXT plan-step
+        opens ground truth, not a description of it. Resolved (containment-guarded), NOT
+        created (mirrors ``baton_path``); the relocation creates it only when there is
+        evidence to move."""
+
+        return self.resolve(f"E{epoch_index}/baton-artifacts")
+
     def read_baton(self, epoch_index: int) -> str:
         """The prior epoch's baton text, or ``""`` when absent/unreadable (NEVER
         raises). Seeds the next PLAN's context: epoch 1 reads ``E0/baton.md`` (absent)

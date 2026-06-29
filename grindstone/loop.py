@@ -103,7 +103,12 @@ from grindstone.events import (
 )
 from grindstone.events import Verdict as VerdictEvent
 from grindstone.journal import reap_sibling_journals, write_journal
-from grindstone.planner import PlannerError, PlannerTimeout, ScriptPlanner
+from grindstone.planner import (
+    BATON_ARTIFACTS_DIRNAME,
+    PlannerError,
+    PlannerTimeout,
+    ScriptPlanner,
+)
 from grindstone.planner import RateLimited as PlannerRateLimited
 from grindstone.rundir import RunDir, create_run_dir
 from grindstone.script_planner import ScriptPlannerTransport
@@ -170,6 +175,11 @@ class PlannerContext:
     #: The 1-based epoch number about to be planned, and the backstop.
     epoch_index: int
     max_epochs: int
+    #: The keyed-log paths of the prior epoch's persisted EVIDENCE bundle
+    #: (``E<n-1>/baton-artifacts/...``: the render the close-out built + viewed, the gate
+    #: output, the diffs) the plan-step opens as primary ground truth. Empty (the default)
+    #: on epoch 1 or when the close-out produced none -> byte-identical planner prompt.
+    baton_artifacts: tuple[str, ...] = ()
     #: The strike-ladder NUDGE (soft): the lineages carried unfinished across prior
     #: epochs, each flagged with the deterministic action the state machine will take
     #: (force senior at 3, park at 4). Reconstructed from the journal, so it survives a
@@ -385,20 +395,26 @@ def _build_context(
     carried: tuple[strikes.CarriedItem, ...] = (),
 ) -> PlannerContext:
     """Reconstruct the PLAN window FROM DISK: the keyed-log index + the prior epoch's
-    baton (``read_baton(epoch_index - 1)``, ``""`` for epoch 1) + the strike-ladder
+    baton (``read_baton(epoch_index - 1)``, ``""`` for epoch 1) + the pointer to that
+    epoch's persisted EVIDENCE bundle (``E<n-1>/baton-artifacts/...``, derived from the
+    keyed log; absent on epoch 1 / when the close-out produced none) + the strike-ladder
     nudge (``carried``, reconstructed from the journal by the caller). No file-name dump
     (the planner greps its own workdir for the tree)."""
 
+    log_index = tuple(run_dir.log_index())
+    prefix = f"E{epoch_index - 1}/{BATON_ARTIFACTS_DIRNAME}/"
+    baton_artifacts = tuple(k for k in log_index if k.startswith(prefix))
     return PlannerContext(
         job=job,
         repo=repo,
         run_dir=run_dir,
         run_branch=run_branch,
         tip_ref=tip_ref,
-        log_index=tuple(run_dir.log_index()),
+        log_index=log_index,
         baton=run_dir.read_baton(epoch_index - 1),
         epoch_index=epoch_index,
         max_epochs=max_epochs,
+        baton_artifacts=baton_artifacts,
         carried=carried,
     )
 

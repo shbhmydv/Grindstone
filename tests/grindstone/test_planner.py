@@ -96,6 +96,36 @@ def test_build_planner_input_renders_every_context_field(run_dir: RunDir) -> Non
     assert "epoch must declare at least one task" in prompt
 
 
+def test_build_planner_input_renders_baton_artifacts_pointer_when_present(
+    run_dir: RunDir,
+) -> None:
+    # baton-v3 plan-step: when the prior epoch persisted an evidence bundle, the prompt
+    # points the planner at it (open it, VIEW the render) as primary ground truth.
+    ctx = PlannerContext(
+        job="# job\n",
+        repo=None,
+        run_dir=run_dir,
+        run_branch=None,
+        tip_ref="deadbeef",
+        log_index=("E2/baton-artifacts/render.png", "E2/baton.md"),
+        baton="## Project summary\nso far\n",
+        epoch_index=3,
+        max_epochs=40,
+        baton_artifacts=("E2/baton-artifacts/render.png",),
+    )
+    prompt = build_planner_input(ctx, domain_skill_index={})
+    assert "<baton_artifacts>" in prompt
+    assert "E2/baton-artifacts/render.png" in prompt
+
+
+def test_build_planner_input_no_baton_artifacts_is_byte_identical(run_dir: RunDir) -> None:
+    # Epoch 1 / a run that persisted no evidence adds ZERO bytes (the absent-block path).
+    ctx = _raw_context(run_dir, baton="## Pending\nfoo\n")
+    assert ctx.baton_artifacts == ()
+    with_block = build_planner_input(ctx, domain_skill_index={})
+    assert "<baton_artifacts>" not in with_block
+
+
 def test_build_planner_input_injects_strategy_after_system_before_job(
     run_dir: RunDir,
 ) -> None:
@@ -485,6 +515,51 @@ def test_close_out_reads_baton_from_the_workdir_file(
     planner = ScriptPlanner(MockPlannerTransport([rig]))
     result = planner.close_out(_live_closeout_context(git_repo, run_dir))
     assert result == baton  # the workdir baton.md, not the --out fallback
+
+
+def test_close_out_relocates_baton_artifacts_to_keyed_log(
+    git_repo: Path, run_dir: RunDir
+) -> None:
+    # baton-v3: the deep-survey close-out persists an EVIDENCE bundle (render PNGs, gate
+    # output, notable diffs) in its throwaway worktree; the state machine relocates it to
+    # the keyed log at E<n>/baton-artifacts/ so the NEXT plan-step opens ground truth.
+    baton = "## Project summary\nrendered + verified\n"
+    rig = MockRig(
+        baton=baton,
+        artifacts={"render.png": "PNGBYTES", "gate.txt": "tsc: 0 errors"},
+    )
+    planner = ScriptPlanner(MockPlannerTransport([rig]))
+    result = planner.close_out(_live_closeout_context(git_repo, run_dir))
+    assert result == baton
+    # Relocated under the epoch dir, and now a durable keyed-log reference.
+    moved = run_dir.root / "E1" / "baton-artifacts" / "render.png"
+    assert moved.is_file() and moved.read_text(encoding="utf-8") == "PNGBYTES"
+    assert "E1/baton-artifacts/render.png" in run_dir.log_index()
+    assert "E1/baton-artifacts/gate.txt" in run_dir.log_index()
+    # The throwaway worktree no longer holds the bundle (it was MOVED, not copied).
+    assert not (run_dir.root / "_planner_tip" / "baton-artifacts").exists()
+
+
+def test_close_out_without_artifacts_relocates_nothing(
+    git_repo: Path, run_dir: RunDir
+) -> None:
+    # A functional run (or a close-out that produced no evidence) writes no bundle: no
+    # crash, nothing relocated, no keyed-log key.
+    planner = ScriptPlanner(MockPlannerTransport([MockRig(baton="## done\n")]))
+    planner.close_out(_live_closeout_context(git_repo, run_dir))
+    assert not (run_dir.root / "E1" / "baton-artifacts").exists()
+    assert not any(
+        k.startswith("E1/baton-artifacts/") for k in run_dir.log_index()
+    )
+
+
+def test_close_out_empty_artifacts_dir_relocates_nothing(
+    git_repo: Path, run_dir: RunDir
+) -> None:
+    # An EMPTY baton-artifacts/ dir (the rig made it but wrote no files) is a no-op too.
+    planner = ScriptPlanner(MockPlannerTransport([MockRig(baton="## done\n", artifacts={})]))
+    planner.close_out(_live_closeout_context(git_repo, run_dir))
+    assert not (run_dir.root / "E1" / "baton-artifacts").exists()
 
 
 def test_close_out_rate_limit_propagates(git_repo: Path, run_dir: RunDir) -> None:

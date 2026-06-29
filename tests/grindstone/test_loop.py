@@ -626,6 +626,47 @@ def test_resume_reads_prior_baton_from_disk(
     assert "escalated" in resume_planner.contexts[0].baton
 
 
+# --- _build_context surfaces the prior epoch's evidence bundle -----------------
+
+
+def test_build_context_points_at_prior_baton_artifacts(run_dir: RunDir) -> None:
+    from grindstone.loop import _build_context
+
+    # E2 persisted an evidence bundle; planning E3 must point at E2/baton-artifacts/.
+    (run_dir.root / "E2" / "baton-artifacts").mkdir(parents=True)
+    (run_dir.root / "E2" / "baton-artifacts" / "render.png").write_text("p", encoding="utf-8")
+    (run_dir.root / "E2" / "T1").mkdir(parents=True)
+    (run_dir.root / "E2" / "T1" / "handoff.md").write_text("h", encoding="utf-8")
+    ctx = _build_context(
+        job="j", repo=None, run_dir=run_dir, run_branch=None, tip_ref=None,
+        epoch_index=3, max_epochs=5,
+    )
+    assert ctx.baton_artifacts == ("E2/baton-artifacts/render.png",)
+    # The handoff (not under baton-artifacts) is NOT a bundle pointer, but stays in the log.
+    assert "E2/T1/handoff.md" in ctx.log_index
+
+
+def test_build_context_no_baton_artifacts_on_first_epoch_or_when_none(
+    run_dir: RunDir,
+) -> None:
+    from grindstone.loop import _build_context
+
+    # Epoch 1: there is no prior epoch, so no bundle pointer.
+    first = _build_context(
+        job="j", repo=None, run_dir=run_dir, run_branch=None, tip_ref=None,
+        epoch_index=1, max_epochs=5,
+    )
+    assert first.baton_artifacts == ()
+    # E2 produced ONLY a baton (functional run, no evidence): planning E3 -> still none.
+    (run_dir.root / "E2").mkdir(parents=True)
+    (run_dir.root / "E2" / "baton.md").write_text("## done\n", encoding="utf-8")
+    none = _build_context(
+        job="j", repo=None, run_dir=run_dir, run_branch=None, tip_ref=None,
+        epoch_index=3, max_epochs=5,
+    )
+    assert none.baton_artifacts == ()
+
+
 # --- the final-acceptance invariant runs done_when against the tip -------------
 
 

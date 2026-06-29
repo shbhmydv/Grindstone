@@ -46,6 +46,20 @@ def test_log_index_keys_epoch_dirs_only(tmp_path: Path) -> None:
     assert "journal.md" not in index
 
 
+def test_baton_artifacts_dir_resolves_but_does_not_create(tmp_path: Path) -> None:
+    rd = _run_dir(tmp_path)
+    # The keyed-log dir the close-out evidence bundle is relocated to: E<n>/baton-artifacts.
+    d = rd.baton_artifacts_dir(3)
+    assert d == (rd.root / "E3/baton-artifacts").resolve()
+    # Resolved (containment-guarded), NOT created: the relocation creates it only when
+    # there is evidence to move (mirrors baton_path, which finalize mkdirs).
+    assert not d.exists()
+    # Its files land under an epoch dir, so they appear in the keyed-log index.
+    d.mkdir(parents=True)
+    (d / "render.png").write_text("PNG", encoding="utf-8")
+    assert "E3/baton-artifacts/render.png" in rd.log_index()
+
+
 def test_baton_path_and_read_baton(tmp_path: Path) -> None:
     rd = _run_dir(tmp_path)
     # Absent baton (and the epoch-0 sentinel for the first epoch) reads as "".
