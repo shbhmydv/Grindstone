@@ -70,8 +70,10 @@ def test_done_pass_is_merge_ready(git_repo: Path, run_dir: RunDir) -> None:
 
 def test_research_pass_publishes_artifact(git_repo: Path, run_dir: RunDir) -> None:
     base = wt.head_commit(git_repo)
+    # The worker writes the BASENAME of artifact_out in its CWD (the safe pattern);
+    # Python owns the nested run-dir publish key.
     worker = MockWorker(
-        script=["ok", "PASS"], artifacts={"E1/T1/r.md": "# findings\n"}
+        script=["ok", "PASS"], artifacts={"r.md": "# findings\n"}
     )
     result = run_task(
         _research(), "E1/T1", run_dir=run_dir, repo=git_repo, base=base,
@@ -81,6 +83,64 @@ def test_research_pass_publishes_artifact(git_repo: Path, run_dir: RunDir) -> No
     assert result.artifact_key == "E1/T1/r.md"
     # The deliverable is relocated into the durable run dir (the keyed log).
     assert run_dir.resolve("E1/T1/r.md").read_text() == "# findings\n"
+
+
+def _review() -> Task:
+    return Task(
+        id="T2", mode="review", goal="judge the work", artifact_out="E1/T2/review.json"
+    )
+
+
+def test_artifact_line_instructs_basename_not_nested_key() -> None:
+    # Fix A: a non-write task is told to write the BASENAME in its CWD, never the
+    # nested run-dir "log key" the worker cannot resolve.
+    from grindstone.worker import build_worker_prompt
+
+    prompt = build_worker_prompt(
+        WorkerRequest(
+            task=_review(), task_id="E1/T2", mode="review", scratch=Path("/scratch")
+        )
+    )
+    assert "review.json" in prompt
+    assert "E1/T2/review.json" not in prompt  # the nested key is never a write path
+    assert "log key" not in prompt
+
+
+def test_non_write_gate_passes_on_basename(git_repo: Path, run_dir: RunDir) -> None:
+    # Fix A: the gate accepts the basename in the worktree root and publishes it to
+    # the nested run-dir key.
+    base = wt.head_commit(git_repo)
+    worker = MockWorker(script=["ok", "PASS"], artifacts={"review.json": "{}\n"})
+    result = run_task(
+        _review(), "E1/T2", run_dir=run_dir, repo=git_repo, base=base,
+        backends=_backends(worker),
+    )
+    assert result.outcome == "passed"
+    assert result.artifact_key == "E1/T2/review.json"
+    assert run_dir.resolve("E1/T2/review.json").read_text() == "{}\n"
+
+
+def test_non_write_gate_rejects_nested_write(git_repo: Path, run_dir: RunDir) -> None:
+    # Fix A: a worker that writes the nested key (instead of the basename in its CWD)
+    # fails the gate; the ladder exhausts and the task escalates.
+    base = wt.head_commit(git_repo)
+    worker = MockWorker(
+        script=["ok", "ok", "ok"], artifacts={"E1/T2/review.json": "{}\n"}
+    )
+    result = run_task(
+        _review(), "E1/T2", run_dir=run_dir, repo=git_repo, base=base,
+        backends=_backends(worker),
+    )
+    assert result.outcome == "escalated"
+    assert "not produced" in result.reason
+
+
+def test_worktree_contract_names_cwd_as_worktree_root() -> None:
+    # Fix C: the contract states the CWD IS the worktree root, so "write in your CWD"
+    # is unambiguous and the model never anchors a write at a nested run-dir path.
+    from grindstone.worker import _WORKTREE_CONTRACT
+
+    assert "root of this worktree" in _WORKTREE_CONTRACT
 
 
 # --- RETRY then PASS -----------------------------------------------------------
@@ -550,7 +610,10 @@ create a.py
 
 <worktree>
 You run inside an ISOLATED, throwaway git worktree that is your current working directory
-and IS the repository for this task. Create and edit every file with paths RELATIVE to
+and IS the repository for this task. Your CWD is the root of this worktree, so when an
+instruction tells you to produce or write a file by name, create that file by its bare name
+at your CWD root, never at a nested run-directory path. Create and edit every file with
+paths RELATIVE to
 your CWD; never write to an absolute path and never write outside your CWD. There is no
 other repository you may touch - do not go looking for one, this worktree is it. The
 orchestrator inspects ONLY this worktree to gate and integrate your work, so anything you

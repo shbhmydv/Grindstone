@@ -22,6 +22,7 @@ the wire contract, Pydantic stays the source of truth.
 
 from __future__ import annotations
 
+from pathlib import PurePosixPath
 from typing import Annotated, Literal, Union
 
 from pydantic import (
@@ -44,6 +45,22 @@ LogKey = Annotated[
 #: The four worker intents. Picks the worker prompt/skill and the critic's
 #: grounding bar (research/review must cite real files). Carried on each task.
 HandoffMode = Literal["implement", "research", "review", "artifact"]
+
+#: The critic's only result channel: a ``verdict.json`` written in the critic's CWD
+#: (a re-read disk contract), relocated into the run dir and re-validated with Pydantic.
+#: Defined HERE (the contracts foundation) so the ``artifact_out`` validator can reserve
+#: it without importing ``worker`` (which imports this module); ``worker`` re-imports it.
+CRITIC_VERDICT_FILENAME = "verdict.json"
+
+#: Basenames the orchestrator OWNS as control files in a task's CWD and the run dir: the
+#: per-task critic verdict, the worker's free-form handoff, the planner's decision, and
+#: the living baton. A non-write task's ``artifact_out`` basename is BOTH what the worker
+#: writes in its CWD and the run-dir publish key, so it may not shadow one of these or two
+#: producers clobber a single key (the Boundary-3b collision). A single named set, the
+#: source of truth for the gate.
+RESERVED_ARTIFACT_BASENAMES: frozenset[str] = frozenset(
+    {CRITIC_VERDICT_FILENAME, "handoff.md", "decision.json", "baton.md"}
+)
 
 
 class _Frozen(BaseModel):
@@ -110,6 +127,12 @@ class Task(_Frozen):
             if self.artifact_out is None:
                 raise ValueError(
                     f"task {self.id}: {self.mode} tasks must declare artifact_out"
+                )
+            basename = PurePosixPath(self.artifact_out).name
+            if basename in RESERVED_ARTIFACT_BASENAMES:
+                raise ValueError(
+                    f"task {self.id}: artifact_out basename {basename!r} is a reserved "
+                    "control-file name (owned by the orchestrator); choose another name"
                 )
             if self.file_ownership:
                 raise ValueError(

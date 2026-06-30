@@ -139,6 +139,30 @@ def test_epoch_rejects_colliding_artifact_out() -> None:
         parse_decision(payload)
 
 
+@pytest.mark.parametrize(
+    "reserved", ["verdict.json", "handoff.md", "decision.json", "baton.md"]
+)
+def test_artifact_out_rejects_reserved_basename(reserved: str) -> None:
+    """A task's artifact_out must NOT shadow a Python-owned control file: the per-task
+    critic OWNS ``E*/T*/verdict.json`` and the other names are run-machinery, so a
+    planner that picks one would clobber a control file on publish. Reject it here so
+    the planner re-emits (it self-validates decision.json through parse_decision)."""
+
+    payload = _epoch_payload()
+    payload["epoch"]["tasks"][1]["artifact_out"] = f"E1/T2/{reserved}"  # type: ignore[index]
+    with pytest.raises(ValidationError):
+        parse_decision(payload)
+
+
+def test_artifact_out_allows_nonreserved_basename() -> None:
+    """A non-reserved basename (even with a .json extension) is fine."""
+
+    payload = _epoch_payload()
+    payload["epoch"]["tasks"][1]["artifact_out"] = "E1/T2/findings.json"  # type: ignore[index]
+    decision = parse_decision(payload)
+    assert isinstance(decision, EpochDecision)
+
+
 def test_epoch_allows_distinct_artifact_out() -> None:
     payload: dict[str, object] = {
         "kind": "epoch",

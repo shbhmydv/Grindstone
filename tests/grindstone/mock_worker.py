@@ -18,6 +18,7 @@ import json
 import random
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from grindstone.worker import (
     CRITIC_VERDICT_FILENAME,
@@ -173,8 +174,8 @@ class LoopWorker:
                 assert request.read_root is not None, "non-write task needs a read_root"
                 tip = (request.read_root / self.read_cite).read_text(encoding="utf-8")
                 body += f"reviewed integration-tip file {self.read_cite}:\n{tip}"
-            out = request.scratch / task.artifact_out
-            out.parent.mkdir(parents=True, exist_ok=True)
+            # The worker writes the BASENAME in its CWD; Python owns the publish key.
+            out = request.scratch / Path(task.artifact_out).name
             out.write_text(body, encoding="utf-8")
 
         (request.scratch / HANDOFF_FILENAME).write_text(
@@ -282,8 +283,8 @@ class StochasticWorker:
                 )
         else:
             assert task.artifact_out is not None
-            out = request.scratch / task.artifact_out
-            out.parent.mkdir(parents=True, exist_ok=True)
+            # The worker writes the BASENAME in its CWD; Python owns the publish key.
+            out = request.scratch / Path(task.artifact_out).name
             out.write_text(f"# artifact {request.task_id}\n", encoding="utf-8")
 
 

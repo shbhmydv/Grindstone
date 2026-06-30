@@ -54,6 +54,7 @@ from typing import Iterator, Literal, Protocol
 from grindstone import worktree as wt
 from grindstone.check_decision import extract_verdict_json
 from grindstone.contracts.models import (
+    CRITIC_VERDICT_FILENAME as CRITIC_VERDICT_FILENAME,  # explicit re-export
     HandoffMode,
     Task,
     Verdict,
@@ -72,10 +73,10 @@ from grindstone.rundir import RunDir
 #: file.
 HANDOFF_FILENAME = "handoff.md"
 
-#: The critic's only result channel: a ``verdict.json`` written in the critic's CWD
-#: (a re-read disk contract). Relocated into the run dir and re-validated with
-#: Pydantic; stdout is never parsed.
-CRITIC_VERDICT_FILENAME = "verdict.json"
+# ``CRITIC_VERDICT_FILENAME`` (the critic's ``verdict.json`` result channel) is imported
+# from ``contracts.models`` above: its canonical definition + the reserved-basename set
+# live there so the ``artifact_out`` validator can reserve it without a circular import.
+# It is re-exported here for the worker/critic prose that references it.
 
 #: Per-tier attempt budgets for the IN-EPOCH tier ladder. A local task gets a few
 #: same-tier self-heal attempts, then (when the rig has a DISTINCT senior endpoint)
@@ -302,7 +303,10 @@ class CriticError(Exception):
 #: outside the worktree; the orchestrator inspects ONLY this worktree.
 _WORKTREE_CONTRACT = """<worktree>
 You run inside an ISOLATED, throwaway git worktree that is your current working directory
-and IS the repository for this task. Create and edit every file with paths RELATIVE to
+and IS the repository for this task. Your CWD is the root of this worktree, so when an
+instruction tells you to produce or write a file by name, create that file by its bare name
+at your CWD root, never at a nested run-directory path. Create and edit every file with
+paths RELATIVE to
 your CWD; never write to an absolute path and never write outside your CWD. There is no
 other repository you may touch - do not go looking for one, this worktree is it. The
 orchestrator inspects ONLY this worktree to gate and integrate your work, so anything you
@@ -329,18 +333,18 @@ _MODE_GUIDANCE: dict[HandoffMode, str] = {
         "result."
     ),
     "research": (
-        "Investigate, then write your findings to the artifact log key below. Ground "
+        "Investigate, then write your findings to the artifact file named below. Ground "
         "every claim in a real file (cite file + line) or a real image you viewed; do "
         "not speculate."
     ),
     "review": (
         "Re-derive the question yourself and reconcile it against the real files and "
         "rendered output; do not just check that sections are present. View any "
-        "screenshots or UI the work produced. Write your verdict to the artifact log "
-        "key below and cite what you judged."
+        "screenshots or UI the work produced. Write your verdict to the artifact file "
+        "named below and cite what you judged."
     ),
     "artifact": (
-        "Produce the deliverable at the artifact log key below (it may be a document "
+        "Produce the deliverable as the artifact file named below (it may be a document "
         "or a rendered image); ground it in real files or visuals where it makes "
         "claims about the repo."
     ),
@@ -515,7 +519,11 @@ instruction - the active instruction is to fix the failures above on the existin
 
 def _artifact_line(task: Task) -> str:
     if task.mode != "implement" and task.artifact_out is not None:
-        return f"\nProduce the artifact at log key `{task.artifact_out}`.\n"
+        name = Path(task.artifact_out).name
+        return (
+            f"\nProduce the artifact as a file named exactly `{name}` in your current "
+            "working directory (a single file at your CWD root, not a nested path).\n"
+        )
     return ""
 
 
@@ -867,13 +875,16 @@ def _run_attempt(
             head=wt.head_commit(scratch), artifact_rel=None,
         )
 
-    # Non-write: the produced deliverable must exist; publish it to its log key.
+    # Non-write: the worker writes the BASENAME in its CWD (the safe basename-in-CWD
+    # pattern); Python owns the nested run-dir publish key. The gate checks the basename
+    # the worker was instructed to write, never the doubly-nested log key.
     assert task.artifact_out is not None
-    produced = scratch / task.artifact_out
+    basename = Path(task.artifact_out).name
+    produced = scratch / basename
     if not produced.is_file():
         if handoff_path is not None:
             handoff_path.unlink(missing_ok=True)
-        raise _Rejected(f"artifact_out not produced in CWD: {task.artifact_out}")
+        raise _Rejected(f"artifact_out not produced in CWD: {basename}")
     published = run_dir.resolve(task.artifact_out)
     published.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(produced, published)
@@ -987,7 +998,12 @@ def run_task(
             try:
                 verdict = _critic_verdict(
                     task, task_id, tier=tier, scratch=scratch, base=base,
-                    artifact_rel=attempt.artifact_rel,
+                    # The critic reads the deliverable in scratch by its BASENAME (the
+                    # safe basename-in-CWD pattern), never the nested publish key.
+                    artifact_rel=(
+                        None if attempt.artifact_rel is None
+                        else Path(attempt.artifact_rel).name
+                    ),
                     handoff_text=attempt.handoff_text,
                     critic_read_root=critic_read_root, run_dir=run_dir,
                     backends=backends, domain_skills=domain_skills,
