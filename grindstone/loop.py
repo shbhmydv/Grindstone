@@ -115,8 +115,6 @@ from grindstone.script_planner import ScriptPlannerTransport
 from grindstone.script_worker import build_backends
 from grindstone.worker import (
     Backends,
-    CRITIC_VERDICT_FILENAME,
-    HANDOFF_FILENAME,
     RateLimited as WorkerRateLimited,
     TaskResult,
     run_task,
@@ -244,6 +242,12 @@ class Planner(Protocol):
 
     def decide(self, context: PlannerContext) -> Decision: ...
     def close_out(self, context: CloseoutContext) -> str: ...
+
+    def discard_tip(self, repo: Path | None, run_dir: RunDir) -> None:
+        """Reclaim the planner's in-repo ``_planner_tip`` worktree (its installed deps /
+        build output, ~GB) at a NON-resumable terminal end. Idempotent; a no-op when the
+        planner holds no tip."""
+        ...
 
 
 #: Invariant #2: the one final acceptance, run ONCE when the planner says done.
@@ -691,16 +695,10 @@ def _task_outcomes(
                 task_id=r.task_id,
                 mode=task.mode if task is not None else "",
                 outcome=r.outcome,
-                handoff_key=(
-                    f"{r.task_id}/{HANDOFF_FILENAME}"
-                    if r.handoff_path is not None
-                    else None
-                ),
-                verdict_key=(
-                    f"{r.task_id}/{CRITIC_VERDICT_FILENAME}"
-                    if r.verdict is not None
-                    else None
-                ),
+                # The producer owns the VERSIONED key naming; close-out renders the
+                # keys it carried, never reconstructs a (now stale) flat key.
+                handoff_key=r.handoff_key,
+                verdict_key=r.verdict_key,
                 reason=r.reason or (r.verdict.reason if r.verdict is not None else ""),
             )
         )
@@ -990,6 +988,44 @@ def _run_interruptible(
 
 
 def _drive(
+    *,
+    job: str,
+    run_dir: RunDir,
+    repo: Path | None,
+    run_branch: str | None,
+    planner: Planner,
+    backends: Backends,
+    max_epochs: int,
+    log_root: Path,
+    acceptance: AcceptanceCheck | None,
+    sleep_fn: SleepFn,
+    backoff_s: float,
+    now_fn: NowFn,
+    journal: JournalWriter,
+    start_index: int,
+) -> RunResult:
+    """Drive the epoch loop to a DECIDED terminal, then reclaim the planner's tip.
+
+    Every ``RunResult`` ``_drive_epochs`` returns is a decided end (done_when passed, a
+    planner-declared END, or a clean partial-end backstop: K planner failures / K aborts
+    / max_epochs), none of which auto-resumes the in-flight work, so the in-repo
+    ``_planner_tip`` worktree (its installed deps + build output, ~GB) is reclaimed here.
+    A RESUMABLE stop propagates PAST this point without razing: a SIGTERM / interrupt is
+    an ``_Interrupted`` exception (caught upstream by ``_run_interruptible``), and a
+    rate-limit / session park never returns from the loop (it parks + re-enters) - both
+    keep the tip for the resume to reuse."""
+
+    result = _drive_epochs(
+        job=job, run_dir=run_dir, repo=repo, run_branch=run_branch, planner=planner,
+        backends=backends, max_epochs=max_epochs, log_root=log_root,
+        acceptance=acceptance, sleep_fn=sleep_fn, backoff_s=backoff_s, now_fn=now_fn,
+        journal=journal, start_index=start_index,
+    )
+    planner.discard_tip(repo, run_dir)
+    return result
+
+
+def _drive_epochs(
     *,
     job: str,
     run_dir: RunDir,

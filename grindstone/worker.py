@@ -95,6 +95,26 @@ _CRITIC_SNIPPET_MAX = 200
 #: verdict serializes far under this; it only ever fires on a corrupt file.
 _DISK_READ_MAX_BYTES = 1_048_576
 
+#: The tail of a FAILED attempt's worker stdout we persist for post-hoc RCA. The raw
+#: stdout can be 200-500MB (a full transcript) so the bulk is reaped; this last slice
+#: keeps the breadcrumb (the final error / what the worker was doing) at a bounded cost.
+_STDOUT_TAIL_BYTES = 256 * 1024
+
+
+def _attempt_handoff_key(task_id: str, label: str) -> str:
+    """The VERSIONED keyed-log key for one attempt's free-form handoff (the single
+    source of truth the producer and any consumer share; ``a{N}`` survives every retry
+    so the full local->senior debug trail is kept, never overwritten)."""
+
+    return f"{task_id}/{label}.{HANDOFF_FILENAME}"
+
+
+def _attempt_verdict_key(task_id: str, label: str) -> str:
+    """The VERSIONED keyed-log key for one attempt's critic verdict (companion of
+    ``_attempt_handoff_key``; only attempts that reached the critic write one)."""
+
+    return f"{task_id}/{label}.{CRITIC_VERDICT_FILENAME}"
+
 
 # --- transport seam (the uniform task-in / disk-out boundary) ------------------
 
@@ -261,14 +281,18 @@ class TaskResult:
       an ambiguous spec, a decision needed) or an exhausted retry ladder -> the
       planner. ``reason`` is the surfaced context.
 
-    ``handoff_path`` is the relocated free-form report (the planner's optional context
-    + the journal), ``None`` when the worker wrote none.
+    ``handoff_key`` / ``verdict_key`` are the VERSIONED keyed-log keys (``a{N}.handoff.md``
+    / ``a{N}.verdict.json``) of the attempt this result REPRESENTS: the passing attempt on
+    a PASS, the verdict-producing attempt on a critic ESCALATE. ``None`` when the worker
+    wrote no handoff / the critic landed no verdict. The producer owns the naming (loop
+    close-out renders these directly, never reconstructs them).
     """
 
     task_id: str
     outcome: Literal["passed", "escalated"]
     attempts: int
-    handoff_path: Path | None = None
+    handoff_key: str | None = None
+    verdict_key: str | None = None
     verdict: Verdict | None = None
     branch: str | None = None
     head: str | None = None
@@ -649,15 +673,16 @@ def build_prompt(request: WorkerRequest) -> str:
 
 
 def _relocate_handoff(
-    scratch: Path, *, run_dir: RunDir, task_id: str
-) -> tuple[Path | None, str]:
-    """Relocate the worker's FREE-FORM ``handoff.md`` to the keyed log and return its
-    ``(path, text)``.
+    scratch: Path, *, run_dir: RunDir, task_id: str, label: str
+) -> tuple[str | None, str]:
+    """Relocate the worker's FREE-FORM ``handoff.md`` to its VERSIONED keyed-log key
+    (``a{N}.handoff.md``) and return its ``(key, text)``.
 
-    The report is NEVER parsed or schema-gated: it is the worker's prose for the
-    critic + the planner's optional context. A missing or pathologically-large report
-    is fine (the deterministic gate is the diff / artifact, not this file), so return
-    ``(None, "")`` and let the critic judge the actual work."""
+    Written for EVERY attempt (pass OR fail) and NEVER unlinked, so the full
+    local->senior debug trail survives. The report is NEVER parsed or schema-gated: it
+    is the worker's prose for the critic + the planner's optional context. A missing or
+    pathologically-large report is fine (the deterministic gate is the diff / artifact,
+    not this file), so return ``(None, "")`` and let the critic judge the actual work."""
 
     src = scratch / HANDOFF_FILENAME
     if not src.is_file():
@@ -670,10 +695,54 @@ def _relocate_handoff(
     except OSError:
         src.unlink(missing_ok=True)
         return None, ""
-    dest = run_dir.resolve(f"{task_id}/{HANDOFF_FILENAME}")
+    key = _attempt_handoff_key(task_id, label)
+    dest = run_dir.resolve(key)
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(src), str(dest))
-    return dest, text
+    return key, text
+
+
+def _persist_failure_debug(
+    stdout: str,
+    *,
+    run_dir: RunDir,
+    task_id: str,
+    label: str,
+    diag: str | None = None,
+) -> None:
+    """Persist a FAILED attempt's debug breadcrumbs under the task's keyed log: the
+    last ``_STDOUT_TAIL_BYTES`` of the worker's stdout (the bulk transcript is reaped,
+    this tail survives for RCA) at ``a{N}.stdout-tail.txt``, plus, on a zero-diff
+    implement rejection, the ``diag`` text at ``a{N}.diag.txt``. Both free-form, never
+    parsed."""
+
+    tail = stdout.encode("utf-8", errors="replace")[-_STDOUT_TAIL_BYTES:]
+    dest = run_dir.resolve(f"{task_id}/{label}.stdout-tail.txt")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(tail)
+    if diag is not None:
+        run_dir.resolve(f"{task_id}/{label}.diag.txt").write_text(
+            diag, encoding="utf-8"
+        )
+
+
+def _zero_diff_diag(repo: Path, ownership: list[str]) -> str:
+    """Diagnose a ZERO-DIFF implement rejection: did the worker write OUTSIDE its
+    worktree into the REAL repo (a wrong-directory write), or produce nothing (a true
+    no-op)? READ-ONLY on ``repo`` (``git status`` only): intersect its dirty paths with
+    the task's ownership globs."""
+
+    owned_dirty = [p for p in wt.dirty_paths(repo) if wt.path_in_scope(p, ownership)]
+    if owned_dirty:
+        return (
+            "wrong-directory write: the worker wrote owned paths into the REAL repo "
+            "instead of its worktree (its worktree is zero-diff): "
+            f"{', '.join(owned_dirty)}"
+        )
+    return (
+        "no out-of-worktree writes detected in the real repo; the worker produced no "
+        "edits (no-op)"
+    )
 
 
 # --- the per-task unit ---------------------------------------------------------
@@ -699,6 +768,7 @@ def _critic_verdict(
     task: Task,
     task_id: str,
     *,
+    label: str,
     tier: str,
     scratch: Path,
     base: str | None,
@@ -748,7 +818,7 @@ def _critic_verdict(
     except Exception as exc:
         raise CriticError(f"critic transport failed: {type(exc).__name__}: {exc}") from exc
 
-    dest = run_dir.resolve(f"{task_id}/{CRITIC_VERDICT_FILENAME}")
+    dest = run_dir.resolve(_attempt_verdict_key(task_id, label))
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     # (a) The disk contract: the critic wrote verdict.json in its CWD (the normal path).
@@ -782,10 +852,11 @@ def _critic_verdict(
 
 @dataclass
 class _AttemptOutput:
-    """A gate-clean attempt: the free-form report (path + text for the critic) and
-    the produced work (implement HEAD, or the published artifact log key)."""
+    """A gate-clean attempt: the free-form report (versioned keyed-log key + text for
+    the critic) and the produced work (implement HEAD, or the published artifact log
+    key)."""
 
-    handoff_path: Path | None
+    handoff_key: str | None
     handoff_text: str
     head: str | None
     artifact_rel: str | None
@@ -795,6 +866,7 @@ def _run_attempt(
     task: Task,
     task_id: str,
     *,
+    label: str,
     tier: str,
     scratch: Path,
     repo: Path | None,
@@ -841,14 +913,16 @@ def _run_attempt(
     )
     try:
         with backends.slot(tier) as transport:
-            transport.run(request)
+            stdout = transport.run(request)
     except RateLimited:
         raise
     except Exception as exc:
         raise _Rejected(f"transport error: {type(exc).__name__}: {exc}") from exc
 
-    handoff_path, handoff_text = _relocate_handoff(
-        scratch, run_dir=run_dir, task_id=task_id
+    # The handoff is relocated to its VERSIONED key for EVERY attempt (pass OR fail) and
+    # NEVER unlinked, so a failed attempt's "what I did + where" survives for RCA.
+    handoff_key, handoff_text = _relocate_handoff(
+        scratch, run_dir=run_dir, task_id=task_id, label=label
     )
 
     if implement:
@@ -856,22 +930,25 @@ def _run_attempt(
         wt.commit_all(scratch, f"grind({task_id}): {task.goal.splitlines()[0][:72]}")
         changed = wt.changed_paths(scratch, epoch_base)
         if not changed:
-            if handoff_path is not None:
-                handoff_path.unlink(missing_ok=True)
+            _persist_failure_debug(
+                stdout, run_dir=run_dir, task_id=task_id, label=label,
+                diag=_zero_diff_diag(repo, list(task.file_ownership)),
+            )
             raise _Rejected(
                 "no committed work: implement task left a zero-diff branch"
             )
         out_of_scope = wt.scope_violations(changed, list(task.file_ownership))
         if out_of_scope:
-            if handoff_path is not None:
-                handoff_path.unlink(missing_ok=True)
+            _persist_failure_debug(
+                stdout, run_dir=run_dir, task_id=task_id, label=label
+            )
             raise _Rejected(
                 f"out-of-scope writes: {', '.join(out_of_scope)}", chainable=False
             )
         if events is not None:
             events.work_gate_passed(task_id)
         return _AttemptOutput(
-            handoff_path=handoff_path, handoff_text=handoff_text,
+            handoff_key=handoff_key, handoff_text=handoff_text,
             head=wt.head_commit(scratch), artifact_rel=None,
         )
 
@@ -882,8 +959,7 @@ def _run_attempt(
     basename = Path(task.artifact_out).name
     produced = scratch / basename
     if not produced.is_file():
-        if handoff_path is not None:
-            handoff_path.unlink(missing_ok=True)
+        _persist_failure_debug(stdout, run_dir=run_dir, task_id=task_id, label=label)
         raise _Rejected(f"artifact_out not produced in CWD: {basename}")
     published = run_dir.resolve(task.artifact_out)
     published.parent.mkdir(parents=True, exist_ok=True)
@@ -891,7 +967,7 @@ def _run_attempt(
     if events is not None:
         events.work_gate_passed(task_id)
     return _AttemptOutput(
-        handoff_path=handoff_path, handoff_text=handoff_text,
+        handoff_key=handoff_key, handoff_text=handoff_text,
         head=None, artifact_rel=task.artifact_out,
     )
 
@@ -958,6 +1034,7 @@ def run_task(
         while stage_attempt < budget:
             stage_attempt += 1
             attempts += 1
+            label = f"a{attempts}"  # versions the per-attempt debug artifacts
             attempt_base = prior_branch if prior_branch is not None else base
             if implement:
                 assert repo is not None and attempt_base is not None
@@ -970,7 +1047,7 @@ def run_task(
 
             try:
                 attempt = _run_attempt(
-                    task, task_id, tier=tier,
+                    task, task_id, label=label, tier=tier,
                     scratch=scratch, repo=repo, read_root=read_root, epoch_base=base,
                     backends=backends,
                     domain_skills=domain_skills,
@@ -997,7 +1074,7 @@ def run_task(
             # which routes to the planner via the ``escalated`` terminal below.
             try:
                 verdict = _critic_verdict(
-                    task, task_id, tier=tier, scratch=scratch, base=base,
+                    task, task_id, label=label, tier=tier, scratch=scratch, base=base,
                     # The critic reads the deliverable in scratch by its BASENAME (the
                     # safe basename-in-CWD pattern), never the nested publish key.
                     artifact_rel=(
@@ -1012,7 +1089,7 @@ def run_task(
                 _discard(repo, scratch, branch, implement)
                 return TaskResult(
                     task_id, "escalated", attempts=attempts,
-                    handoff_path=attempt.handoff_path, reason=str(exc),
+                    handoff_key=attempt.handoff_key, reason=str(exc),
                 )
             if events is not None:
                 events.verdict(task_id, verdict.outcome, verdict.reason)
@@ -1020,7 +1097,8 @@ def run_task(
             if verdict.outcome == "PASS":
                 return TaskResult(
                     task_id, "passed", attempts=attempts,
-                    handoff_path=attempt.handoff_path, verdict=verdict,
+                    handoff_key=attempt.handoff_key,
+                    verdict_key=_attempt_verdict_key(task_id, label), verdict=verdict,
                     branch=branch, head=attempt.head, artifact_key=attempt.artifact_rel,
                 )
             if verdict.outcome == "ESCALATE":
@@ -1028,7 +1106,8 @@ def run_task(
                     _discard(repo, scratch, branch, implement)
                     return TaskResult(
                         task_id, "escalated", attempts=attempts,
-                        handoff_path=attempt.handoff_path, verdict=verdict,
+                        handoff_key=attempt.handoff_key,
+                        verdict_key=_attempt_verdict_key(task_id, label), verdict=verdict,
                         reason=verdict.reason or "critic escalated to planner",
                     )
                 # Not the last stage: carry the wip up to the next (senior) tier.

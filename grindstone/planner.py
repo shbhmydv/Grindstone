@@ -851,3 +851,19 @@ class ScriptPlanner:
         wt.add_worktree_detached(repo, tip, ref=ref)
         self._tip_ref = ref
         return tip
+
+    def discard_tip(self, repo: Path | None, run_dir: RunDir) -> None:
+        """Remove the in-repo ``_planner_tip`` worktree, reclaiming its checkout plus the
+        installed deps / build output it accumulated (~GB in a real run). Called ONLY at a
+        NON-resumable terminal end (a completed run, a planner-declared END, or a clean
+        partial-end backstop); a resumable park / interrupt keeps the tip for the resume to
+        reuse. Idempotent: a missing tip is a no-op."""
+
+        tip = run_dir.root / _TIP_DIRNAME
+        if not tip.exists():
+            return
+        if repo is not None:
+            wt.remove_worktree(repo, tip)  # git worktree remove --force + prune + rmtree
+        else:
+            shutil.rmtree(tip, ignore_errors=True)  # the no-repo scratch-dir fallback
+        self._tip_ref = None

@@ -208,8 +208,12 @@ def test_blocked_report_escalates(git_repo: Path, run_dir: RunDir) -> None:
     )
     assert result.outcome == "escalated"
     assert result.verdict is not None and result.verdict.outcome == "ESCALATE"
-    # The free-form report was relocated for the planner's context.
-    assert result.handoff_path is not None and result.handoff_path.is_file()
+    # The free-form report was relocated for the planner's context, at the VERSIONED
+    # attempt key (a1: the single local attempt that escalated), with its verdict beside.
+    assert result.handoff_key == "E1/T1/a1.handoff.md"
+    assert run_dir.resolve(result.handoff_key).is_file()
+    assert result.verdict_key == "E1/T1/a1.verdict.json"
+    assert run_dir.resolve(result.verdict_key).is_file()
 
 
 # --- a failed deterministic gate (no committed work) is rejected ---------------
@@ -287,14 +291,14 @@ def test_critic_verdict_relocated_out_of_scratch(
     scratch = run_dir.artifacts_dir("E1/T1/critic")
     worker = MockWorker(script=["PASS"])
     verdict = _critic_verdict(
-        _implement(), "E1/T1", tier="local", scratch=scratch, base=base,
+        _implement(), "E1/T1", label="a1", tier="local", scratch=scratch, base=base,
         artifact_rel=None, handoff_text="", critic_read_root=git_repo, run_dir=run_dir,
         backends=_backends(worker), domain_skills={},
     )
     assert verdict.outcome == "PASS"
-    # (a) the scratch original is GONE, (b) the keyed-log dest carries the content.
+    # (a) the scratch original is GONE, (b) the VERSIONED keyed-log dest carries content.
     assert not (scratch / CRITIC_VERDICT_FILENAME).exists()
-    dest = run_dir.resolve(f"E1/T1/{CRITIC_VERDICT_FILENAME}")
+    dest = run_dir.resolve(f"E1/T1/a1.{CRITIC_VERDICT_FILENAME}")
     assert dest.is_file()
     assert json.loads(dest.read_text())["outcome"] == "PASS"
 
@@ -315,8 +319,10 @@ def test_relocate_handoff_oversized_is_removed(
     (scratch / HANDOFF_FILENAME).write_text(
         "x" * (_DISK_READ_MAX_BYTES + 1), encoding="utf-8"
     )
-    path, text = _relocate_handoff(scratch, run_dir=run_dir, task_id="E1/T1")
-    assert path is None and text == ""
+    key, text = _relocate_handoff(
+        scratch, run_dir=run_dir, task_id="E1/T1", label="a1"
+    )
+    assert key is None and text == ""
     assert not (scratch / HANDOFF_FILENAME).exists()
 
 
@@ -326,12 +332,120 @@ def test_relocate_handoff_normal_is_moved(run_dir: RunDir, tmp_path: Path) -> No
     scratch = tmp_path / "scratch"
     scratch.mkdir()
     (scratch / HANDOFF_FILENAME).write_text("# report\n", encoding="utf-8")
-    path, text = _relocate_handoff(scratch, run_dir=run_dir, task_id="E1/T1")
-    assert path is not None and path.is_file()
+    key, text = _relocate_handoff(
+        scratch, run_dir=run_dir, task_id="E1/T1", label="a1"
+    )
+    # Returns the VERSIONED relative key (not an absolute path) for TaskResult to carry.
+    assert key == "E1/T1/a1.handoff.md"
     assert text == "# report\n"
-    # Moved, not copied: gone from scratch, present at the keyed-log dest.
+    # Moved, not copied: gone from scratch, present at the versioned keyed-log dest.
     assert not (scratch / HANDOFF_FILENAME).exists()
-    assert run_dir.resolve(f"E1/T1/{HANDOFF_FILENAME}").read_text() == "# report\n"
+    assert run_dir.resolve(key).read_text() == "# report\n"
+
+
+# --- versioned per-attempt debug persistence (the local->senior trail survives) ---
+
+
+def test_failed_then_passing_keeps_both_attempt_handoffs(
+    git_repo: Path, run_dir: RunDir
+) -> None:
+    # a1 writes a report but lands no committable diff (a no-op-with-report zero-diff
+    # fail); a2 lands the file and passes. BOTH attempts' handoffs must survive at their
+    # VERSIONED keys, and the OLD flat key must never exist.
+    base = wt.head_commit(git_repo)
+    worker = MockWorker(
+        script=["report_only", "ok", "PASS"], artifacts={"a.py": "print(1)\n"}
+    )
+    result = run_task(
+        _implement(), "E1/T1", run_dir=run_dir, repo=git_repo, base=base,
+        backends=_backends(worker),
+    )
+    assert result.outcome == "passed"
+    assert result.attempts == 2
+    # The failed attempt's handoff is KEPT (no longer unlinked) alongside the passer's.
+    assert run_dir.resolve("E1/T1/a1.handoff.md").is_file()
+    assert run_dir.resolve("E1/T1/a2.handoff.md").is_file()
+    # The OLD flat key is gone (each retry no longer overwrites the prior).
+    assert not run_dir.resolve("E1/T1/handoff.md").exists()
+    # The result REPRESENTS the passing attempt (a2): its versioned handoff + verdict.
+    assert result.handoff_key == "E1/T1/a2.handoff.md"
+    assert result.verdict_key == "E1/T1/a2.verdict.json"
+    assert run_dir.resolve("E1/T1/a2.verdict.json").is_file()
+
+
+def test_zero_diff_rejection_keeps_handoff_and_writes_noop_diag(
+    git_repo: Path, run_dir: RunDir
+) -> None:
+    # A zero-diff implement rejection KEEPS its versioned handoff and writes a diag that,
+    # with nothing landing in the REAL repo, names a true no-op.
+    base = wt.head_commit(git_repo)
+    worker = MockWorker(
+        script=["report_only", "report_only", "report_only"],
+        artifacts={"a.py": "x\n"}, stdout="worker chatter\n",
+    )
+    result = run_task(
+        _implement(), "E1/T1", run_dir=run_dir, repo=git_repo, base=base,
+        backends=_backends(worker),
+    )
+    assert result.outcome == "escalated"
+    assert run_dir.resolve("E1/T1/a1.handoff.md").is_file()  # kept, not unlinked
+    diag = run_dir.resolve("E1/T1/a1.diag.txt").read_text()
+    assert "no-op" in diag
+
+
+def test_failed_attempt_persists_stdout_tail_passing_does_not(
+    git_repo: Path, run_dir: RunDir
+) -> None:
+    # A FAILED attempt persists the tail of the worker's stdout (the bulk transcript is
+    # reaped); a PASSING attempt persists none.
+    base = wt.head_commit(git_repo)
+    chatter = "ERROR boom\n" * 100
+    worker = MockWorker(
+        script=["empty", "ok", "PASS"], artifacts={"a.py": "print(1)\n"},
+        stdout=chatter,
+    )
+    result = run_task(
+        _implement(), "E1/T1", run_dir=run_dir, repo=git_repo, base=base,
+        backends=_backends(worker),
+    )
+    assert result.outcome == "passed" and result.attempts == 2
+    # Tail == the full stdout here (well under the 256KB cap).
+    assert run_dir.resolve("E1/T1/a1.stdout-tail.txt").read_text() == chatter
+    # The passing attempt wrote no stdout tail (only failures do).
+    assert not run_dir.resolve("E1/T1/a2.stdout-tail.txt").exists()
+
+
+@dataclass
+class _WrongDirWorker:
+    """A worker that writes its owned files into the REAL target repo (the operator
+    checkout) instead of its isolated worktree, leaving the worktree zero-diff: the
+    wrong-directory-write the zero-diff diag must name. MockWorker has no repo handle,
+    so this dedicated double carries one."""
+
+    repo: Path
+
+    def run(self, request: "WorkerRequest") -> str:
+        if request.critic is not None:
+            return ""
+        for rel in request.task.file_ownership:
+            (self.repo / rel).write_text("leaked write\n", encoding="utf-8")
+        return "I wrote the files."
+
+
+def test_zero_diff_diag_names_wrong_directory_write(
+    git_repo: Path, run_dir: RunDir
+) -> None:
+    # The OTHER zero-diff cause: the worker wrote owned paths OUTSIDE its worktree into
+    # the real repo. The diag must name it a wrong-directory write and cite the path.
+    base = wt.head_commit(git_repo)
+    result = run_task(
+        _implement(), "E1/T1", run_dir=run_dir, repo=git_repo, base=base,
+        backends=Backends.single(_WrongDirWorker(git_repo)),
+    )
+    assert result.outcome == "escalated"
+    diag = run_dir.resolve("E1/T1/a1.diag.txt").read_text()
+    assert "wrong-directory write" in diag
+    assert "a.py" in diag  # the owned path that leaked into the real repo
 
 
 # --- the critic prompt encodes the triage --------------------------------------
@@ -460,7 +574,7 @@ def test_critic_verdict_threads_domain_skills(git_repo: Path, run_dir: RunDir) -
     scratch = run_dir.artifacts_dir("E1/T1/critic")
     skills = {"rn-composition": "Compose screens from primitives."}
     verdict = _critic_verdict(
-        _implement(), "E1/T1", tier="local", scratch=scratch, base=base,
+        _implement(), "E1/T1", label="a1", tier="local", scratch=scratch, base=base,
         artifact_rel=None, handoff_text="", critic_read_root=git_repo, run_dir=run_dir,
         backends=Backends.single(_Recorder()), domain_skills=skills,
     )
@@ -729,13 +843,13 @@ def test_critic_verdict_recovers_chatted_verdict_from_stdout(
     base = wt.head_commit(git_repo)
     scratch = run_dir.artifacts_dir("E1/T1/critic")
     verdict = _critic_verdict(
-        _implement(), "E1/T1", tier="local", scratch=scratch, base=base,
+        _implement(), "E1/T1", label="a1", tier="local", scratch=scratch, base=base,
         artifact_rel=None, handoff_text="", critic_read_root=git_repo, run_dir=run_dir,
         backends=Backends.single(_ChatCritic("PASS")), domain_skills={},
     )
     assert verdict.outcome == "PASS"
-    # Persisted to the keyed-log dest even though NO scratch verdict.json ever existed.
-    dest = run_dir.resolve(f"E1/T1/{CRITIC_VERDICT_FILENAME}")
+    # Persisted to the VERSIONED keyed-log dest even though NO scratch verdict.json existed.
+    dest = run_dir.resolve(f"E1/T1/a1.{CRITIC_VERDICT_FILENAME}")
     assert dest.is_file()
     assert json.loads(dest.read_text())["outcome"] == "PASS"
 
@@ -750,7 +864,7 @@ def test_critic_verdict_file_takes_precedence_over_stdout(
     base = wt.head_commit(git_repo)
     scratch = run_dir.artifacts_dir("E1/T1/critic")
     verdict = _critic_verdict(
-        _implement(), "E1/T1", tier="local", scratch=scratch, base=base,
+        _implement(), "E1/T1", label="a1", tier="local", scratch=scratch, base=base,
         artifact_rel=None, handoff_text="", critic_read_root=git_repo, run_dir=run_dir,
         backends=Backends.single(_BothChannelsCritic()), domain_skills={},
     )

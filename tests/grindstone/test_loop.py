@@ -124,6 +124,40 @@ def test_single_epoch_reaches_completed(
     assert [e.status for e in tree.epochs] == ["completed"]
 
 
+def test_completed_run_reclaims_planner_tip(
+    git_repo: Path, run_dir: RunDir, job_path: Path
+) -> None:
+    # A NON-resumable terminal (done_when passed) reclaims the planner's in-repo
+    # _planner_tip worktree (its ~GB of installed deps / build output). The MockDecision
+    # planner's discard_tip mirrors ScriptPlanner's removal; the pre-seeded tip lets the
+    # test observe the loop calling it at the completed terminal.
+    tip = run_dir.root / "_planner_tip"
+    (tip / "node_modules").mkdir(parents=True)
+    planner = MockDecisionPlanner([_epoch(_impl("T1", ["a.py"])), _end("shipped")])
+    result = start_run(
+        job_path=job_path, run_dir=run_dir, repo=git_repo, planner=planner,
+        backends=_backends(LoopWorker()), max_epochs=5,
+    )
+    assert result.status == "completed"
+    assert not tip.exists()  # reclaimed at the decided terminal
+
+
+def test_clean_partial_end_reclaims_planner_tip(
+    git_repo: Path, run_dir: RunDir, job_path: Path
+) -> None:
+    # A clean partial-end (the planner declared END but invariant #2 failed) is also a
+    # NON-resumable terminal, so it reclaims the tip too.
+    tip = run_dir.root / "_planner_tip"
+    tip.mkdir(parents=True)
+    planner = MockDecisionPlanner([_end("partial")])
+    result = start_run(
+        job_path=job_path, run_dir=run_dir, repo=git_repo, planner=planner,
+        backends=_backends(LoopWorker()), acceptance=lambda ctx: False,
+    )
+    assert result.status == "ended"
+    assert not tip.exists()
+
+
 def test_multi_epoch_run(git_repo: Path, run_dir: RunDir, job_path: Path) -> None:
     planner = MockDecisionPlanner(
         [_epoch(_impl("T1", ["a.py"])), _epoch(_impl("T1", ["b.py"])), _end()]
@@ -940,6 +974,9 @@ class _ReconcilingPlanner:
             f"## Pending\n{body}\n## Current status\nepoch closed\n"
         )
 
+    def discard_tip(self, repo: Path | None, run_dir: RunDir) -> None:
+        return None  # no real tip: Protocol parity only
+
 
 @dataclass
 class _PerTaskCriticWorker:
@@ -1097,6 +1134,9 @@ def test_sigterm_midrun_is_resumable_stop_with_no_git_mutation(
 
         def close_out(self, context: CloseoutContext) -> str:
             return "unused"
+
+        def discard_tip(self, repo: Path | None, run_dir: RunDir) -> None:
+            raise AssertionError("a resumable interrupt must NOT reclaim the tip")
 
     result = start_run(
         job_path=job_path, run_dir=run_dir, repo=git_repo, planner=_Interrupting(),

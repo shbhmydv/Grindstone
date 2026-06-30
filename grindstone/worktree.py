@@ -304,6 +304,28 @@ def changed_paths(repo: Path, base: str, head: str = "HEAD") -> list[str]:
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
+def dirty_paths(repo: Path) -> list[str]:
+    """Repo-relative paths with UNCOMMITTED changes (``git status --porcelain``).
+
+    A READ-ONLY probe of the real target repo (status only, never write/commit): the
+    zero-diff diag uses it to tell a wrong-directory write (the worker wrote owned files
+    into the operator checkout instead of its isolated worktree) from a true no-op.
+    Staged, modified, and untracked paths are all reported; a rename reports its
+    destination. Returns ``[]`` on a clean tree.
+    """
+
+    out = _git(repo, "status", "--porcelain", check=False).stdout
+    paths: list[str] = []
+    for line in out.splitlines():
+        entry = line[3:].strip()  # drop the two-char XY status code + its separator
+        if not entry:
+            continue
+        if " -> " in entry:  # a rename: report the destination path
+            entry = entry.split(" -> ", 1)[1]
+        paths.append(entry)
+    return paths
+
+
 def path_in_scope(path: str, ownership: list[str]) -> bool:
     """Does ``path`` match at least one ownership glob?
 

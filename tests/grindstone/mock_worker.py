@@ -70,6 +70,7 @@ class MockWorker:
 
     script: list[str]
     artifacts: dict[str, str] = field(default_factory=dict)
+    stdout: str = ""
     _calls: int = 0
 
     def run(self, request: WorkerRequest) -> str:
@@ -86,8 +87,15 @@ class MockWorker:
         if behavior in ("rate_limit", "session_limit"):
             raise RateLimited(f"mock {behavior}")
         if behavior == "empty":
-            # No work and no report: a zero-diff / missing-artifact gate failure.
-            return ""
+            # No work and no report: a zero-diff / missing-artifact gate failure. The
+            # real ScriptWorker.run still RETURNS its stdout, which the failure-debug
+            # tail captures, so emit ``stdout`` here too.
+            return self.stdout
+        if behavior == "report_only":
+            # A free-form report but no committable diff (no artifacts): a no-op-WITH-
+            # report zero-diff fail, the failure whose VERSIONED handoff must survive.
+            handoff.write_text(_handoff_md(request), encoding="utf-8")
+            return self.stdout
         if behavior == "timeout":
             # Hung-then-killed: a partial report lands, then the supervisor kills the
             # worker. No real sleep, the kill is modelled as a raise.
@@ -98,7 +106,7 @@ class MockWorker:
             handoff.write_text(
                 _handoff_md(request, blocked=behavior == "blocked"), encoding="utf-8"
             )
-            return ""
+            return self.stdout
         raise ValueError(f"unknown mock behavior: {behavior!r}")
 
     def _write_artifacts(self, request: WorkerRequest) -> None:

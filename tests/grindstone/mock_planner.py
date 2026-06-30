@@ -25,6 +25,7 @@ call now; only the consecutive-failure cap ends the run.
 from __future__ import annotations
 
 import json
+import shutil
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,6 +50,7 @@ from grindstone.planner import (
 
 if TYPE_CHECKING:
     from grindstone.loop import CloseoutContext, PlannerContext
+    from grindstone.rundir import RunDir
 
 
 def render_mock_baton(context: "CloseoutContext") -> str:
@@ -288,6 +290,13 @@ class MockDecisionPlanner:
             raise RateLimited("mock planner close-out rate limit")
         return render_mock_baton(context)
 
+    def discard_tip(self, repo: "Path | None", run_dir: "RunDir") -> None:
+        """Mirror ``ScriptPlanner.discard_tip``: remove the ``_planner_tip`` dir at a
+        non-resumable terminal end (idempotent). A no-op for the script-only tests that
+        never seed a tip; the tip-reclaim loop tests pre-seed one to observe the call."""
+
+        shutil.rmtree(run_dir.root / "_planner_tip", ignore_errors=True)
+
 
 @dataclass
 class GoalPlanner:
@@ -380,6 +389,11 @@ class GoalPlanner:
     def close_out(self, context: "CloseoutContext") -> str:
         self.closeout_contexts.append(context)
         return render_mock_baton(context)
+
+    def discard_tip(self, repo: "Path | None", run_dir: "RunDir") -> None:
+        """Protocol parity (this E2E planner holds no real tip): a no-op removal."""
+
+        shutil.rmtree(run_dir.root / "_planner_tip", ignore_errors=True)
 
     @staticmethod
     def _tip_tree(context: "PlannerContext") -> set[str]:
