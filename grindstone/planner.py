@@ -171,16 +171,25 @@ Rules for every decision:
   fewer planner boundaries, each of which would otherwise reprocess a growing baton and log.
   Each task
   carries: an id ("T1".."T8"); a mode (implement | research
-  | review | artifact); a routing tier ("local", the default, for mechanical or
-  checkable work; "senior" for judgment, taste, synthesis, or visual quality); and a
-  prose goal that states the task's OWN notion of done. Default every task to "local"
-  and JUSTIFY each "senior" - it is the scarce, expensive tier. A taste-critical FEATURE
-  is not a wholesale-"senior" feature: split its mechanical substrate (literal
-  transcription of spec'd values into tokens/constants, type definitions, config,
-  scaffolding - work with one correct answer) into "local" tasks, and reserve "senior"
-  for the slices where judgment changes the output (component feel, layout, composition,
-  visual quality). Do not route a whole subsystem to "senior" because part of it needs
-  taste.
+  | review | artifact); a routing tier ("local", the default; "senior" the scarce,
+  expensive tier); and a prose goal that states the task's OWN notion of done. Choose the
+  tier by SPEC-DETERMINACY, not by domain: ask "can I spec this task CONCRETELY right
+  now?". A WELL-SPECCED task - one with a named, concrete target I can hand off (a precise
+  delta I can state like "center the CTA and cap its width at 288dp", a value to
+  transcribe, one correct answer, a thing to diff against an existing artifact) - is
+  "local" REGARDLESS of domain; a taste OUTCOME I can name as an exact change is still
+  "local". An UNDER-SPECCED task - open-ended or creative work with no concrete target yet
+  (the FIRST creative composition of something, where nothing exists to diff against;
+  "make this feel premium"; synthesis where the answer space is wide) - is "senior". A
+  first creative draft skews "senior" because it is the least-specced moment, not because
+  it is creative: a first draft of MECHANICAL work (a data row, a route stub) is
+  well-specced, so "local". Default every task to "local" and JUSTIFY each "senior" - it
+  is the scarce, expensive tier. A taste-critical FEATURE is not a wholesale-"senior"
+  feature: split its mechanical substrate (literal transcription of spec'd values into
+  tokens/constants, type definitions, config, scaffolding - work with one correct answer)
+  into "local" tasks, and reserve "senior" for the genuinely UNDER-SPECCED slices (the
+  first composition, the open-ended judgment call). Do not route a whole subsystem to
+  "senior" because part of it needs taste.
   * implement tasks declare file_ownership: a list of CONCRETE files (>= 1) the task may
     create or edit. Ownership across the epoch MUST be DISJOINT; the state machine
     refuses to integrate an overlap. Enumerate real files; never claim a subtree or a
@@ -208,6 +217,18 @@ Rules for every decision:
   schedule it in the same epoch as its scaffold (a refine owning the scaffold's files is a
   same-epoch ownership overlap the merge gate refuses, and it could not see the scaffold
   anyway - siblings cannot read each other's output).
+- A PASS that misses your eye is not a failure, it CONVERGES. When a task PASSED its gate
+  but you render the merged result and your judgement says "not there yet", that draws no
+  strike and needs no escalation: just issue the NEXT named delta as a FRESH, well-specced
+  task, which by the tier rule above is "local". That is the normal refine loop - do not
+  track it and do not bump its tier. ESCALATION applies ONLY to a GATE-FAILING task carried
+  across epochs (work-gate / build / done_when actually red), and the trigger is STALL, not
+  epoch-count. Read the baton's progress note on each carried gate-failure: if it MADE
+  PROGRESS last epoch (you split it and some sub-tasks passed, the failing surface shrank)
+  it is CONVERGING - keep it at its specced tier and keep decomposing, do NOT escalate just
+  because it is not done. Only if it made NO progress across epochs (the same gate
+  rejection, nothing moved) is it STALLED - escalate that next attempt to "senior" to
+  root-cause it.
 - Declare HOST-GLOBAL prep as SETUP. If an epoch needs a host-level mutation (a
   system-wide tool, a shared directory outside the repo), list it in the epoch's "setup":
   the trusted state machine runs those, in order, before the tasks. Setup runs in a
@@ -292,7 +313,15 @@ print the baton). Free-form markdown, but ALWAYS these four sections:
   ## Current status
   The honest now: what this epoch changed, and for every failure, YOUR read of its nature
   (partial progress and what remains / no progress and why / a regression to undo) and how
-  to steer next. This is where the nuance lives. If everything passed, say so plainly.
+  to steer next. This is where the nuance lives. For each CARRIED gate-failing task only (a
+  task whose work-gate / build / done_when is actually red and is carried to a later
+  epoch), add ONE line - "made progress this epoch: yes/no" with a few words why (you split
+  it and some sub-tasks landed, or nothing moved). State it qualitatively, do not compute
+  any numeric delta. That read is what lets your next self tell a CONVERGING gate-failure
+  (made progress -> keep its specced tier and keep decomposing) from a STALLED one (no
+  progress across epochs -> escalate to senior to root-cause it). A task that merely PASSED
+  its gate but missed your eye is NOT a failure and needs no such line - it just gets the
+  next named delta as a fresh local task. If everything passed, say so plainly.
 
 Keep it tight and high-signal - it is a baton, not a log. Your next self reads ONLY this
 plus the tree and the keyed log, so put here everything it needs and nothing it can
